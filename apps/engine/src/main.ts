@@ -1,0 +1,131 @@
+import { makeDb } from "@b5p/db";
+import {
+  BinanceKlinesPoller, ClobMarketWs, GammaClient, RtdsClient, tsToMs,
+} from "@b5p/polymarket";
+import { makeBus } from "./bus";
+import { Engine } from "./engine";
+import { logger } from "./log";
+
+/**
+ * Standalone engine entry point. In embedded dev mode the API imports
+ * createEngineRuntime() instead and runs this wiring in-process.
+ */
+export interface EngineRuntime {
+  engine: Engine;
+  stop(): Promise<void>;
+}
+
+export async function createEngineRuntime(): Promise<EngineRuntime> {
+  const db = await makeDb();
+  await db.migrate();
+  const bus = await makeBus();
+
+  const modeEnv = process.env.ENGINE_MODE;
+  const gamma = new GammaClient();
+
+  // config decides default mode; env may force observe (read-only) only
+  const engine = new Engine(db, bus, modeEnv === "observe" ? "observe" : "paper");
+  await engine.start(Date.now());
+  const cfgMode = engine.cfg.app.mode;
+  if (cfgMode === "observe" && engine.mode !== "observe") {
+    logger.info("config requests observe mode; engine runs read-only decision logic without orders");
+  }
+
+  // --- feeds
+  const rtds = new RtdsClient({
+    onTick: (t) => engine.onReferenceTick(t),
+    onClockSample: (skew) => engine.onClockSample(skew),
+    onStatus: (s, d) => logger.info("rtds status", { status: s, detail: d }),
+  });
+  rtds.start();
+
+  const tokenToMarket = new Map<string, string>();
+  const clob = new ClobMarketWs({
+    onBook: (msg, ts) => {
+      engine.onBookSnapshot(msg.asset_id, msg.bids, msg.asks, tsToMs(msg.timestamp, ts), ts);
+    },
+    onPriceChange: (msg, ts) => {
+      for (const c of msg.price_changes) {
+        engine.onPriceChange(c.asset_id, c.price, c.size, c.side, tsToMs(msg.timestamp, ts), ts);
+      }
+    },
+    onLastTrade: (msg, ts) => {
+      void engine.onTrade(msg.asset_id, msg.price, msg.size ?? "0", tsToMs(msg.timestamp, ts));
+    },
+    onStatus: (s, d) => logger.info("clob ws status", { status: s, detail: d }),
+  });
+  clob.start();
+
+  const klines = new BinanceKlinesPoller({
+    pollIntervalMs: 5000,
+    onUpdate: (c) => engine.onCandles(c),
+    onError: (e) => logger.warn("binance klines error", { error: e }),
+  });
+  klines.start();
+
+  // --- discovery loop
+  let discovering = false;
+  const discover = async () => {
+    if (discovering) return;
+    discovering = true;
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const parsed = await gamma.discoverWindows(engine.cfg.market.slug_prefix, nowSec, engine.cfg.market.discover_ahead_windows);
+      // refresh recently finished windows too, for official-outcome cross-checks
+      for (const back of [1, 2, 3]) {
+        const slot = Math.floor(nowSec / 300) * 300 - back * 300;
+        const ev = await gamma.fetchEventBySlug(engine.cfg.market.slug_prefix + slot);
+        if (ev) {
+          const { parseFiveMinMarket } = await import("@b5p/polymarket");
+          const p = parseFiveMinMarket(ev);
+          if (p) parsed.push(p);
+        }
+      }
+      await engine.upsertDiscoveredMarkets(parsed, Date.now());
+      clob.setAssets(engine.subscriptionTokens(nowSec));
+    } catch (e) {
+      logger.warn("discovery error", { error: String(e) });
+    } finally {
+      discovering = false;
+    }
+  };
+  await discover();
+  const discoveryTimer = setInterval(() => void discover(), 20_000);
+
+  // --- main loop
+  let stepping = false;
+  const stepTimer = setInterval(() => {
+    if (stepping) return;
+    stepping = true;
+    engine.step(Date.now())
+      .catch((e) => logger.error("engine step error", { error: String(e), stack: (e as Error).stack }))
+      .finally(() => { stepping = false; });
+  }, 500);
+
+  logger.info("engine runtime started", { mode: engine.mode, db: db.kind, bus: bus.kind });
+
+  return {
+    engine,
+    stop: async () => {
+      clearInterval(discoveryTimer);
+      clearInterval(stepTimer);
+      engine.stop();
+      rtds.stop();
+      clob.stop();
+      klines.stop();
+      await db.close();
+    },
+  };
+}
+
+// standalone execution
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const runtime = await createEngineRuntime();
+  const shutdown = async () => {
+    logger.info("engine shutting down");
+    await runtime.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+}

@@ -1,0 +1,24 @@
+{
+  "name": "btc-5m-poly",
+  "private": true,
+  "version": "0.1.0",
+  "description": "BTC Five-Minute Polymarket Command Center — observe, research, paper-trade, backtest; live execution only after explicit arming.",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "bootstrap": "pnpm install && pnpm db:migrate && pnpm db:seed",
+    "dev": "node scripts/dev.mjs",
+    "build": "pnpm -r --filter './packages/*' build && pnpm --filter @b5p/api build && pnpm --filter @b5p/engine build && pnpm --filter @b5p/research build && pnpm --filter @b5p/web build",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm --filter @b5p/web test:e2e",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "db:migrate": "pnpm --filter @b5p/db migrate",
+    "db:seed": "pnpm --filter @b5p/research seed",
+    "research:backfill": "pnpm --filter @b5p/research backfill",
+    "infra:up": "docker compose -f infra/docker-compose.yml up -d",
+    "infra:down": "docker compose -f infra/docker-compose.yml down"
+  }
+}
