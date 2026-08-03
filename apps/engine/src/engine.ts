@@ -89,6 +89,8 @@ export class Engine {
   private lastFeaturePersistMs = 0;
   private lastLiveRefreshMs = 0;
   private lastLivePollMs = 0;
+  /** Operator cooling-off deadline; set when the consecutive-loss stop trips, cleared only by operator resume. */
+  private coolingOffUntilMs: number | null = null;
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
 
@@ -347,6 +349,17 @@ export class Engine {
         break;
       }
       case "resume": {
+        // Operator resume IS the manual re-arm the spec demands: it clears the
+        // cooling-off timer and the consecutive-loss stop. Nothing else does —
+        // the stops are restored across restarts and never self-reset.
+        const hadCoolingOff = this.coolingOffUntilMs !== null;
+        const hadLossStop = this.accounting.consecutiveLosses > 0 || this.live.consecutiveLosses > 0;
+        this.coolingOffUntilMs = null;
+        await this.accounting.resetLossStop();
+        this.live.consecutiveLosses = 0;
+        if (hadCoolingOff || hadLossStop) {
+          await this.audit("risk", "loss_stop_rearmed", { actor: msg.actor ?? "operator", hadCoolingOff, hadLossStop });
+        }
         if (this.engineState === "HALTED") {
           this.haltReason = null;
           this.transitionEngine("RECONCILING", "operator resume");
@@ -912,7 +925,7 @@ export class Engine {
       // override cannot bypass this (it is not a governance gate).
       calibrationRequired: this.cfg.strategy.calibration_required,
       modelCalibrated: model.calibrated,
-      coolingOffUntilMs: null,
+      coolingOffUntilMs: this.coolingOffUntilMs,
       nowMs,
       idempotencyKeyIsDuplicate: this.usedIdempotencyKeys.has(idemKey),
       requestedStakeFractionPpm: null,
@@ -1333,11 +1346,17 @@ export class Engine {
       if (nowMs < dueMs) continue;
 
       const finalTick = this.chainlink.atOrBefore(rt.ref.endEpoch * 1000);
+      // Same freshness rule as boundary capture: a "final" tick older than the
+      // gap tolerance must not resolve the market — a feed that died minutes
+      // before close would otherwise book a wrong outcome and later halt the
+      // engine on its own self-inflicted official-outcome mismatch.
+      const finalTickFresh = finalTick !== null
+        && rt.ref.endEpoch * 1000 - finalTick.sourceTsMs <= this.cfg.feeds.chainlink.max_gap_ms;
       let outcome: OutcomeSide | null = null;
       let source = "rtds_chainlink_boundary";
       let finalText: string | null = null;
 
-      if (finalTick && rt.priceToBeat) {
+      if (finalTick && finalTickFresh && rt.priceToBeat) {
         finalText = finalTick.fullAccuracyValue ?? String(finalTick.value);
         outcome = compareDecimal(finalText, rt.priceToBeat.text) >= 0 ? "UP" : "DOWN";
       } else if (rt.officialOutcome) {
@@ -1348,7 +1367,8 @@ export class Engine {
       if (outcome === null) {
         if (nowMs - dueMs > 60_000 && !rt.resolveWarned) {
           rt.resolveWarned = true; // warn once per market, not every step
-          await this.health("warning", "resolution", `cannot resolve ${rt.ref.slug} locally (missing boundary data); awaiting official outcome`);
+          const why = finalTick && !finalTickFresh ? "final Chainlink tick stale" : "missing boundary data";
+          await this.health("warning", "resolution", `cannot resolve ${rt.ref.slug} locally (${why}); awaiting official outcome`);
         }
         continue;
       }
@@ -1415,7 +1435,28 @@ export class Engine {
       // fill_selection_cost = signal-conditioned value − fill-conditioned value,
       // computed per resolution batch (drained at end of step).
       this.paperVariants.flushSelectionCost(nowMs);
+      await this.maybeTripCoolingOff(nowMs);
     }
+  }
+
+  /**
+   * Start the operator cooling-off window when the consecutive-loss stop
+   * trips (paper or live counter). Cleared ONLY by an explicit operator
+   * resume — the spec's behavioral-risk mitigation against win-it-back
+   * re-entry after a loss streak. Disabled with risk.cooling_off_minutes: 0.
+   */
+  private async maybeTripCoolingOff(nowMs: number): Promise<void> {
+    if (this.coolingOffUntilMs !== null || this.cfg.risk.cooling_off_minutes <= 0) return;
+    const profileName = this.cfg.risk.profile;
+    const limits = profileName === "custom"
+      ? clampCustomProfile(customLimitsFromConfig(this.cfg)).limits
+      : RISK_PROFILES[profileName];
+    const losses = Math.max(this.accounting.consecutiveLosses, this.live.consecutiveLosses);
+    if (losses < limits.consecutiveLossLimit) return;
+    this.coolingOffUntilMs = nowMs + this.cfg.risk.cooling_off_minutes * 60_000;
+    await this.health("warning", "risk",
+      `consecutive-loss stop tripped (${losses} losses); cooling-off active until ${new Date(this.coolingOffUntilMs).toISOString()} — operator resume required to re-arm`);
+    await this.audit("risk", "cooling_off_started", { losses, untilMs: this.coolingOffUntilMs });
   }
 
   private async crossCheckResolution(rt: MarketRuntime, nowMs: number): Promise<void> {

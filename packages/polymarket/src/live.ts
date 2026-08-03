@@ -164,13 +164,20 @@ export class LiveClobAdapter implements ExecutionAdapter {
       const options = { tickSize, negRisk: req.negRisk ?? false };
 
       if (req.style === "maker_post_only") {
-        // GTD post-only maker order: price + size(shares)
+        if (req.expireAtMs !== undefined && req.expireAtMs <= Date.now()) {
+          return { accepted: false, status: "REJECTED", reason: "GTD expiration is not in the future; refusing to submit" };
+        }
+        // GTD post-only maker order: price + size(shares). Polymarket applies a
+        // documented 1-minute security threshold to GTD expirations: an order
+        // meant to live until T must be submitted with expiration = T + 60s,
+        // or the exchange treats it as expiring a minute early (killing our
+        // 15-75s resting window almost immediately).
         const userOrder = {
           tokenID: req.tokenId,
           price: toNumber(req.price6),
           size: toNumber(req.shares6),
           side,
-          ...(req.expireAtMs ? { expiration: Math.floor(req.expireAtMs / 1000) } : {}),
+          ...(req.expireAtMs ? { expiration: Math.floor(req.expireAtMs / 1000) + GTD_SECURITY_BUFFER_S } : {}),
         };
         const orderType = req.expireAtMs ? m.OrderType.GTD : m.OrderType.GTC;
         const resp = await this.client.createAndPostOrder(userOrder, options, orderType, false, true /* postOnly */);
@@ -260,18 +267,32 @@ export class LiveClobAdapter implements ExecutionAdapter {
   }
 }
 
-function mapResponse(resp: any): OrderResult {
-  const ok = resp?.success !== false && (resp?.orderID || resp?.orderId || resp?.status);
-  const status = String(resp?.status ?? (ok ? "LIVE" : "REJECTED")).toUpperCase();
-  const norm =
-    status === "MATCHED" ? "MATCHED" :
-    status === "LIVE" ? "LIVE" :
-    status === "DELAYED" ? "DELAYED" : ok ? "LIVE" : "REJECTED";
+const GTD_SECURITY_BUFFER_S = 60;
+
+/**
+ * Map a CLOB placement response by ALLOWLIST: only `matched`/`live`/`delayed`
+ * with an explicit `success: true` are accepted. Everything else — including
+ * `unmatched` (FOK/FAK killed without a fill), a missing success field, or a
+ * status string this code has never seen — is a rejection with the raw status
+ * preserved. Treating unknown statuses as accepted mints phantom live
+ * positions that lock out trading (max_open_positions: 1) with real money.
+ */
+export function mapResponse(resp: any): OrderResult {
+  const success = resp?.success === true;
+  const rawStatus = String(resp?.status ?? "").toUpperCase();
+  const norm: OrderResult["status"] | null =
+    rawStatus === "MATCHED" ? "MATCHED" :
+    rawStatus === "LIVE" ? "LIVE" :
+    rawStatus === "DELAYED" ? "DELAYED" : null;
+  const accepted = success && norm !== null;
+  const externalId = resp?.orderID || resp?.orderId ? String(resp.orderID ?? resp.orderId) : undefined;
   return {
-    accepted: Boolean(ok),
-    ...(resp?.orderID || resp?.orderId ? { externalId: String(resp.orderID ?? resp.orderId) } : {}),
-    status: norm as OrderResult["status"],
-    ...(resp?.errorMsg || resp?.message ? { reason: redact(String(resp.errorMsg ?? resp.message)) } : {}),
+    accepted,
+    ...(externalId ? { externalId } : {}),
+    status: accepted ? norm! : "REJECTED",
+    ...(accepted
+      ? {}
+      : { reason: redact(String(resp?.errorMsg ?? resp?.message ?? `unrecognized CLOB placement status '${resp?.status ?? "<absent>"}' (success=${String(resp?.success)})`)) }),
   };
 }
 

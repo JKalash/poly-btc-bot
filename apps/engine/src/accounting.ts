@@ -70,8 +70,21 @@ export class Accounting {
     this.bankroll = latest ? latest.bankroll6 : this.startingBankroll;
     this.sessionStartBankroll = this.bankroll;
     this.sessionPeak = this.bankroll;
-    this.dailyPeak = this.bankroll;
     this.dailyPeakDay = utcDay(nowMs);
+    // The loss stops must survive restarts (spec: no automatic re-arming).
+    // consecutiveLosses carries over from the latest persisted session; the
+    // daily peak is the UTC-day's true maximum from bankroll snapshots — NOT
+    // the current bankroll, which would grant a fresh daily loss budget
+    // measured from the post-loss level after every deploy.
+    const prevSessions = await this.db.db.select().from(tradingSessions).where(eq(tradingSessions.mode, this.mode));
+    const prev = prevSessions.sort((a, b) => b.startedAtMs - a.startedAtMs)[0];
+    this.consecutiveLosses = prev?.consecutiveLosses ?? 0;
+    const dayStartMs = Date.parse(`${this.dailyPeakDay}T00:00:00Z`);
+    let dayPeak = this.bankroll;
+    for (const s of snaps) {
+      if (s.tsMs >= dayStartMs && s.bankroll6 > dayPeak) dayPeak = s.bankroll6;
+    }
+    this.dailyPeak = dayPeak;
     this.sessionId = newId();
     await this.db.db.insert(tradingSessions).values({
       id: this.sessionId,
@@ -80,7 +93,7 @@ export class Accounting {
       startingBankroll6: this.bankroll,
       peakBankroll6: this.bankroll,
       realized6: 0n,
-      consecutiveLosses: 0,
+      consecutiveLosses: this.consecutiveLosses,
     });
     this.reconciled = true;
     logger.info("accounting reconciled", { mode: this.mode, bankroll: this.bankroll, openPositions: this.open.size });
@@ -108,6 +121,16 @@ export class Accounting {
 
   openPositionsList(): OpenPosition[] {
     return [...this.open.values()];
+  }
+
+  /** Operator manual re-arm: clears the consecutive-loss stop (never automatic). */
+  async resetLossStop(): Promise<void> {
+    this.consecutiveLosses = 0;
+    if (this.sessionId) {
+      await this.db.db.update(tradingSessions)
+        .set({ consecutiveLosses: 0 })
+        .where(eq(tradingSessions.id, this.sessionId));
+    }
   }
 
   rollDay(nowMs: number): void {
