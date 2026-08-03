@@ -12,7 +12,16 @@ if (!existsSync(path.join(root, ".env")) && !process.env.SESSION_SECRET) {
   console.log("[dev] no .env found — using dev defaults (operator/operator). Copy .env.example to .env to customize.");
 }
 
-const embedded = !process.env.DATABASE_URL;
+// Split-process mode REQUIRES a cross-process control bus: without REDIS_URL
+// every control publish (kill switch, arm/disarm, resume, config reload)
+// stays inside the API process and silently never reaches the engine. Force
+// embedded mode rather than ship a dashboard whose emergency stop is a no-op.
+const hasDb = Boolean(process.env.DATABASE_URL);
+const hasRedis = Boolean(process.env.REDIS_URL);
+const embedded = !hasDb || !hasRedis;
+if (hasDb && !hasRedis) {
+  console.warn("[dev] DATABASE_URL is set but REDIS_URL is not — forcing EMBEDDED mode so the kill switch and control channel actually reach the engine. Set REDIS_URL to run split-process.");
+}
 const procs = [];
 
 function run(name, cmd, args, extraEnv = {}) {

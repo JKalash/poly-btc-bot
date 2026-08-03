@@ -160,10 +160,31 @@ export class LiveController {
     this.expiresAtMs = 0;
   }
 
+  /** #60: engine drains this each step; a set value triggers a full halt. */
+  private pendingHaltReason: string | null = null;
+  takePendingHalt(): string | null {
+    const r = this.pendingHaltReason;
+    this.pendingHaltReason = null;
+    return r;
+  }
+
   async refreshBankroll(): Promise<void> {
     if (!this.adapter || this.state !== "ARMED") return;
     try {
-      this.liveBankroll6 = await this.adapter.usdcBalance();
+      const expected = this.liveBankroll6;
+      const actual = await this.adapter.usdcBalance();
+      // #60: wallet balance mismatch beyond tolerance is a spec'd halt
+      // condition — money moved that this engine did not account for
+      // (external transfer, another client trading, or accounting drift).
+      // Tolerance: 2% of expected, floor 5 USDC, to absorb fee rounding.
+      const tolerance6 = expected / 50n > 5_000_000n ? expected / 50n : 5_000_000n;
+      const diff = actual > expected ? actual - expected : expected - actual;
+      if (expected > 0n && diff > tolerance6) {
+        this.pendingHaltReason = `wallet balance mismatch: expected ~${expected} got ${actual} (diff ${diff} > tolerance ${tolerance6})`;
+        this.disarm("wallet balance mismatch");
+        return;
+      }
+      this.liveBankroll6 = actual;
       if (this.liveBankroll6 > this.sessionPeak6) this.sessionPeak6 = this.liveBankroll6;
       if (this.liveBankroll6 > this.dailyPeak6) this.dailyPeak6 = this.liveBankroll6;
     } catch (e) {

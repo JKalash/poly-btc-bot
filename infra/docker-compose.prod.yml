@@ -75,7 +75,13 @@ services:
     restart: unless-stopped
 
   web:
-    build: { context: .., dockerfile: Dockerfile }
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        # MUST be a build arg: Next.js freezes the /api rewrite target into
+        # the build; a runtime env var on the built image is ignored.
+        API_PROXY_TARGET: http://api:8787
     command: ["pnpm", "--filter", "@b5p/web", "start"]
     environment:
       API_PROXY_TARGET: http://api:8787

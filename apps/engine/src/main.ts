@@ -122,6 +122,13 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
   }, 500);
 
   logger.info("engine runtime started", { mode: engine.mode, db: db.kind, bus: bus.kind });
+  // #27: a standalone engine process with a process-LOCAL bus cannot receive
+  // API control messages (kill/arm/disarm/resume). The DB-polled kill
+  // fallback still works, but everything else is dead — say so loudly.
+  if (!process.env.EMBED_ENGINE && process.env.DATABASE_URL && bus.kind === "local") {
+    void engine.health("critical", "control",
+      "split-process engine without REDIS_URL: bus control messages (arm/disarm/resume/config-reload) CANNOT reach this process; only the kill switch works, via DB polling. Set REDIS_URL.");
+  }
 
   return {
     engine,
