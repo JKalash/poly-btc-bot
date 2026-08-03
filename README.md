@@ -1,10 +1,12 @@
 # BTC Five-Minute Polymarket Command Center
 
 A locally runnable system for **observing, researching, paper-trading and backtesting** Polymarket's
-BTC Up-or-Down five-minute markets. Live execution does not exist in this release: there is no
-signing path anywhere in the codebase, by design. The system's primary job is to **refuse trades
-lacking auditable edge**, expose the exact risk of approved trades, and make it impossible to
-confuse a lucky win with a good decision.
+BTC Up-or-Down five-minute markets. **A real-money live path exists in this release** — it boots
+disarmed and stays inert unless a hot-wallet key is configured, `LIVE_TRADING_ENABLED` is set, and
+an operator arms it with a typed acknowledgement for a bounded TTL (`docs/live-trading.md`). Treat
+wallet/key hygiene and the arming controls as live-fire safety equipment, not dead code. The
+system's primary job is to **refuse trades lacking auditable edge**, expose the exact risk of
+approved trades, and make it impossible to confuse a lucky win with a good decision.
 
 > A winning trade can still be a terrible decision. Open the **Tutorial** page after first run.
 
@@ -65,7 +67,9 @@ packages/db      drizzle schema + migrations; Postgres or embedded PGlite
 
 ## Non-negotiables (enforced in code, covered by tests)
 
-- Paper mode by default; **live trading disabled** — no signing path exists at all.
+- Paper mode by default; **live trading disarmed by default** — real orders require a configured
+  hot-wallet key, `LIVE_TRADING_ENABLED=true`, and a typed operator acknowledgement with a bounded
+  TTL; any halt or kill immediately disarms.
 - Absolute per-market risk cap **10%**; no martingale, no averaging down, no all-in preset, no auto re-arm.
 - Decimal/fixed-point arithmetic for all money (`bigint` micro-units); floats only for display/statistics.
 - Every order decision persisted as an immutable snapshot **before** any order exists.
@@ -78,8 +82,8 @@ packages/db      drizzle schema + migrations; Postgres or embedded PGlite
 
 ## Live-mode warnings
 
-This release cannot trade live. Before any future live enablement, read
-`docs/live-trading-checklist.md` and `docs/threat-model.md`. The very-aggressive profile is
+This release **can trade live once explicitly armed**. Before configuring a wallet or arming, read
+`docs/live-trading.md`, `docs/live-trading-checklist.md` and `docs/threat-model.md`. The very-aggressive profile is
 genuinely extreme (five full 10% losses ≈ 59% of capital remaining) and requires a typed
 acknowledgement. Polymarket enforces [geographic restrictions](https://help.polymarket.com/en/articles/13364163-geographic-restrictions) —
 verify your jurisdiction before funding anything.
