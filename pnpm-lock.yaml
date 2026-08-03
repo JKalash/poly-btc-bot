@@ -22,6 +22,9 @@ importers:
       '@b5p/engine':
         specifier: workspace:*
         version: link:../engine
+      '@b5p/pair-execution':
+        specifier: workspace:*
+        version: link:../../packages/pair-execution
       '@b5p/research':
         specifier: workspace:*
         version: link:../research
@@ -62,6 +65,9 @@ importers:
       '@b5p/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@b5p/pair-execution':
+        specifier: workspace:*
+        version: link:../../packages/pair-execution
       '@b5p/polymarket':
         specifier: workspace:*
         version: link:../../packages/polymarket
@@ -250,6 +256,25 @@ importers:
         specifier: 2.1.8
         version: 2.1.8(@types/node@26.1.2)
 
+  packages/pair-execution:
+    dependencies:
+      '@b5p/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@b5p/strategy':
+        specifier: workspace:*
+        version: link:../strategy
+    devDependencies:
+      fast-check:
+        specifier: 3.23.2
+        version: 3.23.2
+      typescript:
+        specifier: 5.7.3
+        version: 5.7.3
+      vitest:
+        specifier: 2.1.8
+        version: 2.1.8(@types/node@26.1.2)
+
   packages/polymarket:
     dependencies:
       '@b5p/domain':
@@ -303,6 +328,9 @@ importers:
       '@b5p/config':
         specifier: workspace:*
         version: link:../config
+      fast-check:
+        specifier: 3.23.2
+        version: 3.23.2
       typescript:
         specifier: 5.7.3
         version: 5.7.3

@@ -1,5 +1,5 @@
 {
-  "name": "@b5p/engine",
+  "name": "@b5p/pair-execution",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,25 +9,13 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "dev": "tsx src/main.ts",
-    "start": "tsx src/main.ts",
-    "build": "tsc --noEmit",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@b5p/config": "workspace:*",
-    "@b5p/db": "workspace:*",
     "@b5p/domain": "workspace:*",
-    "@b5p/pair-execution": "workspace:*",
-    "@b5p/polymarket": "workspace:*",
-    "@b5p/risk": "workspace:*",
-    "@b5p/strategy": "workspace:*",
-    "drizzle-orm": "0.38.3",
-    "ioredis": "5.4.2",
-    "tsx": "4.19.2",
-    "zod": "3.24.1"
+    "@b5p/strategy": "workspace:*"
   },
   "devDependencies": {
     "typescript": "5.7.3",

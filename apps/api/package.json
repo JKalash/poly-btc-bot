@@ -17,6 +17,7 @@
     "@b5p/db": "workspace:*",
     "@b5p/domain": "workspace:*",
     "@b5p/engine": "workspace:*",
+    "@b5p/pair-execution": "workspace:*",
     "@b5p/research": "workspace:*",
     "@fastify/cookie": "11.0.1",
     "@fastify/websocket": "11.0.1",
