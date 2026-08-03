@@ -300,6 +300,9 @@ importers:
         specifier: workspace:*
         version: link:../experiments
     devDependencies:
+      '@b5p/config':
+        specifier: workspace:*
+        version: link:../config
       typescript:
         specifier: 5.7.3
         version: 5.7.3

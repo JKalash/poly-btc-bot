@@ -4,6 +4,7 @@ import { seedCalibration } from "@b5p/research";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { AuthService } from "./auth";
+import { seedResearch } from "./seed-research";
 import { buildServer, makeApiBus } from "./server";
 
 /**
@@ -40,6 +41,22 @@ if (process.env.EMBED_ENGINE === "1") {
       logger.info(`api: calibration registry ensured — artifact ${r.modelArtifactId}, decision ${r.decisionId} (approved=${r.approved}, active=${r.active})`);
     } catch (e) {
       logger.warn(`api: calibration registry seed failed (continuing): ${(e as Error).message}`);
+    }
+  }
+}
+
+// Research-provenance seed (repro-suite definitions/runs/observations/evidence
+// computed against locally-held datasets): upsert so the Evidence Lab shows the
+// real ledger on deployments. Idempotent; skipped when the seed isn't shipped.
+{
+  const seedPath = process.env.B5P_RESEARCH_SEED_PATH
+    ?? path.join(import.meta.dirname, "..", "seeds", "research-seed.json");
+  if (existsSync(seedPath)) {
+    try {
+      const r = await seedResearch(db, seedPath);
+      logger.info(`api: research provenance ensured — ${r.definitions} definitions, ${r.runs} runs, ${r.observations} observations, ${r.evidence} evidence rows, ${r.manifests} manifests`);
+    } catch (e) {
+      logger.warn(`api: research provenance seed failed (continuing): ${(e as Error).message}`);
     }
   }
 }

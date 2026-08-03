@@ -188,6 +188,36 @@ export const AppConfigSchema = z.object({
     }).default({}),
   }).default({}),
 
+  /**
+   * Phase 3 R10 paired-cycle inventory/CTF simulation (apps/engine inventory-cycle.ts).
+   * Research loop, opt-in, paper/shadow only. The one-leg duration and unhedged-fraction
+   * budgets deliberately live ONLY in inventory_risk (single source of truth); the engine
+   * syncs the simulator from there.
+   */
+  inventory_research: z.object({
+    enabled: z.boolean().default(false),
+    live_allowed: z.literal(false).default(false),
+    /** Min pre-trade EV per paired share, decimal USDC. */
+    min_cycle_edge: fraction.default("0.005"),
+    pair_size_shares: fraction.default("10"),
+    split_gas_usdc: fraction.default("0.02"),
+    merge_gas_usdc: fraction.default("0.02"),
+    redeem_gas_usdc: fraction.default("0.02"),
+    split_latency_ms: z.number().int().min(0).default(2000),
+    merge_latency_ms: z.number().int().min(0).default(2000),
+    split_failure_fraction: fraction.default("0.02"),
+    quote_fill_hazard_per_sec: fraction.default("0.02"),
+    opportunity_decay_bps_per_sec: z.number().int().min(0).default(5),
+    hedge_policy: z.enum(["auto", "hedge", "cancel"]).default("auto"),
+    max_cycles_per_market: z.number().int().min(1).default(1),
+    max_open_cycles: z.number().int().min(1).default(2),
+    min_seconds_remaining: z.number().int().min(0).default(60),
+    rebates_in_pretrade_ev: z.literal(false).default(false),
+    rewards_in_pretrade_ev: z.literal(false).default(false),
+    /** Liquidity-reward EXPECTED bookkeeping rate, decimal USDC per second. */
+    reward_per_second_usdc: fraction.default("0.0001"),
+  }).default({}),
+
   /** Phase 3 inventory/CTF market-making risk limits (@b5p/risk inventory-risk.ts). All hard rejects. */
   inventory_risk: z.object({
     /** Paired/CTF market-making is research-only in this release. Literal so config cannot flip it. */

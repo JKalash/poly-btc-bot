@@ -597,7 +597,7 @@ export class PairedCycleSimulator {
       if (c.row.state === "MERGE_OR_SETTLE") {
         if (c.wantsMerge) {
           this.trySubmitMerge(c, nowMs, true);
-          if (c.row.state === "MERGE_PENDING") this.completeMerge(c, nowMs);
+          if ((c.row.state as PairedCycleState) === "MERGE_PENDING") this.completeMerge(c, nowMs);
         } else {
           this.settleAtResolution(c, outcome, nowMs);
         }
@@ -617,7 +617,7 @@ export class PairedCycleSimulator {
     const leg = c.legs[legIndex];
     if (leg.state !== "QUOTED") return false;
     this.makerFill(c, legIndex, nowMs);
-    if (c.row.state === "BOTH_LEGS_FILLED") this.windDown(c, nowMs);
+    if ((c.row.state as PairedCycleState) === "BOTH_LEGS_FILLED") this.windDown(c, nowMs);
     return true;
   }
 
@@ -1242,7 +1242,7 @@ export class PairedCycleSimulator {
   private settleAtResolution(c: SimCycle, outcome: OutcomeSide, nowMs: number): void {
     const cfg = this.args.cfg();
     if (c.exposedLegIndex !== null && c.heldTokenSide !== null) {
-      const filled = c.legs[c.exposedLegIndex];
+      const filled = c.legs[c.exposedLegIndex]!;
       const heldTokenId = c.heldTokenSide === "UP" ? c.ctx.upTokenId : c.ctx.downTokenId;
       const won = outcome === c.heldTokenSide;
       if (won) {

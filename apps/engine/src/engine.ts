@@ -12,21 +12,26 @@ import {
   type OutcomeSide, type Ppm, type Prob6, type ReferenceTick, type Usdc6,
 } from "@b5p/domain";
 import { idempotencyKey, newId, sha256Hex } from "@b5p/domain/ids";
+import { LiquidityRewardLedger, RebateLedger } from "./accruals";
 import { resolveExecutionResearchConfig, type ResolvedExecutionResearchConfig } from "./execution-constants";
 import { ExecutionGuardRegistry } from "./execution-invariants";
 import { ExecutionPersistence } from "./execution-persistence";
 import { ExecutionTimeline, durationUs, monotonicNs } from "./execution-timeline";
+import {
+  PairedCycleSimulator, resolveInventoryResearchConfig, type ResolvedInventoryResearchConfig,
+} from "./inventory-cycle";
+import { InventoryPersistence } from "./inventory-persistence";
 import { FillCounterfactualRecorder, MarkoutSampler } from "./markout";
 import { PaperVariantEngine } from "./paper-variants";
 import type { ParsedFiveMinMarket } from "@b5p/polymarket";
 import {
-  evaluateOrderRisk, governanceForMode, RISK_PROFILES, clampCustomProfile,
-  type GovernancePromotionSummary, type RiskContext,
+  DEFAULT_INVENTORY_RISK_LIMITS, evaluateOrderRisk, governanceForMode, RISK_PROFILES, clampCustomProfile,
+  type GovernancePromotionSummary, type InventoryRiskLimits, type RiskContext,
 } from "@b5p/risk";
 import {
   BookState, MODELS, STRATEGY_PRESETS, TickBuffer, computeFeatures, computeIndicators,
   configureCalibratedModel, presetAllowsMode,
-  type Candle, type FeatureSet, type PresetContext, type StrategyDecision,
+  type Candle, type ExtendedMoveFadePriorRun, type FeatureSet, type PresetContext, type StrategyDecision,
 } from "@b5p/strategy";
 import { eq } from "drizzle-orm";
 import { Accounting } from "./accounting";
@@ -97,6 +102,14 @@ export class Engine {
   private execCfgCache: { version: number; value: ResolvedExecutionResearchConfig } | null = null;
   private livePromotion: GovernancePromotionSummary | null = null;
 
+  // --- R10 paired-cycle inventory research (Phase 3; PAPER/SHADOW ONLY, OFF by default) ---
+  readonly inventoryPersistence: InventoryPersistence;
+  readonly rebateLedger: RebateLedger;
+  readonly rewardLedger: LiquidityRewardLedger;
+  /** null in observe mode; never constructed for live (no live MM adapter exists). */
+  readonly inventorySim: PairedCycleSimulator | null;
+  private invCfgCache: { version: number; value: ResolvedInventoryResearchConfig } | null = null;
+
   constructor(
     readonly db: DbHandle,
     readonly bus: Bus,
@@ -151,6 +164,71 @@ export class Engine {
       onActivated: (o, nowMs) => this.onPaperActivated(o, nowMs),
       onQueueChanged: (o, consumed6, tsMs) => this.onPaperQueueChanged(o, consumed6, tsMs),
       onFinished: (o, status, reason, nowMs) => this.onPaperFinished(o, status, reason, nowMs),
+    };
+
+    // R10 paired-cycle simulation: buffered persistence + separate accrual
+    // ledgers (rebates vs liquidity rewards — never merged; realized only at
+    // PAID). The simulator exists only for paper/shadow; there is NO live
+    // construction path (and the simulator itself refuses any other mode).
+    this.inventoryPersistence = new InventoryPersistence(db);
+    this.rebateLedger = new RebateLedger((e) => this.inventoryPersistence.upsertRebate(e), () => this.configVersion);
+    this.rewardLedger = new LiquidityRewardLedger((e) => this.inventoryPersistence.upsertReward(e), () => this.configVersion);
+    this.inventorySim = mode === "observe" ? null : new PairedCycleSimulator({
+      mode,
+      sink: this.inventoryPersistence,
+      books: (tokenId) => this.books.get(tokenId) ?? null,
+      cfg: () => this.invCfg(),
+      configVersion: () => this.configVersion,
+      rebates: this.rebateLedger,
+      rewards: this.rewardLedger,
+      bankroll6: () => this.accounting.state().bankroll,
+      riskLimits: () => this.inventoryRiskLimits(),
+      // Rejection codes from @b5p/risk evaluateInventoryRisk are persisted
+      // durably (audit_events.data) with the cycle/market correlation.
+      onRiskRejection: (rej) => {
+        void this.audit("inventory", "cycle_risk_rejected", {
+          cycleId: rej.cycleId, marketId: rej.marketId, phase: rej.phase,
+          codes: rej.codes, reasons: rej.reasons, tsMs: rej.tsMs,
+        });
+      },
+    });
+  }
+
+  private invCfg(): ResolvedInventoryResearchConfig {
+    if (this.invCfgCache?.version !== this.configVersion) {
+      // Single source of truth: the one-leg/unhedged budgets come from
+      // inventory_risk; inventory_research carries only simulation knobs.
+      const invRisk = (this.cfg as {
+        inventory_risk?: { max_one_leg_duration_ms?: number; max_unhedged_risk_fraction?: string };
+      }).inventory_risk;
+      const rawResearch = (this.cfg as { inventory_research?: Record<string, unknown> }).inventory_research;
+      const value = resolveInventoryResearchConfig({
+        ...this.cfg,
+        inventory_research: {
+          ...rawResearch,
+          ...(invRisk?.max_one_leg_duration_ms !== undefined
+            ? { max_one_leg_seconds: Math.floor(invRisk.max_one_leg_duration_ms / 1000) }
+            : {}),
+          ...(invRisk?.max_unhedged_risk_fraction !== undefined
+            ? { max_unhedged_risk_fraction: invRisk.max_unhedged_risk_fraction }
+            : {}),
+        },
+      } as typeof this.cfg);
+      if (value.clamped.length > 0) {
+        logger.warn("inventory_research config keys clamped to safe values", { clamped: value.clamped });
+      }
+      this.invCfgCache = { version: this.configVersion, value };
+    }
+    return this.invCfgCache.value;
+  }
+
+  /** Agent K inventory limits, with the duration/fraction budgets synced to the resolved config. */
+  private inventoryRiskLimits(): InventoryRiskLimits {
+    const inv = this.invCfg();
+    return {
+      ...DEFAULT_INVENTORY_RISK_LIMITS,
+      maxUnhedgedRiskFractionPpm: inv.maxUnhedgedRiskFractionPpm,
+      maxOneLegDurationMs: inv.maxOneLegSeconds * 1000,
     };
   }
 
@@ -460,6 +538,9 @@ export class Engine {
       await this.maintainRestingOrders(active, nowMs);
     }
     await this.resolveDue(nowMs);
+    // R10 paired-cycle research loop: config-gated (OFF by default), paper/
+    // shadow only, and strictly after the canonical trading path.
+    this.stepInventoryResearch(active, nowMs);
     await this.publishCockpit(nowMs);
     // Execution-quality bookkeeping: strictly after the trading hot path.
     // The drain is awaited HERE (end of step, all trading actions done) rather
@@ -468,6 +549,42 @@ export class Engine {
     this.markouts.sample(nowMs);
     this.counterfactuals.expire(nowMs);
     await this.execTimeline.settle();
+    await this.inventoryPersistence.settle();
+  }
+
+  /**
+   * R10 paired-cycle loop (plan Phase 3). Hard gates, in order:
+   *  - simulator exists only in paper/shadow (observe: null; live: no
+   *    construction path anywhere, and the simulator constructor refuses it);
+   *  - inventory_research.enabled must be explicitly true (default false);
+   *  - engine must be in a healthy PAPER/SHADOW state (never DEGRADED/HALTED).
+   * All simulator work is in-memory + buffered persistence; exceptions are
+   * contained so the canonical trading path can never be disturbed.
+   */
+  private stepInventoryResearch(active: MarketRuntime | null, nowMs: number): void {
+    if (!this.inventorySim) return;
+    if (!this.invCfg().enabled) return; // OFF by default
+    if (this.engineState !== "PAPER" && this.engineState !== "SHADOW") return;
+    try {
+      if (active && active.rulesVerified && active.ptbConsistent && active.fee) {
+        this.inventorySim.consider({
+          marketId: active.ref.marketId,
+          conditionId: active.ref.conditionId,
+          slug: active.ref.slug,
+          upTokenId: active.ref.upTokenId,
+          downTokenId: active.ref.downTokenId,
+          endEpoch: active.ref.endEpoch,
+          cutoffMs: (active.ref.endEpoch - this.cfg.strategy.cancel_seconds_remaining) * 1000,
+          tickSize6: active.tickSize6,
+          feeRatePpm: active.fee.ratePpm,
+          rebateSharePpm: active.fee.rebateRatePpm,
+          maxBookAgeMs: this.cfg.feeds.clob.max_book_age_ms,
+        }, nowMs);
+      }
+      this.inventorySim.step(nowMs);
+    } catch (e) {
+      logger.error("paired-cycle simulator step failed (contained)", { error: String(e) });
+    }
   }
 
   activeMarket(nowMs: number): MarketRuntime | null {
@@ -476,6 +593,20 @@ export class Engine {
       if (rt.ref.startEpoch <= nowSec && nowSec < rt.ref.endEpoch) return rt;
     }
     return null;
+  }
+
+  /** RESOLVED prior-window run feeding extended_move_fade_v1 (fail-closed: null when the chain breaks). */
+  private priorRunFor(activeStartEpoch: number): ExtendedMoveFadePriorRun | null {
+    return computePriorRun(
+      [...this.markets.values()].map((m) => ({
+        startEpoch: m.ref.startEpoch,
+        endEpoch: m.ref.endEpoch,
+        outcome: m.localOutcome ?? m.officialOutcome,
+        openText: m.priceToBeat?.text ?? null,
+        closeText: m.finalValueText,
+      })),
+      activeStartEpoch,
+    );
   }
 
   nextMarket(nowMs: number): MarketRuntime | null {
@@ -593,6 +724,14 @@ export class Engine {
         minConfidence: this.cfg.strategy.late_snipe.min_confidence,
         maxPrice: Number(this.cfg.strategy.late_snipe.max_price),
       },
+      // extended_move_fade_v1 inputs: RESOLVED prior-window run only (never
+      // inferred from the current window); absent fields fail closed in the preset.
+      extendedMoveFade: {
+        minRunBlocks: this.cfg.strategy.extended_move_fade.minimum_run_blocks,
+        minRunMovePct: this.cfg.strategy.extended_move_fade.minimum_run_move_pct,
+        maxEntryPrice: Number(this.cfg.strategy.extended_move_fade.max_entry_price),
+        priorRun: this.priorRunFor(rt.ref.startEpoch),
+      },
     };
     const gate = preset.evaluate(f, presetCtx);
     rt.lastEval = { f, gate, estVersion: null };
@@ -703,6 +842,11 @@ export class Engine {
         { approvedForPaper: model.approvedForPaper, approvedForLive: model.approvedForLive },
         this.livePromotion,
       ),
+      // Calibration policy (PR #72 gate): when calibration_required is set,
+      // an uncalibrated model may not drive trades in ANY mode — the live-arm
+      // override cannot bypass this (it is not a governance gate).
+      calibrationRequired: this.cfg.strategy.calibration_required,
+      modelCalibrated: model.calibrated,
       coolingOffUntilMs: null,
       nowMs,
       idempotencyKeyIsDuplicate: this.usedIdempotencyKeys.has(idemKey),
@@ -1180,6 +1324,14 @@ export class Engine {
         nowMs,
       );
       this.paperVariants.onResolution(rt.ref.marketId, outcome, nowMs);
+      // R10 cycles: settle held exposure / wind down stragglers. Always called
+      // when the simulator exists so cycles from a later-disabled config still
+      // reconcile; a no-op without cycles for this market.
+      try {
+        this.inventorySim?.onResolution(rt.ref.marketId, outcome, nowMs);
+      } catch (e) {
+        logger.error("paired-cycle resolution settle failed (contained)", { error: String(e) });
+      }
       for (const intentId of this.marketIntents.get(rt.ref.marketId) ?? []) {
         const s = this.execTimeline.stateOf(intentId);
         if (s === "FILLED" || s === "REJECTED" || s === "CANCEL_CONFIRMED" || s === "UNKNOWN_OUTCOME") {
@@ -1326,6 +1478,8 @@ export class Engine {
       openPositions: this.accounting.openPositionsList().map((p) => ({
         id: p.id, marketId: p.marketId, side: p.side, shares6: p.shares6, cost6: p.cost6, stake6: p.stake6,
       })),
+      // Inventory Lab feed: null unless the R10 research loop is enabled.
+      inventoryResearch: this.inventorySim && this.invCfg().enabled ? this.inventorySim.summary() : null,
     });
   }
 
@@ -1386,6 +1540,46 @@ export class Engine {
 
 function costOf(shares6: bigint, price6: Prob6): Usdc6 {
   return (shares6 * price6 + 999_999n) / 1_000_000n;
+}
+
+/**
+ * Consecutive same-direction RESOLVED 5m windows immediately preceding
+ * `activeStartEpoch`, chained by endEpoch === next.startEpoch. Direction comes
+ * from resolved outcomes only; the signed cumulative move (%) spans the oldest
+ * run window's open (price-to-beat) to the newest's close, and is null when
+ * either boundary value is missing — never fabricated (extended_move_fade_v1
+ * then fails its run_magnitude gate, which is the intended fail-closed).
+ */
+export function computePriorRun(
+  windows: ReadonlyArray<{
+    startEpoch: number;
+    endEpoch: number;
+    outcome: OutcomeSide | null;
+    openText: string | null;
+    closeText: string | null;
+  }>,
+  activeStartEpoch: number,
+): ExtendedMoveFadePriorRun | null {
+  const byEnd = new Map<number, (typeof windows)[number]>();
+  for (const w of windows) byEnd.set(w.endEpoch, w);
+  const newest = byEnd.get(activeStartEpoch);
+  if (!newest || newest.outcome === null) return null;
+  const direction = newest.outcome;
+  let oldest = newest;
+  let blocks = 1;
+  for (let guard = 0; guard < 64; guard++) {
+    const prev = byEnd.get(oldest.startEpoch);
+    if (!prev || prev.outcome !== direction || prev.endEpoch <= prev.startEpoch) break;
+    oldest = prev;
+    blocks++;
+  }
+  let cumulativeMovePct: number | null = null;
+  const open = oldest.openText !== null ? Number(oldest.openText) : NaN;
+  const close = newest.closeText !== null ? Number(newest.closeText) : NaN;
+  if (Number.isFinite(open) && Number.isFinite(close) && open > 0) {
+    cumulativeMovePct = ((close - open) / open) * 100;
+  }
+  return { blocks, direction, cumulativeMovePct };
 }
 
 /** Exact decimal string comparison via 1e18 fixed-point. */

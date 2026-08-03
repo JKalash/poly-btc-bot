@@ -185,6 +185,9 @@ export function createCalibratedLogisticModel(opts: CalibratedModelOptions = {})
 
   return {
     version,
+    // Calibrated iff a seal-valid artifact actually backs the mapping — never
+    // claimed on the bare shell (PR #72's calibration gate reads this flag).
+    calibrated: artifact !== null,
     approvedForPaper,
     approvedForLive,
     state,

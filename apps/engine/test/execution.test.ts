@@ -84,6 +84,9 @@ beforeEach(async () => {
   engine = new Engine(db, getLocalBus(), "paper");
   await engine.start(NOW0 - 1000);
   engine.cfg.strategy.probability_model = "distance_vol_heuristic";
+  // PR #72 calibration gate: the heuristic model is uncalibrated, so the test
+  // harness must explicitly accept it (same as engine.test.ts).
+  engine.cfg.strategy.calibration_required = false;
   await engine.upsertDiscoveredMarkets([market()], NOW0 - 1000);
 });
 

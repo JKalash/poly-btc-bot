@@ -142,7 +142,7 @@ abstract class AccrualLedgerBase<E extends AnyAccrual> {
     return e;
   }
 
-  private emit(e: E): void {
+  protected emit(e: E): void {
     try {
       this.sink?.({ ...e });
     } catch {
@@ -236,6 +236,29 @@ export class LiquidityRewardLedger extends AccrualLedgerBase<LiquidityRewardAccr
   accrueUptime(id: string, amount6: Usdc6, qualifyingUptimeMs: number, nowMs: number): void {
     this.advance(id, "ACCRUED", nowMs, amount6, { qualifyingUptimeMs });
   }
+
+  /**
+   * Amount/uptime REVISION on an already-ACCRUED epoch entry (more qualifying
+   * uptime observed within the same reward epoch). Not a state transition —
+   * amount6 is the "current best estimate" per the domain contract — and it
+   * refuses every other state, so PENDING/PAID/DISPUTED totals can never be
+   * silently inflated.
+   */
+  addQualifiedUptime(id: string, addAmount6: Usdc6, addUptimeMs: number, nowMs: number): void {
+    const e = this.get(id);
+    if (e.state !== "ACCRUED") {
+      throw new AccrualError(`addQualifiedUptime requires an ACCRUED entry; ${id} is ${e.state}`);
+    }
+    if (addAmount6 < 0n || addUptimeMs < 0) throw new AccrualError("accrual amounts are non-negative");
+    const next: LiquidityRewardAccrual = {
+      ...e,
+      amount6: e.amount6 + addAmount6,
+      qualifyingUptimeMs: (e.qualifyingUptimeMs ?? 0) + addUptimeMs,
+      updatedAtMs: nowMs,
+    };
+    this.entries.set(id, next);
+    this.emit(next);
+  }
 }
 
 /** Rebate EXPECTED-bookkeeping estimate: notional × feeRate × programShare. Never EV. */
@@ -311,7 +334,7 @@ export interface PreTradeEv {
  * false`) the incentive term is ZERO regardless of input.
  */
 export function buildPreTradeEv(inputs: PreTradeEvInputs, opts: { creditRealizedIncentives?: boolean } = {}): PreTradeEv {
-  if (inputs.incentives !== null && (inputs.incentives as Record<symbol, unknown>)[REALIZED_BRAND] !== true) {
+  if (inputs.incentives !== null && (inputs.incentives as unknown as Record<symbol, unknown>)[REALIZED_BRAND] !== true) {
     throw new UnrealizedAccrualError(
       "pre-trade EV rejected: incentive input is not a realized (PAID-only) total built by realizedIncome()",
     );
