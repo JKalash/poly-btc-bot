@@ -38,6 +38,7 @@ interface MarketRuntime {
   officialOutcome: OutcomeSide | null;
   localOutcome: OutcomeSide | null;
   finalValueText: string | null;
+  resolveWarned: boolean;
   lastEval: { f: FeatureSet; gate: StrategyDecision; estVersion: string | null } | null;
   lastDecisionAtMs: number;
   lastRejectionReasons: Array<{ code: string; message: string }>;
@@ -273,6 +274,7 @@ export class Engine {
         officialOutcome: null,
         localOutcome: null,
         finalValueText: null,
+        resolveWarned: false,
         lastEval: null,
         lastDecisionAtMs: 0,
         lastRejectionReasons: [],
@@ -421,8 +423,17 @@ export class Engine {
 
     const upBook = this.bookFor(rt.ref.upTokenId);
     const downBook = this.bookFor(rt.ref.downTokenId);
-    const indicators = this.candles.length > 0
-      ? computeIndicators({ nowMs, windowStartEpochSec: rt.ref.startEpoch, candles1s: this.candles, binanceTicks: this.binance })
+    // Candle source: Binance 1s klines when fresh; otherwise synthesize from the
+    // Chainlink stream (Binance blocks US IPs with HTTP 451 — and Chainlink is
+    // the resolution feed anyway, so momentum computed from it is more faithful.
+    // Volume-surge degrades to null under synthesis; the composite handles that.)
+    const klinesFresh = this.candlesUpdatedAtMs > 0 && nowMs - this.candlesUpdatedAtMs < 20_000;
+    const candles1s = klinesFresh && this.candles.length > 0
+      ? this.candles
+      : synthCandlesFromTicks(this.chainlink, nowMs);
+    const momentumTicks = klinesFresh ? this.binance : this.chainlink;
+    const indicators = candles1s.length > 30
+      ? computeIndicators({ nowMs, windowStartEpochSec: rt.ref.startEpoch, candles1s, binanceTicks: momentumTicks })
       : null;
     const f = computeFeatures({
       nowMs,
@@ -720,7 +731,8 @@ export class Engine {
       }
 
       if (outcome === null) {
-        if (nowMs - dueMs > 60_000 && !rt.lastRejectionReasons.some((r) => r.code === "PRICE_TO_BEAT_UNKNOWN")) {
+        if (nowMs - dueMs > 60_000 && !rt.resolveWarned) {
+          rt.resolveWarned = true; // warn once per market, not every step
           await this.health("warning", "resolution", `cannot resolve ${rt.ref.slug} locally (missing boundary data); awaiting official outcome`);
         }
         continue;
@@ -979,4 +991,29 @@ function customLimitsFromConfig(cfg: AppConfig) {
 
 function jsonSafe<T = Record<string, unknown>>(v: unknown): T {
   return JSON.parse(JSON.stringify(v, (_k, val) => (typeof val === "bigint" ? val.toString() : val))) as T;
+}
+
+/** Forward-filled 1s candles synthesized from a reference tick stream (volume 0 -> surge indicator degrades to null). */
+export function synthCandlesFromTicks(buf: TickBuffer, nowMs: number, lookbackSec = 600): Candle[] {
+  const ticks = buf.window(nowMs, lookbackSec * 1000);
+  if (ticks.length < 2) return [];
+  const startSec = Math.floor(ticks[0]!.sourceTsMs / 1000);
+  const endSec = Math.floor(nowMs / 1000);
+  const out: Candle[] = [];
+  let i = 0;
+  let last = ticks[0]!.value;
+  for (let s = startSec; s <= endSec; s++) {
+    let open = last;
+    let high = last;
+    let low = last;
+    while (i < ticks.length && Math.floor(ticks[i]!.sourceTsMs / 1000) <= s) {
+      const v = ticks[i]!.value;
+      if (v > high) high = v;
+      if (v < low) low = v;
+      last = v;
+      i++;
+    }
+    out.push({ openTimeMs: s * 1000, open, high, low, close: last, volume: 0 });
+  }
+  return out;
 }

@@ -53,9 +53,16 @@ export class BinanceKlinesPoller {
     } = {},
   ) {}
 
+  private consecutiveErrors = 0;
+  private lastErrorLogMs = 0;
+
   start(): void {
     const interval = this.opts.pollIntervalMs ?? 5000;
     const tick = async () => {
+      // geo-blocked or persistently failing endpoints (e.g. HTTP 451 from US
+      // hosts) back off to one attempt per 10 minutes and one warning per hour;
+      // the engine falls back to Chainlink-synthesized candles meanwhile.
+      if (this.consecutiveErrors >= 3 && Date.now() - this.lastFailMs < 600_000) return;
       try {
         const kl = await fetchKlines1s({
           ...(this.opts.symbol !== undefined ? { symbol: this.opts.symbol } : {}),
@@ -65,15 +72,23 @@ export class BinanceKlinesPoller {
         this.candles = kl;
         this.lastFetchTsMs = Date.now();
         this.lastError = null;
+        this.consecutiveErrors = 0;
         this.opts.onUpdate?.(kl);
       } catch (e) {
         this.lastError = String(e);
-        this.opts.onError?.(this.lastError);
+        this.consecutiveErrors += 1;
+        this.lastFailMs = Date.now();
+        if (Date.now() - this.lastErrorLogMs > 3_600_000 || this.consecutiveErrors <= 3) {
+          this.lastErrorLogMs = Date.now();
+          this.opts.onError?.(this.lastError);
+        }
       }
     };
     void tick();
     this.timer = setInterval(() => void tick(), interval);
   }
+
+  private lastFailMs = 0;
 
   stop(): void {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
