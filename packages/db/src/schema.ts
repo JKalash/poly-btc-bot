@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   bigint, bigserial, boolean, doublePrecision, index, integer, jsonb,
   pgTable, serial, text, uniqueIndex,
@@ -228,6 +229,7 @@ export const positions = pgTable("positions", {
   shares6: bigint("shares6", { mode: "bigint" }).notNull(),
   avgPrice6: bigint("avg_price6", { mode: "bigint" }).notNull(),
   cost6: bigint("cost6", { mode: "bigint" }).notNull(),
+  fees6: bigint("fees6", { mode: "bigint" }).notNull().default(sql`0`),
   stake6: bigint("stake6", { mode: "bigint" }).notNull(),
   exitPolicy: text("exit_policy").notNull(),
   status: text("status").notNull(), // OPEN | RESOLVED

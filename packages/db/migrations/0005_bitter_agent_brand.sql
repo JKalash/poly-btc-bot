@@ -1,0 +1,1 @@
+ALTER TABLE "positions" ADD COLUMN "fees6" bigint DEFAULT 0 NOT NULL;
