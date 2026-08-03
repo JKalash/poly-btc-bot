@@ -165,7 +165,7 @@ async function seedTutorial(db: DbHandle, nowMs: number): Promise<void> {
     priceToBeatCapturedAtMs: startEpoch * 1000,
     discoveredAtMs: nowMs,
     updatedAtMs: nowMs,
-  });
+  }).onConflictDoNothing();
 
   const decisionData = {
     tutorial: true,
@@ -190,11 +190,11 @@ async function seedTutorial(db: DbHandle, nowMs: number): Promise<void> {
     correlationId: "tutorial",
     data: decisionData,
     createdAtMs: (endEpoch - 30) * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(orderIntents).values({
     id: T.intent, decisionId: T.decision, version: 1, idempotencyKey: "seed-tutorial-idem",
     payload: { tutorial: true }, createdAtMs: (endEpoch - 30) * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(orders).values({
     id: T.order, intentId: T.intent, decisionId: T.decision, marketId: T.market,
     tokenId: "seed-up-token", outcomeSide: "UP", orderSide: "BUY", style: "taker_fok",
@@ -202,28 +202,28 @@ async function seedTutorial(db: DbHandle, nowMs: number): Promise<void> {
     price6: 950_000n, shares6: 839_000_000n, filledShares6: 839_000_000n,
     stake6: 799_839_675n, mode: "paper", status: "MATCHED",
     statusReason: "tutorial seed", createdAtMs: (endEpoch - 30) * 1000, updatedAtMs: (endEpoch - 29) * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(orderFills).values({
     id: T.fill, orderId: T.order, price6: 950_000n, shares6: 839_000_000n,
     feeUsdc6: 2_789_675n, maker: false, tsMs: (endEpoch - 29) * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(positions).values({
     id: T.position, marketId: T.market, decisionId: T.decision, mode: "paper",
     outcomeSide: "UP", shares6: 839_000_000n, avgPrice6: 950_000n,
     cost6: 797_050_000n, stake6: 799_839_675n, exitPolicy: "hold_to_resolution",
     status: "RESOLVED", outcome: "UP", pnl6: 39_160_325n,
     openedAtMs: (endEpoch - 29) * 1000, resolvedAtMs: endEpoch * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(resolutions).values({
     id: T.resolution, marketId: T.market, outcome: "UP",
     priceToBeatText: "64180.55", finalValueText: "64201.12", officialOutcome: "UP",
     mismatch: false, source: "seed", resolvedAtMs: endEpoch * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(pnlRecords).values({
     id: T.decision.replace("d1", "91"), mode: "paper", marketId: T.market, positionId: T.position,
     gross6: 41_950_000n, fees6: 2_789_675n, rebates6: 0n, net6: 39_160_325n,
     meta: { tutorial: true }, createdAtMs: endEpoch * 1000,
-  });
+  }).onConflictDoNothing();
   await db.db.insert(engineKv).values({
     key: "tutorial_95c",
     value: decisionData,
