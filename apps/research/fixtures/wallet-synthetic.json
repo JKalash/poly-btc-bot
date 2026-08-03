@@ -1,0 +1,29 @@
+{
+  "_comment": "SYNTHETIC RESEARCH FIXTURE (R12) — not a real wallet, no network involved. Constructed so NAIVE flow accounting shows a healthy profit (+369.58 USDC) while honest reconstruction shows trading P&L is NEGATIVE (-25.42 USDC): the apparent edge is paid liquidity rewards + rebates (+225), an unrealized inventory mark (+120), and an unlabeled inbound transfer (+50) a naive observer cannot tell from winnings.",
+  "walletAddress": "0x00000000000000000000000000000000f1x70001",
+  "funderWallet": null,
+  "observationStartMs": 1770000000000,
+  "observationEndMs": 1770021600000,
+  "source": "synthetic-fixture",
+  "historyComplete": false,
+  "provenance": {
+    "claimText": "Public leaderboard-style claim: this wallet 'made +369 USDC in six hours trading BTC 5-minute markets'. Models the naive flow-accounting view behind profitable-wallet posts.",
+    "claimSource": "synthetic construction (apps/research/fixtures/wallet-synthetic.json); no external wallet observed",
+    "retrievedAtMs": null
+  },
+  "marks": {
+    "T-YES-2": "0.70"
+  },
+  "records": [
+    { "kind": "DEPOSIT", "tsMs": 1770000000000, "amountUsdc": "1000" },
+    { "kind": "TRADE", "tsMs": 1770000300000, "marketId": "M1", "tokenId": "T-YES-1", "side": "BUY", "shares": "600", "price": "0.50", "feeUsdc": "3", "role": "MAKER" },
+    { "kind": "TRADE", "tsMs": 1770001200000, "marketId": "M1", "tokenId": "T-YES-1", "side": "SELL", "shares": "600", "price": "0.47", "feeUsdc": "2.82", "role": "TAKER" },
+    { "kind": "SPLIT", "tsMs": 1770001800000, "marketId": "M1", "amountUsdc": "200", "yesTokenId": "T-YES-1", "noTokenId": "T-NO-1" },
+    { "kind": "MERGE", "tsMs": 1770002400000, "marketId": "M1", "amountUsdc": "200", "yesTokenId": "T-YES-1", "noTokenId": "T-NO-1" },
+    { "kind": "TRADE", "tsMs": 1770003600000, "marketId": "M2", "tokenId": "T-YES-2", "side": "BUY", "shares": "400", "price": "0.40", "feeUsdc": "1.60", "role": "MAKER" },
+    { "kind": "REWARD_PAID", "tsMs": 1770007200000, "program": "LIQUIDITY_REWARD", "epochKey": "2026-06-01", "amountUsdc": "180" },
+    { "kind": "REBATE_PAID", "tsMs": 1770007201000, "epochKey": "2026-06-01", "amountUsdc": "45" },
+    { "kind": "TRANSFER_IN", "tsMs": 1770010800000, "amountUsdc": "50", "counterparty": null, "label": null },
+    { "kind": "WITHDRAWAL", "tsMs": 1770014400000, "amountUsdc": "100" }
+  ]
+}

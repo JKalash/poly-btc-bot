@@ -1,0 +1,21 @@
+{
+  "_comment": "SYNTHETIC RESEARCH FIXTURE (R12), contrast case — not a real wallet, no network involved. Trading P&L is GENUINELY positive (+298 USDC realized, fees included) with zero incentive income, no open inventory, and a complete labeled history: honest and naive accounting agree exactly.",
+  "walletAddress": "0x00000000000000000000000000000000f1x70002",
+  "funderWallet": null,
+  "observationStartMs": 1770000000000,
+  "observationEndMs": 1770021600000,
+  "source": "synthetic-fixture",
+  "historyComplete": true,
+  "provenance": {
+    "claimText": "Contrast fixture: a wallet whose profit survives honest accounting — one resolved directional trade, no rewards, no unlabeled flows.",
+    "claimSource": "synthetic construction (apps/research/fixtures/wallet-synthetic-genuine.json); no external wallet observed",
+    "retrievedAtMs": null
+  },
+  "marks": {},
+  "records": [
+    { "kind": "DEPOSIT", "tsMs": 1770000000000, "amountUsdc": "500" },
+    { "kind": "TRADE", "tsMs": 1770000600000, "marketId": "M9", "tokenId": "T-YES-9", "side": "BUY", "shares": "500", "price": "0.40", "feeUsdc": "2", "role": "TAKER" },
+    { "kind": "REDEEM", "tsMs": 1770004200000, "marketId": "M9", "tokenId": "T-YES-9", "shares": "500", "payoutUsdc": "500" },
+    { "kind": "WITHDRAWAL", "tsMs": 1770007200000, "amountUsdc": "700" }
+  ]
+}

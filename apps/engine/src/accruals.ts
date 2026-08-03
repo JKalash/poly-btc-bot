@@ -237,15 +237,23 @@ export class LiquidityRewardLedger extends AccrualLedgerBase<LiquidityRewardAccr
     this.advance(id, "ACCRUED", nowMs, amount6, { qualifyingUptimeMs });
   }
 
-  /** Accumulate additional qualifying uptime onto an already-ACCRUED entry (state unchanged). */
-  addQualifiedUptime(id: string, additionalAmount6: Usdc6, additionalUptimeMs: number, nowMs: number): void {
+  /**
+   * Amount/uptime REVISION on an already-ACCRUED epoch entry (more qualifying
+   * uptime observed within the same reward epoch). Not a state transition —
+   * amount6 is the "current best estimate" per the domain contract — and it
+   * refuses every other state, so PENDING/PAID/DISPUTED totals can never be
+   * silently inflated.
+   */
+  addQualifiedUptime(id: string, addAmount6: Usdc6, addUptimeMs: number, nowMs: number): void {
     const e = this.get(id);
-    if (e.state !== "ACCRUED") throw new AccrualError(`addQualifiedUptime requires ACCRUED; entry ${id} is ${e.state}`);
-    if (additionalAmount6 < 0n) throw new AccrualError("accrual amounts are non-negative");
+    if (e.state !== "ACCRUED") {
+      throw new AccrualError(`addQualifiedUptime requires an ACCRUED entry; ${id} is ${e.state}`);
+    }
+    if (addAmount6 < 0n || addUptimeMs < 0) throw new AccrualError("accrual amounts are non-negative");
     const next: LiquidityRewardAccrual = {
       ...e,
-      amount6: e.amount6 + additionalAmount6,
-      qualifyingUptimeMs: (e.qualifyingUptimeMs ?? 0) + additionalUptimeMs,
+      amount6: e.amount6 + addAmount6,
+      qualifyingUptimeMs: (e.qualifyingUptimeMs ?? 0) + addUptimeMs,
       updatedAtMs: nowMs,
     };
     this.entries.set(id, next);

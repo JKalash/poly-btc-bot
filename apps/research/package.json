@@ -14,6 +14,8 @@
     "backfill": "tsx src/cli-backfill.ts",
     "promote": "tsx src/cli-promote.ts",
     "seed:calibration": "tsx src/cli-seed-calibration.ts",
+    "repro": "tsx src/cli-repro.ts",
+    "wallet-research": "tsx src/cli-wallet-research.ts",
     "build": "tsc --noEmit",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",

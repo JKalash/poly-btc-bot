@@ -72,6 +72,22 @@ export interface CockpitState {
   openPositions: Array<{ id: string; marketId: string; side: string; shares6: string; cost6: string; stake6: string }>;
 }
 
+/**
+ * Runtime shape guard for cockpit payloads. /api/state serves an OFFLINE
+ * fallback ({ engineState: "OFFLINE", note }) when no engine has ever
+ * published state — it has no bankroll/feeds, and rendering it as a full
+ * CockpitState crashed the Shell (reading `bankroll6` of undefined). Only a
+ * payload carrying the objects the Shell dereferences may become state.
+ */
+function isCockpitState(v: unknown): v is CockpitState {
+  if (typeof v !== "object" || v === null) return false;
+  const s = v as { bankroll?: unknown; feeds?: unknown };
+  return (
+    typeof s.bankroll === "object" && s.bankroll !== null &&
+    typeof s.feeds === "object" && s.feeds !== null
+  );
+}
+
 /** Live cockpit: WebSocket (ticket auth) with automatic polling fallback. */
 export function useCockpit(): { state: CockpitState | null; live: boolean } {
   const [state, setState] = useState<CockpitState | null>(null);
@@ -83,20 +99,28 @@ export function useCockpit(): { state: CockpitState | null; live: boolean } {
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     const poll = () => {
-      api<CockpitState>("/api/state").then((s) => { if (!stopped) setState(s); }).catch(() => undefined);
+      // OFFLINE fallback / partial payloads fail the shape guard and leave
+      // state null — the Shell renders its own OFFLINE presentation for null.
+      api<unknown>("/api/state").then((s) => { if (!stopped && isCockpitState(s)) setState(s); }).catch(() => undefined);
     };
 
     const connect = async () => {
       try {
         const { ticket } = await api<{ ticket: string }>("/api/ws-ticket");
         const proto = location.protocol === "https:" ? "wss" : "ws";
-        const wsUrl = `${proto}://127.0.0.1:8787/api/ws?ticket=${ticket}`;
+        // Same-origin by default: the dashboard proxies /api/* to the API
+        // service (next.config rewrites), so the socket follows
+        // window.location wherever the app is served. The Next DEV server does
+        // not proxy WebSocket upgrades, so dev falls back to the API's local
+        // address (kept in the CSP connect-src for exactly this case).
+        const host = process.env.NODE_ENV === "development" ? "127.0.0.1:8787" : location.host;
+        const wsUrl = `${proto}://${host}/api/ws?ticket=${ticket}`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
         ws.onmessage = (ev) => {
           try {
-            const msg = JSON.parse(ev.data as string) as { channel: string; payload: CockpitState };
-            if (msg.channel === "cockpit" && !stopped) { setState(msg.payload); setLive(true); }
+            const msg = JSON.parse(ev.data as string) as { channel: string; payload: unknown };
+            if (msg.channel === "cockpit" && !stopped && isCockpitState(msg.payload)) { setState(msg.payload); setLive(true); }
           } catch { /* ignore */ }
         };
         ws.onclose = () => { setLive(false); };
