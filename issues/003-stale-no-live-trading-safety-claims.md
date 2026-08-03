@@ -12,7 +12,8 @@ The repo's headline safety claim is false in the current tree. A complete live-t
 - `README.md:4-6` — "Live execution does not exist in this release: there is no signing path anywhere in the codebase, by design."
 - `README.md:68` — "Paper mode by default; **live trading disabled** — no signing path exists at all."
 - `docs/limitations.md` — "**Live trading** — entire path absent by design. `DisabledLiveAdapter` refuses everything. LIVE_* engine states exist in the FSM but are unreachable."
-- Reality: `apps/engine/src/live.ts` (`LiveController`, `HOT_WALLET_PRIVATE_KEY`, `LIVE_TRADING_ENABLED`), `packages/polymarket/src/execution.ts` (`LiveClobAdapter`), `apps/engine/src/engine.ts:713-735` (live submission path), and `docs/live-trading.md` ("how to configure a wallet, arm, and place REAL orders").
+- `packages/polymarket/src/execution.ts:3-8,42-51` — the interface header states "this release ships NO live signing path at all: no private key handling exists anywhere in the codebase, by design," and `DisabledLiveAdapter` claims to be "The only 'live' adapter in this release" — both false in this tree. `DisabledLiveAdapter` and `ExecutionAdapter.kind` are unused anywhere in `apps/` (grep-confirmed), and `LiveClobAdapter` deliberately reports `kind = "live_disabled"` (`packages/polymarket/src/live.ts:55`) — a masquerade that would misinform any future consumer that gates on `kind`.
+- Reality: `apps/engine/src/live.ts` (`LiveController`, `HOT_WALLET_PRIVATE_KEY`, `LIVE_TRADING_ENABLED`), `packages/polymarket/src/live.ts` (`LiveClobAdapter`, full signing path via @polymarket/clob-client), `apps/engine/src/engine.ts:713-735` (live submission path), and `docs/live-trading.md` ("how to configure a wallet, arm, and place REAL orders").
 
 ## Failure scenario
 
