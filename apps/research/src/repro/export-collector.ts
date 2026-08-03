@@ -111,7 +111,7 @@ export async function exportCollector(root: string, outDir: string): Promise<Col
     const featsRaw = await paged("feature_snapshots", "market_id, ts_ms, features");
     const feats = featsRaw
       .filter((r) => resolvedIds.has(String(r.market_id)))
-      .map((r) => {
+      .map((r): Record<string, unknown> => {
         const e = epochByMarket.get(String(r.market_id))!;
         return { ...r, start_epoch: e.start, end_epoch: e.end, outcome: e.outcome };
       });

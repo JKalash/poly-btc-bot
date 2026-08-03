@@ -31,6 +31,7 @@ function healthyCtx(overrides: Partial<RiskContext> = {}): RiskContext {
     conservativeProbability: prob("0.60"),
     feeSchedule: { ratePpm: ppm("0.07"), collection: "usdc" },
     modelApprovedForMode: true, strategyValidatedForMode: true,
+    calibrationRequired: true, modelCalibrated: true,
     coolingOffUntilMs: null, nowMs: 1_000_000,
     idempotencyKeyIsDuplicate: false,
     requestedStakeFractionPpm: null, minOrderStake6: usdc("1"),

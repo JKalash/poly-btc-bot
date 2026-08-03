@@ -187,6 +187,7 @@ export function createCalibratedLogisticModel(opts: CalibratedModelOptions = {})
     version,
     approvedForPaper,
     approvedForLive,
+    calibrated: artifact !== null,
     state,
     estimate(f: FeatureSet): ProbabilityEstimate | null {
       if (artifact === null || fit === null) return null;
