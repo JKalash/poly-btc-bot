@@ -598,6 +598,11 @@ export class Engine {
       // acknowledgement), so these two governance gates pass; all economic and
       // safety gates below remain in force.
       modelApprovedForMode: liveArmed ? true : (this.mode === "paper" || this.mode === "shadow" ? model.approvedForPaper : model.approvedForLive),
+      // calibration_required is a config policy, not an arming governance gate:
+      // it holds in every mode, including live-armed. Trading an uncalibrated
+      // model requires the explicit config change calibration_required: false.
+      calibrationRequired: this.cfg.strategy.calibration_required,
+      modelCalibrated: model.calibrated,
       strategyValidatedForMode: true,
       coolingOffUntilMs: null,
       nowMs,
@@ -644,6 +649,7 @@ export class Engine {
       feeRebatePpm: rt.fee?.rebateRatePpm ?? 0n,
       feeCollection: feeSchedule.collection,
       verdict,
+      modelCalibrated: model.calibrated,
       profileName,
       limits: limitsToStrings(limits),
       cfg: this.cfg,

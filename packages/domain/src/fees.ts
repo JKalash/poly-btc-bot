@@ -47,10 +47,13 @@ export function breakEvenTakerUsdcCollected(p: Prob6, ratePpm: Ppm): Prob6 {
 
 /** Taker break-even, share-collected: q* = p / (1 - f*(1-p)). Rounded up. */
 export function breakEvenTakerShareCollected(p: Prob6, ratePpm: Ppm): Prob6 {
-  const feeFactor = mulDiv(ratePpm, ONE - p, PPM, "floor"); // f*(1-p) in prob6
-  const denom = ONE - feeFactor;
+  // Single exact ceiling division on the full rational — flooring an
+  // intermediate fee factor inflates the denominator and can land 1 micro-unit
+  // BELOW the true ceiling, violating the conservative-rounding contract:
+  //   q* = ceil( p * PPM * ONE / (PPM*ONE - ratePpm*(ONE - p)) )
+  const denom = PPM * ONE - ratePpm * (ONE - p);
   if (denom <= 0n) throw new Error("degenerate fee schedule");
-  return mulDiv(p, ONE, denom, "ceil");
+  return mulDiv(p * PPM, ONE, denom, "ceil");
 }
 
 export function breakEvenTaker(p: Prob6, sched: Pick<FeeSchedule, "ratePpm" | "collection">): Prob6 {

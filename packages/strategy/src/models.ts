@@ -21,6 +21,13 @@ export interface ProbabilityModel {
   version: string;
   approvedForLive: boolean;
   approvedForPaper: boolean;
+  /**
+   * True only when the model's probabilities are backed by a walk-forward
+   * calibration artifact — or, for the book baseline, are definitionally the
+   * market's own price (there is no fitted mapping to be miscalibrated).
+   * Enforced by the risk engine when `strategy.calibration_required` is set.
+   */
+  calibrated: boolean;
   estimate(f: FeatureSet): ProbabilityEstimate | null;
 }
 
@@ -43,6 +50,7 @@ export const bookBaselineModel: ProbabilityModel = {
   version: "book_baseline_v1",
   approvedForLive: false,
   approvedForPaper: true,
+  calibrated: true,
   estimate(f: FeatureSet): ProbabilityEstimate | null {
     if (f.upMid === null || f.upSpread === null) return null;
     const halfSpread = f.upSpread / 2;
@@ -81,6 +89,7 @@ export const distanceVolHeuristicModel: ProbabilityModel = {
   version: "distance_vol_heuristic_v1_UNCALIBRATED",
   approvedForLive: false,
   approvedForPaper: true,
+  calibrated: false,
   estimate(f: FeatureSet): ProbabilityEstimate | null {
     if (f.distanceZ === null || f.estRemainingMoveStdBps === null) return null;
     const pUp = studentT3Cdf(f.distanceZ);
@@ -118,6 +127,8 @@ export const calibratedLogisticModel: ProbabilityModel = {
   version: "calibrated_logistic_v0_NO_ARTIFACT",
   approvedForLive: false,
   approvedForPaper: false,
+  calibrated: false, // no artifact in this build
+
   estimate(): ProbabilityEstimate | null {
     return null; // no calibration artifact in this build
   },
@@ -134,6 +145,7 @@ export const binanceCompositeModel: ProbabilityModel = {
   version: "binance_composite_v1_UNCALIBRATED",
   approvedForLive: false,
   approvedForPaper: true,
+  calibrated: false,
   estimate(f: FeatureSet): ProbabilityEstimate | null {
     const ind = f.indicators;
     if (!ind || ind.direction === null) return null;

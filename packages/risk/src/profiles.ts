@@ -69,6 +69,20 @@ export const RISK_PROFILES: Record<Exclude<RiskProfileName, "custom">, RiskLimit
   },
 };
 
+// The built-in profiles are safety constants: freeze them (fields are scalars,
+// so a shallow freeze per object is deep) so no code path can silently raise a
+// live cap by mutation. Changing a profile requires a source change.
+Object.freeze(RISK_PROFILES);
+for (const p of Object.values(RISK_PROFILES)) Object.freeze(p);
+
+/**
+ * Custom loss stops may not exceed the most aggressive built-in profile.
+ * Session/daily loss limits are stops on REAL drawdown when live is armed;
+ * without a ceiling a custom "1.0" would disable them entirely.
+ */
+export const MAX_CUSTOM_SESSION_LOSS_PPM = RISK_PROFILES.very_aggressive.sessionLossLimitPpm;
+export const MAX_CUSTOM_DAILY_LOSS_PPM = RISK_PROFILES.very_aggressive.dailyLossLimitPpm;
+
 /** Custom profiles clamp to the absolute cap; there is deliberately no "all in" configuration. */
 export function clampCustomProfile(limits: RiskLimits): { limits: RiskLimits; clamped: boolean } {
   let clamped = false;
@@ -79,6 +93,14 @@ export function clampCustomProfile(limits: RiskLimits): { limits: RiskLimits; cl
   }
   if (out.baseRiskFractionPpm > out.maxRiskFractionPpm) {
     out.baseRiskFractionPpm = out.maxRiskFractionPpm;
+    clamped = true;
+  }
+  if (out.sessionLossLimitPpm > MAX_CUSTOM_SESSION_LOSS_PPM) {
+    out.sessionLossLimitPpm = MAX_CUSTOM_SESSION_LOSS_PPM;
+    clamped = true;
+  }
+  if (out.dailyLossLimitPpm > MAX_CUSTOM_DAILY_LOSS_PPM) {
+    out.dailyLossLimitPpm = MAX_CUSTOM_DAILY_LOSS_PPM;
     clamped = true;
   }
   return { limits: out, clamped };
