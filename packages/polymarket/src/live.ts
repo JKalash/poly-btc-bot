@@ -52,8 +52,10 @@ function toTickSize(tickSize6: Prob6): "0.1" | "0.01" | "0.001" | "0.0001" {
 }
 
 export class LiveClobAdapter implements ExecutionAdapter {
-  readonly kind = "live_disabled" as const; // reported kind stays conservative; realKind distinguishes
-  readonly realKind = "live" as const;
+  // Honest kind: any consumer gating on `kind` must see this adapter for what
+  // it is — a real-money signing path (masquerading as "live_disabled" would
+  // misinform exactly the code that most needs the truth).
+  readonly kind = "live" as const;
 
   private client: ClobClientT | null = null;
   private creds: ApiKeyCredsT | null = null;
@@ -192,6 +194,46 @@ export class LiveClobAdapter implements ExecutionAdapter {
     }
   }
 
+  /**
+   * Total matched size per order id from the account's trade history. Covers
+   * resting maker fills that arrive AFTER submission ack — the CLOB has no
+   * push channel wired here, so the engine polls this while orders are open.
+   * Returns aggregate fills (shares + size-weighted average price) for every
+   * requested order id that appears in trade history.
+   */
+  async fillsForOrders(externalIds: string[]): Promise<Map<string, { filledShares6: Shares6; avgPrice6: Prob6 | null }>> {
+    const out = new Map<string, { filledShares6: Shares6; avgPrice6: Prob6 | null }>();
+    if (externalIds.length === 0) return out;
+    await this.init();
+    const ids = new Set(externalIds.map(String));
+    const acc = new Map<string, { shares6: bigint; notional6: bigint }>();
+    const add = (orderId: unknown, size: unknown, price: unknown): void => {
+      const id = String(orderId);
+      if (!ids.has(id)) return;
+      const s6 = sharesFromDecimalString(size);
+      if (s6 <= 0n) return;
+      const p6 = priceFromDecimalString(price);
+      const cur = acc.get(id) ?? { shares6: 0n, notional6: 0n };
+      cur.shares6 += s6;
+      cur.notional6 += (s6 * p6) / 1_000_000n;
+      acc.set(id, cur);
+    };
+    const trades = await this.client.getTrades();
+    for (const t of Array.isArray(trades) ? trades : []) {
+      if (t?.taker_order_id) add(t.taker_order_id, t.size, t.price);
+      for (const mo of Array.isArray(t?.maker_orders) ? t.maker_orders : []) {
+        add(mo?.order_id, mo?.matched_amount, mo?.price);
+      }
+    }
+    for (const [id, a] of acc) {
+      out.set(id, {
+        filledShares6: a.shares6,
+        avgPrice6: a.shares6 > 0n ? (a.notional6 * 1_000_000n) / a.shares6 : null,
+      });
+    }
+    return out;
+  }
+
   async cancel(externalId: string): Promise<{ ok: boolean; reason?: string }> {
     try {
       await this.init();
@@ -241,6 +283,18 @@ function usdcFromDecimalString(s: string | number): Usdc6 {
 
 function costGuess(shares6: Shares6, price6: Prob6): Usdc6 {
   return (shares6 * price6 + 999_999n) / 1_000_000n;
+}
+
+function sharesFromDecimalString(s: unknown): Shares6 {
+  const n = typeof s === "number" ? s : Number(s);
+  if (!Number.isFinite(n) || n <= 0) return 0n;
+  return BigInt(Math.round(n * 1_000_000));
+}
+
+function priceFromDecimalString(s: unknown): Prob6 {
+  const n = typeof s === "number" ? s : Number(s);
+  if (!Number.isFinite(n) || n <= 0) return 0n;
+  return BigInt(Math.round(n * 1_000_000));
 }
 
 /**

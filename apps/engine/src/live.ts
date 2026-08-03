@@ -1,10 +1,10 @@
-import { orderFills, orders as ordersTable, type DbHandle } from "@b5p/db";
+import { orderFills, orders as ordersTable, pnlRecords, positions as positionsTable, type DbHandle } from "@b5p/db";
 import { newId } from "@b5p/domain/ids";
 import {
   mulDiv, usdc, type BankrollState, type OutcomeSide, type Prob6, type Shares6, type Usdc6,
 } from "@b5p/domain";
 import { LiveClobAdapter, type LivePreflight, type OrderRequest } from "@b5p/polymarket";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { logger } from "./log";
 
 /**
@@ -41,6 +41,19 @@ export interface ArmResult {
   expiresAtMs?: number;
 }
 
+interface LiveOpenPosition {
+  positionId: string;
+  marketId: string;
+  decisionId: string | null;
+  side: OutcomeSide;
+  shares6: Shares6;
+  cost6: Usdc6;
+  fees6: Usdc6;
+  stake6: Usdc6;
+  exitPolicy: string;
+  openedAtMs: number;
+}
+
 export class LiveController {
   private adapter: LiveClobAdapter | null = null;
   state: ArmState = "DISARMED";
@@ -51,6 +64,10 @@ export class LiveController {
   dailyPeak6: Usdc6 = 0n;
   consecutiveLosses = 0;
   private openMarkets = new Set<string>();
+  /** marketId -> live position built from RECORDED fills only. */
+  private positions = new Map<string, LiveOpenPosition>();
+  /** orderId -> stake reserved by a resting (unfilled) live order. */
+  private restingReserve = new Map<string, { marketId: string; stake6: Usdc6 }>();
   disarmReason: string | null = null;
 
   constructor(private readonly db: DbHandle) {
@@ -132,6 +149,14 @@ export class LiveController {
     }
   }
 
+  /** Cash at risk right now: recorded open positions plus resting-order reservations. */
+  openExposure6(): Usdc6 {
+    let total = 0n;
+    for (const p of this.positions.values()) total += p.stake6;
+    for (const r of this.restingReserve.values()) total += r.stake6;
+    return total;
+  }
+
   /** BankrollState the risk engine consumes when live-armed (real USDC, session/daily peaks from arm time). */
   bankState(): BankrollState {
     return {
@@ -142,16 +167,195 @@ export class LiveController {
       dailyRealized: this.liveBankroll6 - this.dailyPeak6,
       consecutiveLosses: this.consecutiveLosses,
       openPositions: this.openMarkets.size,
-      openExposure: 0n,
+      openExposure: this.openExposure6(),
       reconciled: this.lastPreflight?.ok ?? false,
     };
   }
 
   hasOpenPosition(marketId: string): boolean { return this.openMarkets.has(marketId); }
   markOpen(marketId: string): void { this.openMarkets.add(marketId); }
-  markClosed(marketId: string, won: boolean): void {
+  /**
+   * Close a market's live bookkeeping. `won === null` means NO fill was ever
+   * recorded — outcome unknown, and unknown is never counted as a loss (a
+   * winning resting fill mistaken for a loss would trip the consecutive-loss
+   * stop on wins; a real loss is captured by settle() from recorded fills).
+   */
+  markClosed(marketId: string, won: boolean | null): void {
     this.openMarkets.delete(marketId);
+    if (won === null) return;
     if (won) this.consecutiveLosses = 0; else this.consecutiveLosses += 1;
+  }
+
+  livePositionsList(): LiveOpenPosition[] {
+    return [...this.positions.values()];
+  }
+
+  /**
+   * Record a live fill into the position ledger (memory + positions row,
+   * mode "live") so risk exposure, resolution accounting and the dashboard
+   * all see real fills. Mirrors Accounting.onFill for the live path.
+   */
+  private async applyFill(args: {
+    marketId: string;
+    decisionId: string | null;
+    side: OutcomeSide;
+    shares6: Shares6;
+    price6: Prob6;
+    fee6: Usdc6;
+    exitPolicy: string;
+    nowMs: number;
+  }): Promise<void> {
+    const cost6 = mulDiv(args.shares6, args.price6, 1_000_000n, "ceil");
+    let pos = this.positions.get(args.marketId);
+    if (!pos) {
+      pos = {
+        positionId: newId(),
+        marketId: args.marketId,
+        decisionId: args.decisionId,
+        side: args.side,
+        shares6: 0n,
+        cost6: 0n,
+        fees6: 0n,
+        stake6: 0n,
+        exitPolicy: args.exitPolicy,
+        openedAtMs: args.nowMs,
+      };
+      this.positions.set(args.marketId, pos);
+      await this.db.db.insert(positionsTable).values({
+        id: pos.positionId,
+        marketId: pos.marketId,
+        decisionId: pos.decisionId,
+        mode: "live",
+        outcomeSide: pos.side,
+        shares6: 0n,
+        avgPrice6: 0n,
+        cost6: 0n,
+        fees6: 0n,
+        stake6: 0n,
+        exitPolicy: pos.exitPolicy,
+        status: "OPEN",
+        openedAtMs: pos.openedAtMs,
+      });
+    }
+    pos.shares6 += args.shares6;
+    pos.cost6 += cost6;
+    pos.fees6 += args.fee6;
+    pos.stake6 += cost6 + args.fee6;
+    const avg = pos.shares6 > 0n ? mulDiv(pos.cost6, 1_000_000n, pos.shares6, "half-even") : 0n;
+    await this.db.db.update(positionsTable)
+      .set({ shares6: pos.shares6, cost6: pos.cost6, fees6: pos.fees6, stake6: pos.stake6, avgPrice6: avg })
+      .where(eq(positionsTable.id, pos.positionId));
+  }
+
+  /**
+   * Poll the exchange for fills on non-terminal live orders. The default
+   * strategy is maker-only, so fills usually arrive AFTER the submission ack —
+   * without this, resting fills would never reach orders/order_fills, the
+   * position ledger, or the win/loss logic. Runs whenever the adapter is
+   * configured (even disarmed: a disarm must not blind the books to fills on
+   * orders that are already on the exchange).
+   */
+  async pollOpenOrders(nowMs: number): Promise<void> {
+    if (!this.adapter) return;
+    const open = await this.db.db.select().from(ordersTable).where(and(
+      eq(ordersTable.mode, "live"),
+      inArray(ordersTable.status, ["PENDING", "LIVE", "DELAYED", "PARTIAL"]),
+    ));
+    if (open.length === 0) return;
+    let fills: Awaited<ReturnType<LiveClobAdapter["fillsForOrders"]>>;
+    try {
+      fills = await this.adapter.fillsForOrders(open.filter((o) => o.externalId).map((o) => o.externalId!));
+    } catch (e) {
+      logger.warn("live fill poll failed; will retry", { error: String(e) });
+      return;
+    }
+    for (const o of open) {
+      const agg = o.externalId ? fills.get(o.externalId) : undefined;
+      const total6 = agg?.filledShares6 ?? o.filledShares6;
+      if (total6 > o.filledShares6) {
+        const delta6 = total6 - o.filledShares6;
+        const price6 = agg?.avgPrice6 ?? o.price6;
+        await this.db.db.insert(orderFills).values({
+          id: newId(),
+          orderId: o.id,
+          price6,
+          shares6: delta6,
+          feeUsdc6: 0n,
+          maker: o.postOnly,
+          tradeRef: o.externalId,
+          tsMs: nowMs,
+        });
+        const full = total6 >= o.shares6;
+        await this.db.db.update(ordersTable)
+          .set({ filledShares6: total6, status: full ? "MATCHED" : "PARTIAL", updatedAtMs: nowMs })
+          .where(eq(ordersTable.id, o.id));
+        await this.applyFill({
+          marketId: o.marketId,
+          decisionId: o.decisionId,
+          side: o.outcomeSide as OutcomeSide,
+          shares6: delta6,
+          price6,
+          fee6: 0n,
+          exitPolicy: "hold_to_resolution",
+          nowMs,
+        });
+        if (full) this.restingReserve.delete(o.id);
+        logger.info("live resting fill recorded", { orderId: o.id, shares6: delta6.toString(), price6: price6.toString() });
+      } else if (o.expireAtMs !== null && nowMs > o.expireAtMs + 60_000) {
+        // GTD expiry passed with no (further) fill visible in trade history
+        await this.db.db.update(ordersTable)
+          .set({ status: "EXPIRED", statusReason: "GTD expiry passed", updatedAtMs: nowMs })
+          .where(eq(ordersTable.id, o.id));
+        this.restingReserve.delete(o.id);
+      }
+    }
+  }
+
+  /**
+   * Settle a live position at resolution from RECORDED fills. Returns the net
+   * P&L, or null when no fill was ever recorded (caller must treat that as
+   * unknown, not as a loss). Falls back to the persisted positions row when
+   * process memory was lost between fill and resolution.
+   */
+  async settle(marketId: string, outcome: OutcomeSide, nowMs: number): Promise<Usdc6 | null> {
+    let pos = this.positions.get(marketId) ?? null;
+    if (!pos) {
+      const rows = await this.db.db.select().from(positionsTable).where(and(
+        eq(positionsTable.marketId, marketId), eq(positionsTable.mode, "live"), eq(positionsTable.status, "OPEN"),
+      ));
+      const r = rows[0];
+      if (r && r.shares6 > 0n) {
+        pos = {
+          positionId: r.id, marketId: r.marketId, decisionId: r.decisionId,
+          side: r.outcomeSide as OutcomeSide, shares6: r.shares6, cost6: r.cost6,
+          fees6: r.fees6, stake6: r.stake6, exitPolicy: r.exitPolicy, openedAtMs: r.openedAtMs,
+        };
+      }
+    }
+    if (!pos || pos.shares6 <= 0n) {
+      this.markClosed(marketId, null);
+      return null;
+    }
+    const payout6: Usdc6 = pos.side === outcome ? pos.shares6 : 0n;
+    const net6 = payout6 - pos.cost6 - pos.fees6;
+    await this.db.db.update(positionsTable)
+      .set({ status: "RESOLVED", outcome, pnl6: net6, resolvedAtMs: nowMs })
+      .where(eq(positionsTable.id, pos.positionId));
+    await this.db.db.insert(pnlRecords).values({
+      id: newId(),
+      mode: "live",
+      marketId,
+      positionId: pos.positionId,
+      gross6: payout6 - pos.cost6,
+      fees6: pos.fees6,
+      rebates6: 0n,
+      net6,
+      meta: { side: pos.side, outcome, shares6: pos.shares6.toString(), exitPolicy: pos.exitPolicy },
+      createdAtMs: nowMs,
+    });
+    this.positions.delete(marketId);
+    this.markClosed(marketId, net6 > 0n ? true : net6 < 0n ? false : null);
+    return net6;
   }
 
   /** Submit a live order and persist it + any immediate fill. Returns success. */
@@ -169,6 +373,7 @@ export class LiveController {
     negRisk: boolean;
     expireAtMs?: number;
     idempotencyKey: string;
+    exitPolicy?: string;
     nowMs: number;
   }): Promise<{ ok: boolean; orderId: string; status: string; reason?: string }> {
     if (!this.adapter || this.state !== "ARMED") {
@@ -226,8 +431,8 @@ export class LiveController {
     }).where(eq(ordersTable.id, orderId));
 
     // A MATCHED taker fill is immediate; record it at the requested price as a
-    // conservative proxy (exact fills reconcile from trade history in a later
-    // pass — see docs/limitations.md).
+    // conservative proxy (the fill poller refines from trade history). It goes
+    // through the live position ledger so exposure/resolution/dashboard see it.
     if (res.accepted && status === "MATCHED") {
       await this.db.db.insert(orderFills).values({
         id: newId(),
@@ -240,6 +445,20 @@ export class LiveController {
         tsMs: args.nowMs,
       });
       await this.db.db.update(ordersTable).set({ filledShares6: args.shares6 }).where(eq(ordersTable.id, orderId));
+      await this.applyFill({
+        marketId: args.marketId,
+        decisionId: args.decisionId,
+        side: args.outcomeSide,
+        shares6: args.shares6,
+        price6: args.price6,
+        fee6: 0n,
+        exitPolicy: args.exitPolicy ?? "hold_to_resolution",
+        nowMs: args.nowMs,
+      });
+    } else if (res.accepted) {
+      // resting order: its stake is committed on the exchange — visible to the
+      // risk engine as open exposure until it fills, expires or is canceled
+      this.restingReserve.set(orderId, { marketId: args.marketId, stake6: args.stake6 });
     }
 
     return { ok: res.accepted, orderId, status, ...(res.reason ? { reason: res.reason } : {}) };
@@ -263,6 +482,11 @@ export class LiveController {
       expiresInS: this.state === "ARMED" ? Math.max(0, Math.round((this.expiresAtMs - nowMs) / 1000)) : 0,
       walletAddress: this.address() ? this.address().slice(0, 6) + "…" + this.address().slice(-4) : null,
       liveBankroll6: this.liveBankroll6.toString(),
+      openExposure6: this.openExposure6().toString(),
+      openPositions: this.livePositionsList().map((p) => ({
+        marketId: p.marketId, side: p.side,
+        shares6: p.shares6.toString(), cost6: p.cost6.toString(), stake6: p.stake6.toString(),
+      })),
       disarmReason: this.disarmReason,
       lastPreflightReasons: this.lastPreflight?.reasons ?? [],
     };

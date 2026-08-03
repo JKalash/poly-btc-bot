@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, type AppConfig } from "@b5p/config";
 import {
   auditEvents, configVersions, decisionSnapshots, engineKv, featureSnapshots, healthEvents,
-  killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents, orders,
+  killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents,
   referencePriceTicks, resolutions, riskDecisions, signalCandidates, strategyPromotionDecisions,
   type DbHandle,
 } from "@b5p/db";
@@ -83,6 +83,7 @@ export class Engine {
   private tickPersistQueue: ReferenceTick[] = [];
   private lastFeaturePersistMs = 0;
   private lastLiveRefreshMs = 0;
+  private lastLivePollMs = 0;
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
 
@@ -448,6 +449,12 @@ export class Engine {
     await this.captureBoundaries(nowMs);
     await this.paper.step(nowMs);
     await this.watchdogs(nowMs);
+    // Poll live fills while ANY live order is on the exchange (configured is
+    // enough — a disarm must not blind the books to fills on resting orders).
+    if (this.live.configured && nowMs - this.lastLivePollMs > 5000) {
+      this.lastLivePollMs = nowMs;
+      await this.live.pollOpenOrders(nowMs).catch((e) => logger.warn("live order poll failed", { error: String(e) }));
+    }
     // refresh real USDC balance periodically while armed (drives live drawdown stops)
     if (this.live.isArmed(nowMs) && nowMs - this.lastLiveRefreshMs > 30_000) {
       this.lastLiveRefreshMs = nowMs;
@@ -950,7 +957,7 @@ export class Engine {
           decisionId, intentId, marketId: rt.ref.marketId, tokenId, outcomeSide: side,
           style, price6, shares6, stake6, tickSize6: rt.tickSize6, negRisk: false,
           ...(style === "maker_post_only" ? { expireAtMs: cancelCutoffMs } : {}),
-          idempotencyKey: idemKey, nowMs,
+          idempotencyKey: idemKey, exitPolicy: this.cfg.strategy.exit_policy, nowMs,
         });
       } catch (e) {
         // Transport/adapter exception: outcome unknown. Quarantine the intent —
@@ -1209,11 +1216,16 @@ export class Engine {
       }).onConflictDoNothing();
       await this.db.db.update(marketsTable).set({ status: "RESOLVED", outcome, updatedAtMs: nowMs }).where(eq(marketsTable.id, rt.ref.marketId));
       const pnl = await this.accounting.onResolution(rt.ref.marketId, outcome, nowMs);
-      // live position bookkeeping: mark closed (win/loss feeds consecutive-loss stop) and re-read real balance
+      // Live settlement from RECORDED fills only: settle() computes win/loss
+      // from the position ledger and returns null when no fill was recorded —
+      // unknown is never counted as a loss. Then re-read the real balance.
       if (this.live.hasOpenPosition(rt.ref.marketId)) {
-        const liveOrders = await this.db.db.select().from(orders).where(eq(orders.marketId, rt.ref.marketId));
-        const wonSide = liveOrders.find((o) => o.mode === "live" && o.filledShares6 > 0n)?.outcomeSide;
-        this.live.markClosed(rt.ref.marketId, wonSide === outcome);
+        // catch up on any fills the 5s poll hasn't seen yet before settling
+        await this.live.pollOpenOrders(nowMs).catch(() => undefined);
+        const liveNet = await this.live.settle(rt.ref.marketId, outcome, nowMs);
+        if (liveNet !== null) {
+          await this.audit("resolution", "live_settled", { slug: rt.ref.slug, outcome, net6: liveNet.toString() });
+        }
         await this.live.refreshBankroll();
       }
       await this.audit("resolution", "resolved", { slug: rt.ref.slug, outcome, source, pnl: pnl ?? "no position" });
@@ -1479,7 +1491,7 @@ function customLimitsFromConfig(cfg: AppConfig) {
     minExpectedValuePerCostPpm: ppm(cfg.strategy.min_expected_value_per_cost),
     maxSpread: prob(cfg.execution.max_spread),
     maxPriceImpact: prob(cfg.execution.max_price_impact),
-    liveAllowed: false, // live is disabled in this release regardless of profile
+    liveAllowed: false, // custom profiles can never arm live; only built-in profiles may
   };
 }
 
