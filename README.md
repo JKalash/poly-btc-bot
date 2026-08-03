@@ -91,6 +91,9 @@ verify your jurisdiction before funding anything.
 - `docs/threat-model.md`
 - `docs/live-trading-checklist.md`
 - `docs/limitations.md` — explicit list of what is stubbed or partial
+- `docs/research/calibration-study-2026-08.md` — walk-forward study on 14,226 real markets: the
+  mid-price beats our model at every horizon; maker fills cost −8.8pts; the late favorite drift is
+  real but is the HFT latency pool
 - `docs/research/reddit-5min-bot-ecosystem.md` — dossier on the r/algotrading 5-min bot ecosystem:
   three independent builders replicating this repo's null result, plus free order-book datasets
   (~26.8M ticks CC0; 727M rows Apache-2.0) usable for our calibration studies
