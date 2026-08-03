@@ -15,6 +15,20 @@
       "when": 1785467979899,
       "tag": "0001_tricky_the_order",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785741711647,
+      "tag": "0002_secret_hulk",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1785742858390,
+      "tag": "0003_legal_black_bird",
+      "breakpoints": true
     }
   ]
 }

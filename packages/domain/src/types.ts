@@ -72,6 +72,39 @@ export interface FeeScheduleInfo {
 }
 
 /**
+ * The eight signal quantities, kept DISTINCT end-to-end (snake_case names are
+ * the cross-language contract; fields are the repo's camelCase):
+ * market_probability, model_probability, conservative_probability,
+ * score_strength, effective_break_even_probability, fill_probability,
+ * expected_value_if_filled, expected_value_per_signal.
+ *
+ * INVARIANTS:
+ *  - score_strength is a raw score, NEVER a probability, and NEVER feeds any
+ *    EV computation (an uncalibrated score yields null EVs).
+ *  - Every quantity is per-side (the side being bought), in probability units.
+ *  - These are DIAGNOSTIC doubles; the authoritative approve/size path stays
+ *    in bigint Prob6 inside @b5p/risk. Nothing here sizes money.
+ */
+export interface SignalQuantities {
+  /** Executable market price for the side, as a probability. */
+  marketProbability: number | null;
+  /** CALIBRATED model probability for the side (null when uncalibrated). */
+  modelProbability: number | null;
+  /** Lower-confidence, penalty-adjusted probability (what risk/Kelly sees). */
+  conservativeProbability: number | null;
+  /** Raw composite/indicator score strength. NOT a probability. */
+  scoreStrength: number | null;
+  /** Probability the position must exceed to break even after fees. */
+  effectiveBreakEvenProbability: number | null;
+  /** Probability the resting/marketable order actually fills. */
+  fillProbability: number | null;
+  /** Net EV per unit cost CONDITIONAL on a fill, after all frictions. */
+  expectedValueIfFilled: number | null;
+  /** Unconditional net EV per signal = fill_probability x expected_value_if_filled. */
+  expectedValuePerSignal: number | null;
+}
+
+/**
  * The immutable decision snapshot. Persisted BEFORE any simulated/shadow/live
  * order exists. Everything needed to reconstruct the decision must be here.
  */
@@ -122,6 +155,11 @@ export interface DecisionSnapshotData {
   effectiveBreakEven: string | null;
   evPerCostRaw: number | null;
   evPerCostAfterFriction: number | null;
+  /** Diagnostic doubles completing the eight SignalQuantities (optional: older snapshots predate them). */
+  scoreStrength?: number | null;
+  fillProbability?: number | null;
+  expectedValueIfFilled?: number | null;
+  expectedValuePerSignal?: number | null;
   risk: {
     profile: string;
     limits: Record<string, string>;

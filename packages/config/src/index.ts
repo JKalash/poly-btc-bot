@@ -64,6 +64,10 @@ export const AppConfigSchema = z.object({
     volatility_model: z.enum(["empirical_ewma", "sqrt_time"]).default("empirical_ewma"),
     probability_model: z.enum(["book_baseline", "distance_vol_heuristic", "binance_composite", "calibrated_logistic"]).default("book_baseline"),
     calibration_required: z.boolean().default(true),
+    /** Path to the sealed CalibrationArtifact JSON (null: calibrated_logistic estimates nothing, approved for nothing). */
+    calibrated_artifact_path: z.string().nullable().default(null),
+    /** Path to the persisted StrategyPromotionDecision JSON produced by cli-promote. */
+    promotion_decision_path: z.string().nullable().default(null),
     minute_bucket_standalone_signal: z.literal(false).default(false),
     min_abs_distance_z: z.number().default(0.5),
     min_depth_shares: z.number().default(100),
@@ -141,6 +145,39 @@ export const AppConfigSchema = z.object({
     walk_forward_only: z.literal(true).default(true),
     minimum_candidate_count: z.number().int().default(1000),
     minimum_fill_count_before_live: z.number().int().default(300),
+    walk_forward_folds: z.number().int().min(2).default(4),
+    walk_forward_embargo_ms: z.number().int().min(0).default(60_000),
+    promotion: z.object({
+      min_fill_samples: z.number().int().min(1).default(300),
+      max_ece: z.number().positive().default(0.05),
+      /** Net-EV lower 95% CI must EXCEED this (per-cost fraction) for live promotion. */
+      min_net_ev_lower_ci: z.number().default(0),
+    }).default({}),
+  }).default({}),
+
+  evidence: z.object({
+    /** Every strategy/model input claim must carry a provenance row + label. */
+    require_provenance: z.boolean().default(true),
+    /** OFFICIAL_CURRENT_AT_RETRIEVAL claims older than this are flagged for re-verification. */
+    official_reverify_days: z.number().int().min(1).default(30),
+  }).default({}),
+
+  execution_research: z.object({
+    /** Post-fill markout sampling horizons; resolution markout is always added. */
+    markout_horizons_ms: z.array(z.number().int().positive()).default([250, 1000, 2000, 5000, 10_000, 30_000]),
+    /** A pending markout is dropped (never fabricated) if no book newer than the fill arrives within horizon + grace. */
+    markout_book_grace_ms: z.number().int().min(0).default(30_000),
+    /** Record would-be maker fills that did not happen (counterfactual book). */
+    record_fill_counterfactuals: z.boolean().default(true),
+    /** CONSERVATIVE_STRESS paper-variant knobs (worse latency, one-tick disadvantage, missed fills). */
+    paper_variants: z.object({
+      stress_extra_latency_ms: z.number().int().min(0).default(500),
+      stress_tick_disadvantage_ticks: z.number().int().min(0).default(1),
+      stress_missed_fill_fraction: fraction.default("0.25"),
+      stress_cancel_fail_fraction: fraction.default("0.10"),
+      /** Adverse-selection penalty (bps of filled/remaining notional) charged to CONSERVATIVE_STRESS P&L. */
+      stress_adverse_markout_penalty_bps: z.number().int().min(0).default(100),
+    }).default({}),
   }).default({}),
 });
 
@@ -155,6 +192,29 @@ export const DEFAULT_CONFIG: AppConfig = AppConfigSchema.parse({});
  * code's explicit absolute safety cap is changed").
  */
 export const ABSOLUTE_MAX_RISK_FRACTION = "0.10";
+
+/**
+ * Strategy versions that reproduce external sources (Reddit analysis /
+ * Archetapp gist). Research artifacts by construction: they may run in
+ * paper/shadow but a configuration that points LIVE mode at one is invalid.
+ * The preset registry enforces the same rule at runtime (allowedModes).
+ */
+export const SOURCE_REPRODUCTION_STRATEGIES: readonly string[] = [
+  "late_snipe_composite_v1",
+  "extended_move_fade_v1",
+];
+
+/**
+ * Paper sizing simulations that encode a SOURCE's aggressive sizing (gist
+ * 25%/all-profits/all-in). They exist to demonstrate ruin on simulated money
+ * and are valid only under the paper_exploration profile — never alongside a
+ * profile that could ever route real or shadow flow.
+ */
+export const SOURCE_FIXTURE_SIZING_MODES: readonly string[] = [
+  "gist_safe",
+  "gist_aggressive",
+  "gist_degen",
+];
 
 export interface ConfigValidationIssue {
   path: string;
@@ -182,6 +242,28 @@ export function validateConfig(raw: unknown): { ok: true; config: AppConfig } | 
   }
   if (cfg.strategy.candidate_seconds_remaining_min >= cfg.strategy.candidate_seconds_remaining_max) {
     issues.push({ path: "strategy.candidate_seconds_remaining_min", message: "candidate window min must be < max" });
+  }
+  if (SOURCE_FIXTURE_SIZING_MODES.includes(cfg.paper.sizing_simulation) && cfg.risk.profile !== "paper_exploration") {
+    issues.push({
+      path: "paper.sizing_simulation",
+      message: `source-fixture sizing mode '${cfg.paper.sizing_simulation}' is a paper ruin demonstration; it requires the paper_exploration profile and can never accompany a profile that routes shadow/live flow`,
+    });
+  }
+  if (cfg.app.mode === "live" && SOURCE_REPRODUCTION_STRATEGIES.includes(cfg.strategy.active_version)) {
+    issues.push({
+      path: "strategy.active_version",
+      message: `'${cfg.strategy.active_version}' is a source-reproduction research strategy; it cannot be requested for live mode`,
+    });
+  }
+  if (cfg.research.promotion.min_net_ev_lower_ci < 0) {
+    issues.push({
+      path: "research.promotion.min_net_ev_lower_ci",
+      message: "promotion net-EV lower-CI bound cannot be below 0; a strategy whose lower CI is negative must never be promoted to live",
+    });
+  }
+  if (Number(cfg.execution_research.paper_variants.stress_missed_fill_fraction) > 1
+    || Number(cfg.execution_research.paper_variants.stress_cancel_fail_fraction) > 1) {
+    issues.push({ path: "execution_research.paper_variants", message: "stress fractions must be <= 1" });
   }
   if (issues.length > 0) return { ok: false, issues };
   return { ok: true, config: cfg };

@@ -2,27 +2,38 @@ import { DEFAULT_CONFIG, type AppConfig } from "@b5p/config";
 import {
   auditEvents, configVersions, decisionSnapshots, engineKv, featureSnapshots, healthEvents,
   killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents, orders,
-  referencePriceTicks, resolutions, riskDecisions, signalCandidates, type DbHandle,
+  referencePriceTicks, resolutions, riskDecisions, signalCandidates, strategyPromotionDecisions,
+  type DbHandle,
 } from "@b5p/db";
 import {
   ENGINE_TRANSITIONS, MARKET_TRANSITIONS, canTransition, makerEdgeSatisfied, parseFixed,
   ppm, prob, roundSharesToLot, sharesForStake, shares as sharesOf, usdc,
-  type EngineState, type MarketInstanceState, type MarketRef, type Mode, type OutcomeSide,
-  type Ppm, type Prob6, type ReferenceTick, type Usdc6,
+  type EngineState, type ExecutionMode, type MarketInstanceState, type MarketRef, type Mode,
+  type OutcomeSide, type Ppm, type Prob6, type ReferenceTick, type Usdc6,
 } from "@b5p/domain";
 import { idempotencyKey, newId, sha256Hex } from "@b5p/domain/ids";
+import { resolveExecutionResearchConfig, type ResolvedExecutionResearchConfig } from "./execution-constants";
+import { ExecutionGuardRegistry } from "./execution-invariants";
+import { ExecutionPersistence } from "./execution-persistence";
+import { ExecutionTimeline, durationUs, monotonicNs } from "./execution-timeline";
+import { FillCounterfactualRecorder, MarkoutSampler } from "./markout";
+import { PaperVariantEngine } from "./paper-variants";
 import type { ParsedFiveMinMarket } from "@b5p/polymarket";
-import { evaluateOrderRisk, RISK_PROFILES, clampCustomProfile, type RiskContext } from "@b5p/risk";
+import {
+  evaluateOrderRisk, governanceForMode, RISK_PROFILES, clampCustomProfile,
+  type GovernancePromotionSummary, type RiskContext,
+} from "@b5p/risk";
 import {
   BookState, MODELS, STRATEGY_PRESETS, TickBuffer, computeFeatures, computeIndicators,
-  presetAllowsMode, type Candle, type FeatureSet, type PresetContext, type StrategyDecision,
+  configureCalibratedModel, presetAllowsMode,
+  type Candle, type FeatureSet, type PresetContext, type StrategyDecision,
 } from "@b5p/strategy";
 import { eq } from "drizzle-orm";
 import { Accounting } from "./accounting";
 import { CHANNELS, type Bus } from "./bus";
 import { LiveController, minArmUsdc, type ArmRequest } from "./live";
 import { logger } from "./log";
-import { PaperExecutor } from "./paper";
+import { PaperExecutor, type FillEvent, type PaperOrderRecord } from "./paper";
 import { ENGINE_VERSION, buildDecisionSnapshot } from "./snapshot";
 
 interface MarketRuntime {
@@ -73,6 +84,19 @@ export class Engine {
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
 
+  // --- execution-quality instrumentation (plan items 1b/1c) ---
+  readonly execPersistence: ExecutionPersistence;
+  readonly execTimeline: ExecutionTimeline;
+  readonly execGuards = new ExecutionGuardRegistry();
+  readonly markouts: MarkoutSampler;
+  readonly counterfactuals: FillCounterfactualRecorder;
+  readonly paperVariants: PaperVariantEngine;
+  /** intentId -> correlation metadata for timeline threading. */
+  private intentMeta = new Map<string, { correlationId: string; decisionId: string; marketId: string }>();
+  private marketIntents = new Map<string, string[]>();
+  private execCfgCache: { version: number; value: ResolvedExecutionResearchConfig } | null = null;
+  private livePromotion: GovernancePromotionSummary | null = null;
+
   constructor(
     readonly db: DbHandle,
     readonly bus: Bus,
@@ -100,9 +124,41 @@ export class Engine {
         if (rt) this.transitionMarket(rt, fill.order.filled6 >= fill.order.shares6 ? "FILLED" : "PARTIAL");
         await this.audit("order", "fill", { orderId: fill.order.id, shares: fill.shares6, price: fill.price6, maker: fill.maker });
         this.emitEvent({ type: "fill", orderId: fill.order.id, marketId: fill.order.marketId });
+        this.observePaperFill(fill);
       },
       (tokenId) => this.books.get(tokenId) ?? null,
     );
+
+    this.execPersistence = new ExecutionPersistence(db);
+    this.execTimeline = new ExecutionTimeline(this.execPersistence, () => this.configVersion);
+    this.markouts = new MarkoutSampler(
+      this.execPersistence,
+      (tokenId) => this.books.get(tokenId) ?? null,
+      () => this.execCfg().markoutHorizonsMs,
+      () => this.configVersion,
+    );
+    this.counterfactuals = new FillCounterfactualRecorder(
+      this.execPersistence,
+      () => this.configVersion,
+      () => this.execCfg().recordFillCounterfactuals,
+    );
+    this.paperVariants = new PaperVariantEngine(
+      this.execPersistence,
+      () => this.execCfg().stress,
+      () => this.configVersion,
+    );
+    this.paper.hooks = {
+      onActivated: (o, nowMs) => this.onPaperActivated(o, nowMs),
+      onQueueChanged: (o, consumed6, tsMs) => this.onPaperQueueChanged(o, consumed6, tsMs),
+      onFinished: (o, status, reason, nowMs) => this.onPaperFinished(o, status, reason, nowMs),
+    };
+  }
+
+  private execCfg(): ResolvedExecutionResearchConfig {
+    if (this.execCfgCache?.version !== this.configVersion) {
+      this.execCfgCache = { version: this.configVersion, value: resolveExecutionResearchConfig(this.cfg) };
+    }
+    return this.execCfgCache.value;
   }
 
   // ---------- lifecycle ----------
@@ -136,6 +192,29 @@ export class Engine {
     const row = rows.sort((a, b) => b.version - a.version)[0]!;
     this.cfg = row.config as AppConfig;
     this.configVersion = row.version;
+    configureCalibratedModel({
+      artifactPath: this.cfg.strategy.calibrated_artifact_path ?? null,
+      promotionPath: this.cfg.strategy.promotion_decision_path ?? null,
+    });
+    await this.loadLivePromotion();
+  }
+
+  /**
+   * Latest active LIVE promotion decision for the active strategy — consumed by
+   * governanceForMode() so the strategy-validated gate reflects persisted
+   * promotion evidence rather than a hardcoded flag.
+   */
+  private async loadLivePromotion(): Promise<void> {
+    try {
+      const rows = await this.db.db.select().from(strategyPromotionDecisions)
+        .where(eq(strategyPromotionDecisions.strategyVersion, this.cfg.strategy.active_version));
+      const live = rows
+        .filter((r) => r.mode === "live" && r.active)
+        .sort((a, b) => b.decidedAtMs - a.decidedAtMs)[0] ?? null;
+      this.livePromotion = live ? { approved: live.approved, active: live.active, mode: live.mode } : null;
+    } catch {
+      this.livePromotion = null; // fail closed: no promotion evidence -> not validated for live
+    }
   }
 
   private async onControl(payload: unknown, nowMs: number): Promise<void> {
@@ -252,6 +331,7 @@ export class Engine {
   async onTrade(tokenId: string, price: string, size: string, sourceTsMs: number): Promise<void> {
     this.bookFor(tokenId).applyTrade(price, sourceTsMs);
     await this.paper.onTrade(tokenId, prob(price), sharesOf(size), sourceTsMs, this.cfg.paper.queue_model);
+    this.counterfactuals.onTrade(tokenId, prob(price), sharesOf(size), sourceTsMs);
   }
 
   // ---------- discovery ----------
@@ -364,6 +444,14 @@ export class Engine {
     if (this.live.isArmed(nowMs) && nowMs - this.lastLiveRefreshMs > 30_000) {
       this.lastLiveRefreshMs = nowMs;
       await this.live.refreshBankroll();
+      // A successful wallet re-read reconciles any UNKNOWN_OUTCOME intents:
+      // only after this may a NEW attempt be authorized again.
+      if (this.live.state === "ARMED") {
+        for (const g of this.execGuards.unreconciled()) {
+          g.markBalanceReconciled();
+          this.execTimeline.transition(g.intentId, "BALANCE_RECONCILED", { utcMs: nowMs, reason: "live bankroll re-read" });
+        }
+      }
     }
 
     const active = this.activeMarket(nowMs);
@@ -373,6 +461,13 @@ export class Engine {
     }
     await this.resolveDue(nowMs);
     await this.publishCockpit(nowMs);
+    // Execution-quality bookkeeping: strictly after the trading hot path.
+    // The drain is awaited HERE (end of step, all trading actions done) rather
+    // than run on a detached chain: the embedded PGlite dev database is a
+    // single WASM connection and cannot tolerate interleaved queries.
+    this.markouts.sample(nowMs);
+    this.counterfactuals.expire(nowMs);
+    await this.execTimeline.settle();
   }
 
   activeMarket(nowMs: number): MarketRuntime | null {
@@ -559,6 +654,10 @@ export class Engine {
 
     const decisionId = newId();
     const correlationId = newId();
+    // Pre-generated intent id: the execution timeline references it from
+    // DECISION_SNAPSHOT on, before (and whether or not) the intent row exists.
+    const intentId = newId();
+    const execMode: ExecutionMode = decisionMode === "live" ? "LIVE" : decisionMode === "shadow" ? "SHADOW" : "PAPER";
     const bank = liveArmed ? this.live.bankState() : this.accounting.state();
     const feeSchedule = { ratePpm: rt.fee?.ratePpm ?? ppm("0.07"), collection: this.cfg.paper.fee_collection_convention };
     const sideBook = side === "UP" ? this.bookFor(rt.ref.upTokenId) : this.bookFor(rt.ref.downTokenId);
@@ -593,12 +692,17 @@ export class Engine {
       secondsRemaining: f.secondsRemaining,
       conservativeProbability: conservative6,
       feeSchedule,
-      // Paper/shadow require the model be paper-approved. When live-armed the
-      // operator has explicitly accepted an unproven model (typed arm
-      // acknowledgement), so these two governance gates pass; all economic and
-      // safety gates below remain in force.
-      modelApprovedForMode: liveArmed ? true : (this.mode === "paper" || this.mode === "shadow" ? model.approvedForPaper : model.approvedForLive),
-      strategyValidatedForMode: true,
+      // Governance gates derived centrally (@b5p/risk governanceForMode): the
+      // live-arm acknowledgement bypasses EXACTLY these two gates and nothing
+      // else; live without the override requires model live-approval plus an
+      // active, approved LIVE promotion decision. All economic and safety
+      // gates below remain in force regardless.
+      ...governanceForMode(
+        decisionMode,
+        liveArmed,
+        { approvedForPaper: model.approvedForPaper, approvedForLive: model.approvedForLive },
+        this.livePromotion,
+      ),
       coolingOffUntilMs: null,
       nowMs,
       idempotencyKeyIsDuplicate: this.usedIdempotencyKeys.has(idemKey),
@@ -662,6 +766,25 @@ export class Engine {
       data: snapshot as unknown as Record<string, unknown>,
       createdAtMs: nowMs,
     });
+
+    // execution timeline: decision snapshot persisted, intent id minted.
+    // All emission below is synchronous in-memory buffering (hot-path safe).
+    this.execTimeline.begin({ correlationId, intentId, mode: execMode });
+    this.intentMeta.set(intentId, { correlationId, decisionId, marketId: rt.ref.marketId });
+    const mIntents = this.marketIntents.get(rt.ref.marketId) ?? [];
+    mIntents.push(intentId);
+    this.marketIntents.set(rt.ref.marketId, mIntents);
+    const decisionBookToken = this.execTimeline.captureBook(sideBook, rt.ref.marketId);
+    this.execTimeline.transition(intentId, "DECISION_SNAPSHOT", {
+      utcMs: nowMs, bookToken: decisionBookToken, detail: { decisionId, marketId: rt.ref.marketId, side, style },
+    });
+    this.execTimeline.transition(intentId, "INTENT_CREATED", { utcMs: nowMs, detail: { idempotencyKey: idemKey } });
+    if (sideBook.receivedTsMs > 0 && sideBook.sourceTsMs > 0) {
+      this.execTimeline.latency({
+        correlationId, intentId, attemptId: null, stage: "BOOK_FEED",
+        durationUs: Math.max(0, (sideBook.receivedTsMs - sideBook.sourceTsMs) * 1000), mode: execMode, nowMs,
+      });
+    }
     await this.db.db.insert(signalCandidates).values({
       id: newId(),
       marketId: rt.ref.marketId,
@@ -681,6 +804,19 @@ export class Engine {
     });
 
     if (!verdict.approved) {
+      this.execTimeline.transition(intentId, "REJECTED", {
+        utcMs: nowMs, reason: "risk_rejected", detail: { codes: verdict.reasons.map((r) => r.code) },
+      });
+      // counterfactual: would this maker order have filled had we placed it?
+      if (shares6 > 0n && style === "maker_post_only") {
+        this.counterfactuals.register({
+          correlationId, decisionId, marketId: rt.ref.marketId,
+          tokenId: side === "UP" ? rt.ref.upTokenId : rt.ref.downTokenId,
+          price6, size6: shares6, reason: "risk_rejected",
+          queueAhead6: sideBook.queueAtBid(price6), registeredAtMs: nowMs,
+          expiresAtMs: (rt.ref.endEpoch - this.cfg.strategy.cancel_seconds_remaining) * 1000,
+        });
+      }
       this.transitionMarket(rt, "REJECTED");
       this.transitionMarket(rt, "OBSERVING");
       this.emitEvent({ type: "decision_rejected", decisionId, marketId: rt.ref.marketId, reasons: verdict.reasons.map((r) => r.code) });
@@ -688,8 +824,10 @@ export class Engine {
     }
 
     this.transitionMarket(rt, "RISK_APPROVED");
+    this.execTimeline.transition(intentId, "RISK_APPROVED", {
+      utcMs: nowMs, detail: { stake6: stake6.toString(), shares6: shares6.toString() },
+    });
     this.usedIdempotencyKeys.add(idemKey);
-    const intentId = newId();
     await this.db.db.insert(orderIntents).values({
       id: intentId,
       decisionId,
@@ -703,43 +841,123 @@ export class Engine {
       createdAtMs: nowMs,
     });
 
+    const tokenId = side === "UP" ? rt.ref.upTokenId : rt.ref.downTokenId;
+    const cancelCutoffMs = (rt.ref.endEpoch - this.cfg.strategy.cancel_seconds_remaining) * 1000;
+
     if (decisionMode === "shadow") {
+      // No order is sent: record the would-be maker fill as a counterfactual.
+      this.counterfactuals.register({
+        correlationId, decisionId, marketId: rt.ref.marketId, tokenId,
+        price6, size6: shares6, reason: "shadow_not_placed",
+        queueAhead6: sideBook.queueAtBid(price6), registeredAtMs: nowMs, expiresAtMs: cancelCutoffMs,
+      });
       await this.audit("order", "shadow_would_submit", { decisionId, side, price: price6, shares: shares6 });
       this.emitEvent({ type: "shadow_would_submit", decisionId, marketId: rt.ref.marketId });
       this.transitionMarket(rt, "OBSERVING");
       return;
     }
 
+    // Execution invariants: per-intent guard (remaining-size-aware retries,
+    // one in-flight mutation, cutoff, UNKNOWN_OUTCOME quarantine).
+    const cutoffSeconds = decisionMode === "live" ? limits.liveEntryCutoffSeconds : limits.paperEntryCutoffSeconds;
+    const guard = this.execGuards.create({
+      intentId, decisionId, correlationId, approvedShares6: shares6,
+      entryCutoffMs: (rt.ref.endEpoch - cutoffSeconds) * 1000,
+    });
+    const timeInForce = style === "maker_post_only" ? "GTD" : style === "taker_fok" ? "FOK" : "FAK";
+    const requestHash = sha256Hex(JSON.stringify({
+      intentId, attempt: 1, tokenId, orderSide: "BUY", style,
+      price6: price6.toString(), shares6: shares6.toString(), timeInForce,
+    }));
+    const attemptId = this.execTimeline.beginAttempt({
+      intentId, attemptNumber: 1, requestHash, tokenId, side: "BUY",
+      price6, size6: shares6, timeInForce, postOnly: style === "maker_post_only",
+      decisionBookToken, nowMs,
+    });
+    const auth = guard.authorizeAttempt(shares6, nowMs);
+    const lock = auth.ok && attemptId !== null ? guard.beginMutation(attemptId) : { ok: false as const };
+    if (!auth.ok || attemptId === null || !lock.ok) {
+      const reason = `execution invariant refused attempt: ${auth.refusal ?? ("refusal" in lock ? lock.refusal : "NO_ATTEMPT")}`;
+      this.execTimeline.transition(intentId, "SIGN_STARTED", { utcMs: nowMs });
+      this.execTimeline.transition(intentId, "REJECTED", { utcMs: nowMs, reason });
+      this.transitionMarket(rt, "REJECTED");
+      this.transitionMarket(rt, "OBSERVING");
+      await this.audit("order", "attempt_refused", { decisionId, reason });
+      return;
+    }
+
     // LIVE path: real order via the CLOB adapter.
     if (liveArmed) {
       this.transitionMarket(rt, "ORDER_PENDING");
-      const tokenId = side === "UP" ? rt.ref.upTokenId : rt.ref.downTokenId;
-      const res = await this.live.submit({
-        decisionId, intentId, marketId: rt.ref.marketId, tokenId, outcomeSide: side,
-        style, price6, shares6, stake6, tickSize6: rt.tickSize6, negRisk: false,
-        ...(style === "maker_post_only" ? { expireAtMs: (rt.ref.endEpoch - this.cfg.strategy.cancel_seconds_remaining) * 1000 } : {}),
-        idempotencyKey: idemKey, nowMs,
-      });
+      this.execTimeline.transition(intentId, "SIGN_STARTED", { utcMs: nowMs });
+      const sendBookToken = this.execTimeline.captureBook(sideBook, rt.ref.marketId);
+      this.execTimeline.attachSnapshot(attemptId, "send", sendBookToken);
+      this.execTimeline.transition(intentId, "SENT", { utcMs: nowMs, bookToken: sendBookToken });
+      const t0 = monotonicNs();
+      let res: Awaited<ReturnType<LiveController["submit"]>>;
+      try {
+        res = await this.live.submit({
+          decisionId, intentId, marketId: rt.ref.marketId, tokenId, outcomeSide: side,
+          style, price6, shares6, stake6, tickSize6: rt.tickSize6, negRisk: false,
+          ...(style === "maker_post_only" ? { expireAtMs: cancelCutoffMs } : {}),
+          idempotencyKey: idemKey, nowMs,
+        });
+      } catch (e) {
+        // Transport/adapter exception: outcome unknown. Quarantine the intent —
+        // NO retry until balances are reconciled against exchange truth.
+        guard.markUnknownOutcome();
+        this.execTimeline.transition(intentId, "UNKNOWN_OUTCOME", { utcMs: Date.now(), reason: String(e) });
+        this.execTimeline.latency({ correlationId, intentId, attemptId, stage: "ACK", durationUs: durationUs(t0, monotonicNs()), mode: execMode, nowMs });
+        await this.health("critical", "live", `live submit outcome UNKNOWN for ${decisionId}: ${String(e)}; retries blocked until balance reconciliation`);
+        return;
+      }
+      this.execTimeline.latency({ correlationId, intentId, attemptId, stage: "ACK", durationUs: durationUs(t0, monotonicNs()), mode: execMode, nowMs });
       if (res.ok) {
+        const ackBookToken = this.execTimeline.captureBook(sideBook, rt.ref.marketId);
+        this.execTimeline.attachSnapshot(attemptId, "ack", ackBookToken);
+        this.execTimeline.transition(intentId, "EXCHANGE_ACK", { utcMs: Date.now(), bookToken: ackBookToken, detail: { orderId: res.orderId, status: res.status } });
+        this.execTimeline.bindOrder(res.orderId, attemptId);
+        // Duplicate-ack idempotence: exposure is only recorded the first time
+        // this requestHash is acknowledged.
+        const firstAck = guard.registerAck(requestHash);
         this.live.markOpen(rt.ref.marketId);
+        if (res.status === "MATCHED") {
+          if (firstAck) {
+            guard.recordFill(shares6);
+            this.execTimeline.recordAttemptFill(attemptId, shares6, nowMs);
+          }
+          const fillBookToken = this.execTimeline.captureBook(sideBook, rt.ref.marketId);
+          this.execTimeline.attachSnapshot(attemptId, "fill", fillBookToken);
+          this.execTimeline.transition(intentId, "FILLED", { utcMs: Date.now(), bookToken: fillBookToken });
+          this.markouts.registerFill({
+            correlationId, attemptId, fillId: null, marketId: rt.ref.marketId, tokenId,
+            side: "BUY", fillTsMs: nowMs, midAtFill6: sideBook.mid() ?? price6,
+          });
+        } else {
+          this.execTimeline.transition(intentId, "RESTING", { utcMs: Date.now() });
+        }
         this.transitionMarket(rt, res.status === "MATCHED" ? "FILLED" : "RESTING");
         await this.audit("order", "live_submitted", { decisionId, orderId: res.orderId, side, price: price6, shares: shares6, stake: stake6, status: res.status });
         this.emitEvent({ type: "live_order", orderId: res.orderId, marketId: rt.ref.marketId, decisionId, status: res.status });
       } else {
+        this.execTimeline.transition(intentId, "REJECTED", { utcMs: Date.now(), reason: res.reason ?? "live rejected" });
         this.transitionMarket(rt, "REJECTED");
         this.transitionMarket(rt, "OBSERVING");
         await this.audit("order", "live_rejected", { decisionId, reason: res.reason });
         this.emitEvent({ type: "live_rejected", decisionId, marketId: rt.ref.marketId, reason: res.reason });
       }
+      guard.endMutation(attemptId);
       return;
     }
 
     this.transitionMarket(rt, "ORDER_PENDING");
+    this.execTimeline.transition(intentId, "SIGN_STARTED", { utcMs: nowMs, detail: { simulated: true } });
+    const t0 = monotonicNs();
     const order = await this.paper.submit({
       decisionId,
       intentId,
       marketId: rt.ref.marketId,
-      tokenId: side === "UP" ? rt.ref.upTokenId : rt.ref.downTokenId,
+      tokenId,
       outcomeSide: side,
       style: style === "maker_post_only" ? "maker_post_only" : "taker_fak",
       price6,
@@ -751,6 +969,16 @@ export class Engine {
       cancelAtSecondsRemaining: this.cfg.strategy.cancel_seconds_remaining,
       marketEndEpoch: rt.ref.endEpoch,
     });
+    this.execTimeline.latency({ correlationId, intentId, attemptId, stage: "SEND", durationUs: durationUs(t0, monotonicNs()), mode: execMode, nowMs });
+    const sendBookToken = this.execTimeline.captureBook(sideBook, rt.ref.marketId);
+    this.execTimeline.attachSnapshot(attemptId, "send", sendBookToken);
+    this.execTimeline.transition(intentId, "SENT", { utcMs: nowMs, bookToken: sendBookToken, detail: { orderId: order.id } });
+    this.execTimeline.bindOrder(order.id, attemptId);
+    this.paperVariants.onOrderSubmitted(order, {
+      correlationId, tickSize6: rt.tickSize6,
+      feeRatePpm: rt.fee?.ratePpm ?? ppm("0.07"), feeCollection: this.cfg.paper.fee_collection_convention,
+    });
+    guard.endMutation(attemptId);
     this.transitionMarket(rt, "RESTING");
     await this.audit("order", "submitted", { decisionId, orderId: order.id, side, price: price6, shares: shares6, stake: stake6, sim: sim.mode });
     this.emitEvent({ type: "order_submitted", orderId: order.id, marketId: rt.ref.marketId, decisionId });
@@ -778,9 +1006,117 @@ export class Engine {
     }
   }
 
+  // ---------- execution-quality observation (plan item 1b) ----------
+  // All handlers are synchronous in-memory buffering; persistence happens on
+  // the background flush chain and can never block or reorder trading.
+
+  /** Simulated exchange accept: EXCHANGE_ACK (+RESTING and queue estimate for makers). */
+  private onPaperActivated(o: PaperOrderRecord, nowMs: number): void {
+    const attemptId = this.execTimeline.attemptForOrder(o.id);
+    const intentId = attemptId ? this.execTimeline.intentForAttempt(attemptId) : null;
+    if (!attemptId || !intentId) return;
+    const book = this.books.get(o.tokenId) ?? null;
+    const ackBookToken = this.execTimeline.captureBook(book, o.marketId);
+    this.execTimeline.attachSnapshot(attemptId, "ack", ackBookToken);
+    this.execTimeline.transition(intentId, "EXCHANGE_ACK", { utcMs: nowMs, bookToken: ackBookToken, detail: { orderId: o.id, simulated: true } });
+    if (o.style === "maker_post_only") {
+      this.execTimeline.transition(intentId, "RESTING", { utcMs: nowMs, detail: { queueAhead6: o.queueAhead6.toString() } });
+      const meta = this.intentMeta.get(intentId);
+      if (meta) {
+        this.execTimeline.queueEstimate({
+          correlationId: meta.correlationId, attemptId, tokenId: o.tokenId,
+          price6: o.price6, aheadShares6: o.queueAhead6, method: "FULL_LEVEL_CONSERVATIVE", nowMs,
+        });
+      }
+    }
+    this.paperVariants.onOrderActivated(o.id, nowMs);
+  }
+
+  private onPaperQueueChanged(o: PaperOrderRecord, _consumed6: bigint, tsMs: number): void {
+    const attemptId = this.execTimeline.attemptForOrder(o.id);
+    const intentId = attemptId ? this.execTimeline.intentForAttempt(attemptId) : null;
+    const meta = intentId ? this.intentMeta.get(intentId) : null;
+    if (!attemptId || !meta) return;
+    this.execTimeline.queueEstimate({
+      correlationId: meta.correlationId, attemptId, tokenId: o.tokenId,
+      price6: o.price6, aheadShares6: o.queueAhead6, method: "TRADE_TAPE_REPLAY", nowMs: tsMs,
+    });
+  }
+
+  /** Terminal paper order status -> timeline (post-only crossing routes to REJECTED). */
+  private onPaperFinished(o: PaperOrderRecord, status: PaperOrderRecord["status"], reason: string, nowMs: number): void {
+    this.paperVariants.onOrderFinished(o.id, status, nowMs);
+    const attemptId = this.execTimeline.attemptForOrder(o.id);
+    const intentId = attemptId ? this.execTimeline.intentForAttempt(attemptId) : null;
+    if (!intentId) return;
+    const state = this.execTimeline.stateOf(intentId);
+    if (status === "REJECTED") {
+      // includes post-only-would-cross: a safe no-fill, never converted to taker
+      this.execTimeline.transition(intentId, "REJECTED", { utcMs: nowMs, reason });
+    } else if (status === "CANCELED" || status === "EXPIRED") {
+      if (state === "RESTING" || state === "PARTIAL_FILL") {
+        this.execTimeline.transition(intentId, "CANCEL_REQUESTED", { utcMs: nowMs, reason });
+        this.execTimeline.transition(intentId, "CANCEL_CONFIRMED", { utcMs: nowMs, reason });
+        // counterfactual: maker order canceled before it could (fully) fill
+        const meta = this.intentMeta.get(intentId);
+        const remaining = o.shares6 - o.filled6;
+        if (meta && o.style === "maker_post_only" && remaining > 0n && o.expireAtMs !== null && o.expireAtMs > nowMs) {
+          this.counterfactuals.register({
+            correlationId: meta.correlationId, decisionId: meta.decisionId, marketId: o.marketId,
+            tokenId: o.tokenId, price6: o.price6, size6: remaining, reason: "canceled_before_fill",
+            queueAhead6: o.queueAhead6, registeredAtMs: nowMs, expiresAtMs: o.expireAtMs,
+          });
+        }
+      } else {
+        // never rested (FAK nothing executable / canceled pre-activation): safe no-fill
+        this.execTimeline.transition(intentId, "REJECTED", { utcMs: nowMs, reason });
+      }
+    } else if (status === "MATCHED" && o.filled6 < o.shares6) {
+      this.execTimeline.transition(intentId, "CANCEL_CONFIRMED", { utcMs: nowMs, reason: "FAK remainder canceled at stake cap/limit" });
+    }
+    // full MATCHED: FILLED already emitted by the fill observer
+  }
+
+  /** Every paper fill: guard accounting, timeline fill events, markouts, variants. */
+  private observePaperFill(fill: FillEvent): void {
+    const o = fill.order;
+    const attemptId = this.execTimeline.attemptForOrder(o.id);
+    const intentId = attemptId ? this.execTimeline.intentForAttempt(attemptId) : null;
+    const meta = intentId ? this.intentMeta.get(intentId) : null;
+    const book = this.books.get(o.tokenId) ?? null;
+    if (attemptId && intentId) {
+      const guard = this.execGuards.get(intentId);
+      if (guard) {
+        const res = guard.recordFill(fill.shares6);
+        if (res.clamped) {
+          logger.error("fill exceeded approved intent size; clamped in guard", { orderId: o.id, intentId });
+        }
+      }
+      const fillBookToken = this.execTimeline.captureBook(book, o.marketId);
+      this.execTimeline.attachSnapshot(attemptId, "fill", fillBookToken);
+      this.execTimeline.recordAttemptFill(attemptId, fill.shares6, fill.tsMs);
+      this.execTimeline.transition(intentId, o.filled6 >= o.shares6 ? "FILLED" : "PARTIAL_FILL", {
+        utcMs: fill.tsMs, bookToken: fillBookToken,
+        detail: { shares6: fill.shares6.toString(), price6: fill.price6.toString(), fee6: fill.fee6.toString(), maker: fill.maker },
+      });
+    }
+    this.markouts.registerFill({
+      correlationId: meta?.correlationId ?? o.decisionId,
+      attemptId,
+      fillId: fill.fillId ?? null,
+      marketId: o.marketId,
+      tokenId: o.tokenId,
+      side: "BUY",
+      fillTsMs: fill.tsMs,
+      midAtFill6: book?.mid() ?? fill.price6,
+    });
+    this.paperVariants.onActualFill(o, fill.shares6, fill.price6, fill.fee6, fill.tsMs);
+  }
+
   // ---------- resolution ----------
 
   async resolveDue(nowMs: number): Promise<void> {
+    let resolvedAny = false;
     for (const rt of this.markets.values()) {
       if (rt.localOutcome !== null) continue;
       const dueMs = rt.ref.endEpoch * 1000 + RESOLUTION_GRACE_MS;
@@ -833,6 +1169,29 @@ export class Engine {
       await this.audit("resolution", "resolved", { slug: rt.ref.slug, outcome, source, pnl: pnl ?? "no position" });
       this.emitEvent({ type: "resolved", slug: rt.ref.slug, outcome, pnl: pnl?.toString() ?? null });
       await this.crossCheckResolution(rt, nowMs);
+
+      // execution research: AT_RESOLUTION markouts, three-variant results,
+      // fill-selection samples, and timeline balance reconciliation.
+      resolvedAny = true;
+      this.markouts.onResolution(
+        rt.ref.marketId, outcome,
+        (tokenId) => tokenId === rt.ref.upTokenId ? "UP" : tokenId === rt.ref.downTokenId ? "DOWN" : null,
+        nowMs,
+      );
+      this.paperVariants.onResolution(rt.ref.marketId, outcome, nowMs);
+      for (const intentId of this.marketIntents.get(rt.ref.marketId) ?? []) {
+        const s = this.execTimeline.stateOf(intentId);
+        if (s === "FILLED" || s === "REJECTED" || s === "CANCEL_CONFIRMED" || s === "UNKNOWN_OUTCOME") {
+          this.execTimeline.transition(intentId, "BALANCE_RECONCILED", { utcMs: nowMs, reason: "market resolved; paper accounting settled" });
+        }
+        this.intentMeta.delete(intentId);
+      }
+      this.marketIntents.delete(rt.ref.marketId);
+    }
+    if (resolvedAny) {
+      // fill_selection_cost = signal-conditioned value − fill-conditioned value,
+      // computed per resolution batch (drained at end of step).
+      this.paperVariants.flushSelectionCost(nowMs);
     }
   }
 

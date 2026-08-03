@@ -1,20 +1,24 @@
 import { clampProb, ONE, prob, type Prob6, type ProbabilityEstimate } from "@b5p/domain";
+import { createCalibratedLogisticModel } from "./calibrated";
 import type { FeatureSet } from "./features";
 
 /**
  * Probability models.
  *
- * Three quantities are kept distinct everywhere:
+ * The signal quantities are kept distinct everywhere (full set of eight in
+ * ./quantities.ts — SignalQuantities); the three that models produce:
  *   market_probability      — executable price / book-derived probability
  *   model_probability       — calibrated estimate of resolution probability
  *   conservative_probability— lower-confidence estimate after penalties
  *
- * HONESTY CONSTRAINT: no model in this build is calibrated on out-of-sample
- * fills, so NO model is approved for live use. The book baseline is the null
- * model (its probability IS the market price, so it can never show edge by
- * construction). The distance/vol heuristic is explicitly UNCALIBRATED and
- * usable in paper/observe only. This is by design: the system must refuse to
- * trade until a walk-forward-validated calibration artifact exists.
+ * HONESTY CONSTRAINT: a model is approved for paper ONLY when a hash-valid
+ * walk-forward calibration artifact backs it, and for live ONLY when a passing
+ * StrategyPromotionDecision exists on top (see ./calibrated.ts). The book
+ * baseline is the null model (its probability IS the market price, so it can
+ * never show edge by construction). The distance/vol heuristic and composite
+ * models are explicitly UNCALIBRATED and usable in paper/observe only. The
+ * system refuses to trade on model edge until the evidence exists — the
+ * 2026-08 calibration study measured that no such edge does (the null held).
  */
 
 export interface ProbabilityModel {
@@ -110,18 +114,16 @@ export const distanceVolHeuristicModel: ProbabilityModel = {
 };
 
 /**
- * Placeholder for the calibrated logistic model. Refuses to produce estimates
- * until a walk-forward validation artifact exists (created by apps/research,
- * never automatically).
+ * Calibrated logistic model. Backed by a SEALED walk-forward calibration
+ * artifact (apps/research/py/train_calibrated_model.py); without one it
+ * refuses to estimate and is approved for nothing. With a valid artifact it
+ * is paper-approved; live approval additionally requires a PASSING persisted
+ * StrategyPromotionDecision that re-derives from the artifact's own evidence.
+ * Artifact/decision paths come from B5P_CALIBRATED_ARTIFACT_PATH /
+ * B5P_PROMOTION_DECISION_PATH (see createCalibratedLogisticModel for
+ * injection in tests).
  */
-export const calibratedLogisticModel: ProbabilityModel = {
-  version: "calibrated_logistic_v0_NO_ARTIFACT",
-  approvedForLive: false,
-  approvedForPaper: false,
-  estimate(): ProbabilityEstimate | null {
-    return null; // no calibration artifact in this build
-  },
-};
+export const calibratedLogisticModel: ProbabilityModel = createCalibratedLogisticModel();
 
 /**
  * Composite-indicator model (gist integration). Maps the weighted indicator
@@ -168,6 +170,21 @@ export const MODELS: Record<string, ProbabilityModel> = {
   binance_composite: binanceCompositeModel,
   calibrated_logistic: calibratedLogisticModel,
 };
+
+/**
+ * Point the calibrated_logistic registry slot at config-provided artifact /
+ * promotion-decision paths (null falls through to the env-var defaults, so a
+ * config without paths preserves B5P_CALIBRATED_ARTIFACT_PATH behavior).
+ * Called by the engine on config (re)load.
+ */
+export function configureCalibratedModel(opts: { artifactPath?: string | null; promotionPath?: string | null }): ProbabilityModel {
+  const model = createCalibratedLogisticModel({
+    artifactPath: opts.artifactPath ?? null,
+    promotionPath: opts.promotionPath ?? null,
+  });
+  MODELS.calibrated_logistic = model;
+  return model;
+}
 
 /**
  * Conservative probability for a given side: the side-adjusted lower bound

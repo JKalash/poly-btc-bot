@@ -81,7 +81,8 @@ export interface RiskContext {
   conservativeProbability: Prob6;
   feeSchedule: Pick<FeeSchedule, "ratePpm" | "collection">;
 
-  // model/strategy governance
+  // model/strategy governance — derive these with governanceForMode() below so
+  // the live-arm override can bypass EXACTLY these two gates and nothing else
   modelApprovedForMode: boolean;
   strategyValidatedForMode: boolean;
   coolingOffUntilMs: number | null;
@@ -261,4 +262,62 @@ export function evaluateOrderRisk(ctx: RiskContext): RiskVerdict {
 function fmtP(v: bigint): string {
   const s = (Number(v) / 1_000_000).toFixed(4);
   return s.replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/* ------------------------------------------------------------------------ *
+ * Model/strategy governance.
+ *
+ * The two governance booleans in RiskContext are DERIVED, never hand-set:
+ *   modelApprovedForMode     -> MODEL_NOT_APPROVED when false
+ *   strategyValidatedForMode -> STRATEGY_UNVALIDATED when false
+ *
+ * Live approval is evidence-backed: the model must carry a hash-valid
+ * walk-forward calibration artifact (model.approvedForLive, set by
+ * @b5p/strategy ONLY when a passing StrategyPromotionDecision re-derives from
+ * that artifact) AND an active, approved, live-mode promotion decision must
+ * exist for the strategy.
+ *
+ * The typed live-arm acknowledgement bypasses EXACTLY these two gates — the
+ * operator has accepted trading an unproven model with real money. Every
+ * economic and safety gate (edge, break-even, caps, staleness, price ceiling,
+ * cutoff, drawdown stops) is untouched by arming, by construction: the
+ * override exists only inside this function and this function only produces
+ * these two booleans.
+ * ------------------------------------------------------------------------ */
+
+export interface GovernanceModelFlags {
+  approvedForPaper: boolean;
+  approvedForLive: boolean;
+}
+
+/** Structural summary of a persisted StrategyPromotionDecision (@b5p/experiments). */
+export interface GovernancePromotionSummary {
+  approved: boolean;
+  active: boolean;
+  /** PromotionMode: "paper" | "shadow" | "live". */
+  mode: string;
+}
+
+export interface GovernanceVerdict {
+  modelApprovedForMode: boolean;
+  strategyValidatedForMode: boolean;
+}
+
+export function governanceForMode(
+  mode: Mode,
+  liveArmOverride: boolean,
+  model: GovernanceModelFlags,
+  promotion: GovernancePromotionSummary | null,
+): GovernanceVerdict {
+  if (liveArmOverride) {
+    // The arm acknowledgement bypasses ONLY the two governance gates.
+    return { modelApprovedForMode: true, strategyValidatedForMode: true };
+  }
+  if (mode === "live") {
+    const promoted = promotion !== null && promotion.approved && promotion.active && promotion.mode === "live";
+    return { modelApprovedForMode: model.approvedForLive, strategyValidatedForMode: promoted };
+  }
+  // observe/paper/shadow: paper approval suffices; validation evidence is
+  // PRODUCED in these modes, so they cannot also require it.
+  return { modelApprovedForMode: model.approvedForPaper, strategyValidatedForMode: true };
 }

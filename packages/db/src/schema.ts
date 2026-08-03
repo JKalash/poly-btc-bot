@@ -384,3 +384,310 @@ export const backtestRuns = pgTable("backtest_runs", {
   createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
   finishedAtMs: bigint("finished_at_ms", { mode: "number" }),
 });
+
+// ---------- evidence / provenance (refinement brief) ----------
+
+export const sourceEvidence = pgTable("source_evidence", {
+  id: text("id").primaryKey(),
+  sourceKey: text("source_key").notNull(),
+  claimKey: text("claim_key").notNull(),
+  title: text("title").notNull(),
+  claimText: text("claim_text").notNull(),
+  claimedValue: text("claimed_value"),
+  units: text("units"),
+  label: text("label").notNull(), // EvidenceLabel
+  url: text("url"),
+  retrievedAtMs: bigint("retrieved_at_ms", { mode: "number" }),
+  reproducedValue: text("reproduced_value"),
+  reproductionRunId: text("reproduction_run_id"),
+  methodologyNotes: text("methodology_notes"),
+  correlationId: text("correlation_id").notNull(),
+  configVersion: integer("config_version"),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("source_evidence_claim_idx").on(t.sourceKey, t.claimKey),
+  index("source_evidence_label_idx").on(t.label),
+]);
+
+export const datasetManifests = pgTable("dataset_manifests", {
+  id: text("id").primaryKey(),
+  datasetKey: text("dataset_key").notNull(),
+  title: text("title").notNull(),
+  source: text("source").notNull(),
+  license: text("license"),
+  files: jsonb("files").notNull(), // DatasetFileEntry[]
+  contentChecksum: text("content_checksum").notNull(),
+  timeRangeStartMs: bigint("time_range_start_ms", { mode: "number" }),
+  timeRangeEndMs: bigint("time_range_end_ms", { mode: "number" }),
+  rowCount: bigint("row_count", { mode: "number" }),
+  schemaDescription: text("schema_description"),
+  materialized: boolean("materialized").notNull().default(false),
+  retrievedAtMs: bigint("retrieved_at_ms", { mode: "number" }),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  index("dataset_manifests_key_idx").on(t.datasetKey),
+]);
+
+// ---------- reproducible experiments ----------
+
+export const experimentDefinitions = pgTable("experiment_definitions", {
+  id: text("id").primaryKey(),
+  experimentKey: text("experiment_key").notNull(),
+  title: text("title").notNull(),
+  hypothesis: text("hypothesis").notNull(),
+  nullHypothesis: text("null_hypothesis").notNull(),
+  primaryMetric: text("primary_metric").notNull(),
+  successCriteria: text("success_criteria").notNull(),
+  sourceEvidenceIds: jsonb("source_evidence_ids").notNull(), // string[]
+  datasetKeys: jsonb("dataset_keys").notNull(),              // string[]
+  foldPlan: jsonb("fold_plan"),                              // FoldPlan | null
+  status: text("status").notNull(),                          // HypothesisStatus
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("experiment_definitions_key_idx").on(t.experimentKey),
+]);
+
+export const experimentRuns = pgTable("experiment_runs", {
+  id: text("id").primaryKey(),
+  definitionId: text("definition_id").notNull().references(() => experimentDefinitions.id),
+  runKey: text("run_key").notNull(),
+  params: jsonb("params").notNull(),
+  datasetManifestIds: jsonb("dataset_manifest_ids").notNull(), // string[]
+  codeVersion: text("code_version").notNull(),
+  configVersion: integer("config_version"),
+  status: text("status").notNull(), // RUNNING | COMPLETED | FAILED
+  startedAtMs: bigint("started_at_ms", { mode: "number" }).notNull(),
+  finishedAtMs: bigint("finished_at_ms", { mode: "number" }),
+  resultSummary: jsonb("result_summary"),
+  resultChecksum: text("result_checksum"),
+  correlationId: text("correlation_id").notNull(),
+}, (t) => [
+  index("experiment_runs_definition_idx").on(t.definitionId),
+]);
+
+export const experimentObservations = pgTable("experiment_observations", {
+  id: text("id").primaryKey(),
+  runId: text("run_id").notNull().references(() => experimentRuns.id),
+  metric: text("metric").notNull(),
+  scope: text("scope").notNull(), // "overall" | fold id | bucket | ...
+  value: doublePrecision("value"),
+  valueText: text("value_text"), // exact value when doubles would lose precision
+  n: integer("n"),
+  ciLo: doublePrecision("ci_lo"),
+  ciHi: doublePrecision("ci_hi"),
+  detail: jsonb("detail"),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  index("experiment_observations_run_idx").on(t.runId, t.metric),
+]);
+
+// ---------- model / calibration artifacts + promotion ----------
+
+export const modelArtifacts = pgTable("model_artifacts", {
+  id: text("id").primaryKey(),
+  modelKey: text("model_key").notNull(),
+  version: text("version").notNull(),
+  kind: text("kind").notNull(), // logistic | gbm
+  featureNames: jsonb("feature_names").notNull(),
+  coefficients: jsonb("coefficients"),
+  standardization: jsonb("standardization"),
+  datasetManifestIds: jsonb("dataset_manifest_ids").notNull(),
+  foldPlan: jsonb("fold_plan").notNull(),
+  trainedAtMs: bigint("trained_at_ms", { mode: "number" }).notNull(),
+  codeVersion: text("code_version").notNull(),
+  artifactChecksum: text("artifact_checksum").notNull(),
+  artifact: jsonb("artifact").notNull(), // full payload for audit/reload
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("model_artifacts_version_idx").on(t.version),
+]);
+
+export const calibrationArtifacts = pgTable("calibration_artifacts", {
+  id: text("id").primaryKey(),
+  modelArtifactId: text("model_artifact_id").notNull().references(() => modelArtifacts.id),
+  method: text("method").notNull(), // isotonic | platt
+  curve: jsonb("curve"),
+  platt: jsonb("platt"),
+  metrics: jsonb("metrics").notNull(),          // CalibrationMetrics (out-of-fold)
+  perFoldMetrics: jsonb("per_fold_metrics").notNull(),
+  codeVersion: text("code_version").notNull(),
+  artifactChecksum: text("artifact_checksum").notNull(),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  index("calibration_artifacts_model_idx").on(t.modelArtifactId),
+]);
+
+export const strategyPromotionDecisions = pgTable("strategy_promotion_decisions", {
+  id: text("id").primaryKey(),
+  strategyVersion: text("strategy_version").notNull(),
+  modelVersion: text("model_version").notNull(),
+  mode: text("mode").notNull(), // paper | shadow | live
+  approved: boolean("approved").notNull(),
+  reasons: jsonb("reasons").notNull(),   // string[]
+  evidence: jsonb("evidence").notNull(), // PromotionEvidence
+  criteria: jsonb("criteria").notNull(), // PromotionCriteria
+  calibrationArtifactId: text("calibration_artifact_id"),
+  decidedBy: text("decided_by").notNull(),
+  decidedAtMs: bigint("decided_at_ms", { mode: "number" }).notNull(),
+  active: boolean("active").notNull().default(false),
+}, (t) => [
+  index("strategy_promotion_idx").on(t.strategyVersion, t.mode, t.active),
+]);
+
+// ---------- execution-quality timeline (refinement plan item 1b) ----------
+// Domain contracts live in @b5p/domain/src/execution.ts. mode = PAPER|SHADOW|LIVE.
+// NOTE: pnl_records semantics are UNCHANGED (they remain the QUEUE_REPLAY paper
+// path); additional paper-fill variants land in paper_variant_results.
+
+export const executionTimelineEvents = pgTable("execution_timeline_events", {
+  id: text("id").primaryKey(), // stable event id: duplicate deliveries upsert, never double-count
+  correlationId: text("correlation_id").notNull(),
+  // Pre-generated intent id; deliberately NOT an FK — the DECISION_SNAPSHOT
+  // event is written before the order_intents row exists.
+  intentId: text("intent_id").notNull(),
+  attemptId: text("attempt_id"),
+  state: text("state").notNull(), // ExecutionTimelineState
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  monoNs: bigint("mono_ns", { mode: "bigint" }), // process-local monotonic clock, ns
+  bookSnapshotId: bigint("book_snapshot_id", { mode: "bigint" }).references(() => orderbookSnapshots.id),
+  mode: text("mode").notNull(), // PAPER | SHADOW | LIVE
+  detail: jsonb("detail"),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("exec_timeline_correlation_idx").on(t.correlationId, t.tsMs),
+  index("exec_timeline_intent_idx").on(t.intentId, t.tsMs),
+]);
+
+export const orderAttempts = pgTable("order_attempts", {
+  id: text("id").primaryKey(),
+  intentId: text("intent_id").notNull().references(() => orderIntents.id),
+  correlationId: text("correlation_id").notNull(),
+  attemptNumber: integer("attempt_number").notNull(), // starts at 1; retry after reconcile = new attempt
+  requestHash: text("request_hash").notNull(),        // hash of exact signed request payload
+  tokenId: text("token_id").notNull(),
+  side: text("side").notNull(), // BUY | SELL
+  price6: bigint("price6", { mode: "bigint" }).notNull(),
+  size6: bigint("size6", { mode: "bigint" }).notNull(),
+  remaining6: bigint("remaining6", { mode: "bigint" }).notNull(),
+  timeInForce: text("time_in_force").notNull(),
+  postOnly: boolean("post_only").notNull(),
+  status: text("status").notNull(), // latest ExecutionTimelineState
+  decisionBookSnapshotId: bigint("decision_book_snapshot_id", { mode: "bigint" }).references(() => orderbookSnapshots.id),
+  sendBookSnapshotId: bigint("send_book_snapshot_id", { mode: "bigint" }).references(() => orderbookSnapshots.id),
+  ackBookSnapshotId: bigint("ack_book_snapshot_id", { mode: "bigint" }).references(() => orderbookSnapshots.id),
+  fillBookSnapshotId: bigint("fill_book_snapshot_id", { mode: "bigint" }).references(() => orderbookSnapshots.id),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  uniqueIndex("order_attempts_intent_attempt_idx").on(t.intentId, t.attemptNumber),
+  index("order_attempts_correlation_idx").on(t.correlationId),
+  index("order_attempts_status_idx").on(t.status),
+]);
+
+export const latencySamples = pgTable("latency_samples", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  intentId: text("intent_id"),
+  attemptId: text("attempt_id"),
+  stage: text("stage").notNull(), // SIGN | SEND | ACK | CANCEL | BOOK_FEED
+  durationUs: bigint("duration_us", { mode: "number" }).notNull(), // microseconds
+  mode: text("mode").notNull(), // PAPER | SHADOW | LIVE
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("latency_samples_stage_ts_idx").on(t.stage, t.tsMs),
+  index("latency_samples_correlation_idx").on(t.correlationId),
+]);
+
+export const queueEstimates = pgTable("queue_estimates", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  attemptId: text("attempt_id").notNull().references(() => orderAttempts.id),
+  tokenId: text("token_id").notNull(),
+  price6: bigint("price6", { mode: "bigint" }).notNull(),
+  aheadShares6: bigint("ahead_shares6", { mode: "bigint" }).notNull(),
+  method: text("method").notNull(), // BOOK_DELTA_FIFO | TRADE_TAPE_REPLAY | FULL_LEVEL_CONSERVATIVE
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("queue_estimates_attempt_ts_idx").on(t.attemptId, t.tsMs),
+  index("queue_estimates_correlation_idx").on(t.correlationId),
+]);
+
+export const fillCounterfactuals = pgTable("fill_counterfactuals", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  decisionId: text("decision_id").notNull(),
+  marketId: text("market_id").notNull(),
+  tokenId: text("token_id").notNull(),
+  price6: bigint("price6", { mode: "bigint" }).notNull(),
+  size6: bigint("size6", { mode: "bigint" }).notNull(),
+  wouldFill: boolean("would_fill").notNull(),
+  reason: text("reason").notNull(),
+  evidence: jsonb("evidence").notNull(), // book/trade refs supporting the counterfactual
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("fill_counterfactuals_market_ts_idx").on(t.marketId, t.tsMs),
+  index("fill_counterfactuals_correlation_idx").on(t.correlationId),
+]);
+
+export const markoutObservations = pgTable("markout_observations", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  attemptId: text("attempt_id"),
+  fillId: text("fill_id"), // order_fills id when tied to a specific fill
+  marketId: text("market_id").notNull(),
+  tokenId: text("token_id").notNull(),
+  side: text("side").notNull(), // BUY | SELL (markout6 is side-adjusted)
+  horizonMs: text("horizon_ms").notNull(), // "250"|"1000"|"2000"|"5000"|"10000"|"30000"|"AT_RESOLUTION"
+  midAtFill6: bigint("mid_at_fill6", { mode: "bigint" }).notNull(),
+  midAtHorizon6: bigint("mid_at_horizon6", { mode: "bigint" }).notNull(),
+  markout6: bigint("markout6", { mode: "bigint" }).notNull(), // signed; positive = moved in our favor
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("markout_obs_market_ts_idx").on(t.marketId, t.tsMs),
+  index("markout_obs_correlation_idx").on(t.correlationId),
+]);
+
+export const paperVariantResults = pgTable("paper_variant_results", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  decisionId: text("decision_id").notNull(),
+  marketId: text("market_id").notNull(),
+  variant: text("variant").notNull(), // OPTIMISTIC_TOUCH | QUEUE_REPLAY | CONSERVATIVE_STRESS
+  filled: boolean("filled").notNull(),
+  fillPrice6: bigint("fill_price6", { mode: "bigint" }).notNull(), // 0 when not filled
+  fillSize6: bigint("fill_size6", { mode: "bigint" }).notNull(),   // 0 when not filled
+  fee6: bigint("fee6", { mode: "bigint" }).notNull(),
+  pnl6: bigint("pnl6", { mode: "bigint" }), // null until resolution
+  detail: jsonb("detail"),
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  uniqueIndex("paper_variant_decision_variant_idx").on(t.decisionId, t.variant),
+  index("paper_variant_market_ts_idx").on(t.marketId, t.tsMs),
+  index("paper_variant_correlation_idx").on(t.correlationId),
+]);
+
+export const fillSelectionCostRecords = pgTable("fill_selection_cost_records", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  marketId: text("market_id"), // null = aggregate across markets in the window
+  signalConditionedValue6: bigint("signal_conditioned_value6", { mode: "bigint" }).notNull(),
+  fillConditionedValue6: bigint("fill_conditioned_value6", { mode: "bigint" }).notNull(),
+  cost6: bigint("cost6", { mode: "bigint" }).notNull(), // signal - fill; positive = adverse selection
+  signalSampleCount: integer("signal_sample_count").notNull(),
+  fillSampleCount: integer("fill_sample_count").notNull(),
+  windowStartMs: bigint("window_start_ms", { mode: "number" }).notNull(),
+  windowEndMs: bigint("window_end_ms", { mode: "number" }).notNull(),
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("fill_selection_cost_ts_idx").on(t.tsMs),
+  index("fill_selection_cost_market_idx").on(t.marketId, t.tsMs),
+]);

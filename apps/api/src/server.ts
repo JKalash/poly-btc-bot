@@ -2,9 +2,12 @@ import fastifyCookie from "@fastify/cookie";
 import fastifyWebsocket from "@fastify/websocket";
 import { validateConfig, diffConfigs, type AppConfig } from "@b5p/config";
 import {
-  auditEvents, configVersions, decisionSnapshots, engineKv, healthEvents, killSwitchEvents,
-  marketTradeTicks, markets, orderFills, orders, pnlRecords, positions, researchMarkets,
-  resolutions, riskDecisions, timingBucketStatistics, type DbHandle,
+  auditEvents, calibrationArtifacts, configVersions, decisionSnapshots, engineKv,
+  executionTimelineEvents, fillCounterfactuals, fillSelectionCostRecords, healthEvents,
+  killSwitchEvents, latencySamples, marketTradeTicks, markets, markoutObservations,
+  orderAttempts, orderFills, orders, paperVariantResults, pnlRecords, positions,
+  queueEstimates, researchMarkets, resolutions, riskDecisions, signalCandidates,
+  strategyPromotionDecisions, timingBucketStatistics, type DbHandle,
 } from "@b5p/db";
 import { closingMinuteBucket } from "@b5p/domain";
 import { newId } from "@b5p/domain/ids";
@@ -232,6 +235,492 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
       longestLossStreak,
       openPositions: openCount,
       totalRecords: pnls.length,
+    });
+  });
+
+  // ---------- execution lab (read-only telemetry; tables fill once the engine
+  // records execution-quality events — every route degrades to an empty payload) ----------
+
+  const TELEMETRY_NOTE = "execution telemetry unavailable (tables missing or migration not applied)";
+
+  app.get("/api/execution/timelines", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(100, clampLimit(q.limit, 25));
+    try {
+      let intentIds: string[];
+      if (q.intentId) {
+        intentIds = [q.intentId];
+      } else {
+        const recent = await db.db.select({
+          intentId: executionTimelineEvents.intentId,
+          last: sql<number>`max(${executionTimelineEvents.tsMs})`,
+        }).from(executionTimelineEvents)
+          .groupBy(executionTimelineEvents.intentId)
+          .orderBy(desc(sql`max(${executionTimelineEvents.tsMs})`))
+          .limit(limit);
+        intentIds = recent.map((r) => r.intentId);
+      }
+      if (intentIds.length === 0) return { intents: [] };
+      const events = await db.db.select().from(executionTimelineEvents)
+        .where(inArray(executionTimelineEvents.intentId, intentIds))
+        .orderBy(executionTimelineEvents.tsMs);
+      const attempts = await db.db.select().from(orderAttempts)
+        .where(inArray(orderAttempts.intentId, intentIds))
+        .orderBy(orderAttempts.attemptNumber);
+      const evBy = new Map<string, typeof events>();
+      for (const e of events) {
+        const list = evBy.get(e.intentId) ?? [];
+        list.push(e);
+        evBy.set(e.intentId, list);
+      }
+      const atBy = new Map<string, typeof attempts>();
+      for (const a of attempts) {
+        const list = atBy.get(a.intentId) ?? [];
+        list.push(a);
+        atBy.set(a.intentId, list);
+      }
+      const intents = intentIds.flatMap((id) => {
+        const evs = evBy.get(id) ?? [];
+        if (evs.length === 0) return [];
+        const first = evs[0]!;
+        const lastEv = evs[evs.length - 1]!;
+        return [{
+          intentId: id,
+          correlationId: first.correlationId,
+          mode: first.mode,
+          firstTsMs: first.tsMs,
+          lastTsMs: lastEv.tsMs,
+          lastState: lastEv.state,
+          events: evs.map((e) => ({ id: e.id, state: e.state, tsMs: e.tsMs, attemptId: e.attemptId, detail: e.detail })),
+          attempts: (atBy.get(id) ?? []).map((a) => ({
+            id: a.id, attemptNumber: a.attemptNumber, side: a.side, price6: a.price6, size6: a.size6,
+            remaining6: a.remaining6, timeInForce: a.timeInForce, postOnly: a.postOnly, status: a.status,
+            createdAtMs: a.createdAtMs, updatedAtMs: a.updatedAtMs,
+          })),
+        }];
+      });
+      // most recent activity first
+      intents.sort((a, b) => b.lastTsMs - a.lastTsMs);
+      return jsonSafe({ intents });
+    } catch {
+      return { intents: [], note: TELEMETRY_NOTE };
+    }
+  });
+
+  app.get("/api/execution/funnel", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const rows = await db.db.select({
+        state: executionTimelineEvents.state,
+        intents: sql<number>`count(distinct ${executionTimelineEvents.intentId})`,
+      }).from(executionTimelineEvents).groupBy(executionTimelineEvents.state);
+      const total = await db.db.select({ n: sql<number>`count(distinct ${executionTimelineEvents.intentId})` })
+        .from(executionTimelineEvents);
+      return {
+        states: rows.map((r) => ({ state: r.state, intents: Number(r.intents) })),
+        totalIntents: Number(total[0]?.n ?? 0),
+      };
+    } catch {
+      return { states: [], totalIntents: 0, note: TELEMETRY_NOTE };
+    }
+  });
+
+  app.get("/api/execution/latency", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const rows = await db.db.select({
+        stage: latencySamples.stage,
+        n: sql<number>`count(*)`,
+        p50Us: sql<number>`percentile_cont(0.5) within group (order by ${latencySamples.durationUs})`,
+        p90Us: sql<number>`percentile_cont(0.9) within group (order by ${latencySamples.durationUs})`,
+        p99Us: sql<number>`percentile_cont(0.99) within group (order by ${latencySamples.durationUs})`,
+        maxUs: sql<number>`max(${latencySamples.durationUs})`,
+      }).from(latencySamples).groupBy(latencySamples.stage);
+      return {
+        stages: rows.map((r) => ({
+          stage: r.stage, n: Number(r.n),
+          p50Us: Number(r.p50Us), p90Us: Number(r.p90Us), p99Us: Number(r.p99Us), maxUs: Number(r.maxUs),
+        })),
+      };
+    } catch {
+      return { stages: [], note: TELEMETRY_NOTE };
+    }
+  });
+
+  app.get("/api/execution/markout", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const rows = await db.db.select({
+        horizonMs: markoutObservations.horizonMs,
+        n: sql<number>`count(*)`,
+        sumMarkout6: sql<string>`coalesce(sum(${markoutObservations.markout6}), 0)::text`,
+        medianMarkout6: sql<string | null>`(percentile_cont(0.5) within group (order by ${markoutObservations.markout6}))::bigint::text`,
+        adverseCount: sql<number>`sum(case when ${markoutObservations.markout6} < 0 then 1 else 0 end)`,
+      }).from(markoutObservations).groupBy(markoutObservations.horizonMs);
+      // horizon_ms is TEXT (incl. "AT_RESOLUTION"): the UI orders horizons explicitly.
+      return {
+        horizons: rows.map((r) => ({
+          horizonMs: r.horizonMs, n: Number(r.n), sumMarkout6: r.sumMarkout6,
+          medianMarkout6: r.medianMarkout6, adverseCount: Number(r.adverseCount),
+        })),
+      };
+    } catch {
+      return { horizons: [], note: TELEMETRY_NOTE };
+    }
+  });
+
+  app.get("/api/execution/paper-variants", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const agg = await db.db.select({
+        variant: paperVariantResults.variant,
+        decisions: sql<number>`count(*)`,
+        filledCount: sql<number>`sum(case when ${paperVariantResults.filled} then 1 else 0 end)`,
+        resolved: sql<number>`count(${paperVariantResults.pnl6})`,
+        wins: sql<number>`sum(case when ${paperVariantResults.pnl6} > 0 then 1 else 0 end)`,
+        net6: sql<string>`coalesce(sum(${paperVariantResults.pnl6}), 0)::text`,
+        fees6: sql<string>`coalesce(sum(case when ${paperVariantResults.pnl6} is not null then ${paperVariantResults.fee6} else 0 end), 0)::text`,
+        avgFillPrice6: sql<string | null>`(sum(${paperVariantResults.fillPrice6}::numeric * ${paperVariantResults.fillSize6}) / nullif(sum(${paperVariantResults.fillSize6}), 0))::bigint::text`,
+      }).from(paperVariantResults).groupBy(paperVariantResults.variant);
+
+      // resolved rows in time order for drawdown / streak (exact bigint walk)
+      const resolvedRows = await db.db.select({
+        variant: paperVariantResults.variant,
+        pnl6: paperVariantResults.pnl6,
+      }).from(paperVariantResults)
+        .where(sql`${paperVariantResults.pnl6} is not null`)
+        .orderBy(paperVariantResults.tsMs)
+        .limit(5000);
+      const walk = new Map<string, { equity: bigint; peak: bigint; maxDd: bigint; streak: number; longest: number }>();
+      for (const r of resolvedRows) {
+        const w = walk.get(r.variant) ?? { equity: 0n, peak: 0n, maxDd: 0n, streak: 0, longest: 0 };
+        const p = r.pnl6 ?? 0n;
+        w.equity += p;
+        if (w.equity > w.peak) w.peak = w.equity;
+        if (w.peak - w.equity > w.maxDd) w.maxDd = w.peak - w.equity;
+        if (p < 0n) { w.streak += 1; w.longest = Math.max(w.longest, w.streak); } else w.streak = 0;
+        walk.set(r.variant, w);
+      }
+      return jsonSafe({
+        variants: agg.map((a) => {
+          const w = walk.get(a.variant);
+          return {
+            variant: a.variant,
+            decisions: Number(a.decisions),
+            filledCount: Number(a.filledCount),
+            resolved: Number(a.resolved),
+            wins: Number(a.wins),
+            net6: a.net6,
+            fees6: a.fees6,
+            gross6: (BigInt(a.net6) + BigInt(a.fees6)).toString(),
+            avgFillPrice6: a.avgFillPrice6,
+            maxDrawdown6: (w?.maxDd ?? 0n).toString(),
+            longestLossStreak: w?.longest ?? 0,
+          };
+        }),
+        note: "pnl_records remain the QUEUE_REPLAY paper path; variants are alternative fill assumptions over the same decisions and are never merged.",
+      });
+    } catch {
+      return { variants: [], note: TELEMETRY_NOTE };
+    }
+  });
+
+  app.get("/api/execution/queue", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const methods = await db.db.select({
+        method: queueEstimates.method,
+        n: sql<number>`count(*)`,
+        avgAhead6: sql<string | null>`avg(${queueEstimates.aheadShares6})::bigint::text`,
+        medianAhead6: sql<string | null>`(percentile_cont(0.5) within group (order by ${queueEstimates.aheadShares6}))::bigint::text`,
+      }).from(queueEstimates).groupBy(queueEstimates.method);
+      const cf = await db.db.select({
+        n: sql<number>`count(*)`,
+        wouldFill: sql<number>`coalesce(sum(case when ${fillCounterfactuals.wouldFill} then 1 else 0 end), 0)`,
+      }).from(fillCounterfactuals);
+      const reasons = await db.db.select({
+        reason: fillCounterfactuals.reason,
+        n: sql<number>`count(*)`,
+        wouldFill: sql<number>`sum(case when ${fillCounterfactuals.wouldFill} then 1 else 0 end)`,
+      }).from(fillCounterfactuals).groupBy(fillCounterfactuals.reason).orderBy(desc(sql`count(*)`)).limit(6);
+      return {
+        methods: methods.map((m) => ({ method: m.method, n: Number(m.n), avgAhead6: m.avgAhead6, medianAhead6: m.medianAhead6 })),
+        counterfactuals: {
+          n: Number(cf[0]?.n ?? 0),
+          wouldFill: Number(cf[0]?.wouldFill ?? 0),
+          reasons: reasons.map((r) => ({ reason: r.reason, n: Number(r.n), wouldFill: Number(r.wouldFill) })),
+        },
+      };
+    } catch {
+      return { methods: [], counterfactuals: { n: 0, wouldFill: 0, reasons: [] }, note: TELEMETRY_NOTE };
+    }
+  });
+
+  app.get("/api/execution/fill-quality", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    // quoted-vs-filled / partial / missed / maker-taker from the core order tables
+    const ords = await db.db.select({
+      id: orders.id, orderSide: orders.orderSide, price6: orders.price6,
+      shares6: orders.shares6, filledShares6: orders.filledShares6,
+    }).from(orders).orderBy(desc(orders.createdAtMs)).limit(2000);
+    const orderIds = ords.map((o) => o.id);
+    const fills = orderIds.length > 0
+      ? await db.db.select().from(orderFills).where(inArray(orderFills.orderId, orderIds))
+      : [];
+    const byOrder = new Map(ords.map((o) => [o.id, o]));
+
+    let full = 0, partial = 0, none = 0;
+    let quotedNum = 0n, quotedDen = 0n;
+    for (const o of ords) {
+      if (o.filledShares6 <= 0n) none += 1;
+      else if (o.filledShares6 >= o.shares6) full += 1;
+      else partial += 1;
+      if (o.filledShares6 > 0n) {
+        quotedNum += o.price6 * o.filledShares6;
+        quotedDen += o.filledShares6;
+      }
+    }
+    let filledNum = 0n, filledDen = 0n, slipNum = 0n;
+    let makerFills = 0, takerFills = 0, makerShares = 0n, takerShares = 0n;
+    for (const f of fills) {
+      filledNum += f.price6 * f.shares6;
+      filledDen += f.shares6;
+      const o = byOrder.get(f.orderId);
+      if (o) {
+        const diff = o.orderSide === "BUY" ? f.price6 - o.price6 : o.price6 - f.price6;
+        slipNum += diff * f.shares6;
+      }
+      if (f.maker) { makerFills += 1; makerShares += f.shares6; } else { takerFills += 1; takerShares += f.shares6; }
+    }
+
+    // cancel races come from the timeline (guarded: telemetry may not exist yet)
+    let cancelRaces = { requested: 0, lostToFill: 0 };
+    try {
+      const cr = await db.db.select({
+        intentId: executionTimelineEvents.intentId,
+        t: sql<number>`min(${executionTimelineEvents.tsMs})`,
+      }).from(executionTimelineEvents)
+        .where(eq(executionTimelineEvents.state, "CANCEL_REQUESTED"))
+        .groupBy(executionTimelineEvents.intentId);
+      if (cr.length > 0) {
+        const fl = await db.db.select({
+          intentId: executionTimelineEvents.intentId,
+          t: sql<number>`max(${executionTimelineEvents.tsMs})`,
+        }).from(executionTimelineEvents)
+          .where(inArray(executionTimelineEvents.state, ["PARTIAL_FILL", "FILLED"]))
+          .groupBy(executionTimelineEvents.intentId);
+        const fillBy = new Map(fl.map((r) => [r.intentId, Number(r.t)]));
+        cancelRaces = {
+          requested: cr.length,
+          lostToFill: cr.filter((r) => (fillBy.get(r.intentId) ?? Number.NEGATIVE_INFINITY) >= Number(r.t)).length,
+        };
+      }
+    } catch { /* telemetry tables absent — leave zeros */ }
+
+    return jsonSafe({
+      orders: { total: ords.length, full, partial, none },
+      quoted: {
+        avgQuoted6: quotedDen > 0n ? (quotedNum / quotedDen).toString() : null,
+        avgFilled6: filledDen > 0n ? (filledNum / filledDen).toString() : null,
+        slippagePerShare6: filledDen > 0n ? (slipNum / filledDen).toString() : null,
+      },
+      makerTaker: { makerFills, takerFills, makerShares6: makerShares, takerShares6: takerShares },
+      cancelRaces,
+    });
+  });
+
+  // ---------- strategy comparison ----------
+
+  app.get("/api/strategy/comparison", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const decisionIdOf = sql`${signalCandidates.detail} ->> 'decisionId'`;
+
+    // candidates per strategy (existing tables)
+    const cand = await db.db.select({
+      sv: signalCandidates.strategyVersion,
+      total: sql<number>`count(*)`,
+      approved: sql<number>`sum(case when ${signalCandidates.status} = 'RISK_APPROVED' then 1 else 0 end)`,
+    }).from(signalCandidates).groupBy(signalCandidates.strategyVersion);
+
+    // orders + fills per strategy, via the candidate's decision id
+    const fillAgg = await db.db.select({
+      sv: signalCandidates.strategyVersion,
+      placed: sql<number>`count(distinct ${orders.id})`,
+      filledOrders: sql<number>`count(distinct case when ${orders.filledShares6} > 0 then ${orders.id} end)`,
+      fillCount: sql<number>`count(${orderFills.id})`,
+      shares6: sql<string>`coalesce(sum(${orderFills.shares6}), 0)::text`,
+      avgPrice6: sql<string | null>`(sum(${orderFills.price6}::numeric * ${orderFills.shares6}) / nullif(sum(${orderFills.shares6}), 0))::bigint::text`,
+      slip6: sql<string | null>`(sum((case when ${orders.orderSide} = 'BUY' then ${orderFills.price6} - ${orders.price6} else ${orders.price6} - ${orderFills.price6} end)::numeric * ${orderFills.shares6}) / nullif(sum(${orderFills.shares6}), 0))::bigint::text`,
+    }).from(signalCandidates)
+      .innerJoin(orders, sql`${orders.decisionId} = ${decisionIdOf}`)
+      .leftJoin(orderFills, eq(orderFills.orderId, orders.id))
+      .groupBy(signalCandidates.strategyVersion);
+
+    // resolved outcomes per strategy, in resolution order (drawdown / streak / CI)
+    const pnlRows = await db.db.select({
+      sv: signalCandidates.strategyVersion,
+      pnl6: positions.pnl6,
+    }).from(signalCandidates)
+      .innerJoin(positions, sql`${positions.decisionId} = ${decisionIdOf}`)
+      .where(sql`${positions.pnl6} is not null`)
+      .orderBy(positions.resolvedAtMs)
+      .limit(5000);
+
+    // gross / fees decomposition from pnl_records
+    const feeAgg = await db.db.select({
+      sv: signalCandidates.strategyVersion,
+      gross6: sql<string>`coalesce(sum(${pnlRecords.gross6}), 0)::text`,
+      fees6: sql<string>`coalesce(sum(${pnlRecords.fees6}), 0)::text`,
+    }).from(signalCandidates)
+      .innerJoin(positions, sql`${positions.decisionId} = ${decisionIdOf}`)
+      .innerJoin(pnlRecords, eq(pnlRecords.positionId, positions.id))
+      .groupBy(signalCandidates.strategyVersion);
+
+    // adverse selection proxy: avg 30s side-adjusted markout, linked via correlation id
+    const advBy = new Map<string, { n: number; avg6: string }>();
+    try {
+      const adv = await db.db.select({
+        sv: signalCandidates.strategyVersion,
+        n: sql<number>`count(*)`,
+        avg6: sql<string>`avg(${markoutObservations.markout6})::bigint::text`,
+      }).from(signalCandidates)
+        .innerJoin(decisionSnapshots, sql`${decisionSnapshots.decisionId} = ${decisionIdOf}`)
+        .innerJoin(markoutObservations, eq(markoutObservations.correlationId, decisionSnapshots.correlationId))
+        .where(eq(markoutObservations.horizonMs, "30000"))
+        .groupBy(signalCandidates.strategyVersion);
+      for (const a of adv) advBy.set(a.sv, { n: Number(a.n), avg6: a.avg6 });
+    } catch { /* markout table absent — leave empty */ }
+
+    // promotion decisions (latest per strategy; an active one wins)
+    const promos = await db.db.select().from(strategyPromotionDecisions)
+      .orderBy(desc(strategyPromotionDecisions.decidedAtMs)).limit(500);
+    const promoBy = new Map<string, typeof promos[number]>();
+    for (const p of promos) {
+      // rows arrive newest-first: keep the latest, but let an active decision win
+      const cur = promoBy.get(p.strategyVersion);
+      if (!cur || (p.active && !cur.active)) promoBy.set(p.strategyVersion, p);
+    }
+    const calibIds = [...promoBy.values()].map((p) => p.calibrationArtifactId).filter((x): x is string => x !== null);
+    const calibs = calibIds.length > 0
+      ? await db.db.select().from(calibrationArtifacts).where(inArray(calibrationArtifacts.id, calibIds))
+      : [];
+    const calibBy = new Map(calibs.map((c) => [c.id, c]));
+
+    // portfolio-level fill-selection cost: latest aggregate window (market_id null preferred)
+    let fillSelectionCost: Record<string, unknown> | null = null;
+    try {
+      const fscRows = await db.db.select().from(fillSelectionCostRecords)
+        .orderBy(desc(fillSelectionCostRecords.tsMs)).limit(50);
+      const f = fscRows.find((r) => r.marketId === null) ?? fscRows[0];
+      if (f) {
+        fillSelectionCost = {
+          signalConditionedValue6: f.signalConditionedValue6,
+          fillConditionedValue6: f.fillConditionedValue6,
+          cost6: f.cost6,
+          signalSampleCount: f.signalSampleCount,
+          fillSampleCount: f.fillSampleCount,
+          windowStartMs: f.windowStartMs,
+          windowEndMs: f.windowEndMs,
+        };
+      }
+    } catch { /* table absent */ }
+
+    // realized outcome walks per strategy (exact bigint)
+    const outcomes = new Map<string, { pnls: bigint[]; equity: bigint; peak: bigint; maxDd: bigint; streak: number; longest: number; wins: number; net: bigint }>();
+    for (const r of pnlRows) {
+      const w = outcomes.get(r.sv) ?? { pnls: [], equity: 0n, peak: 0n, maxDd: 0n, streak: 0, longest: 0, wins: 0, net: 0n };
+      const p = r.pnl6 ?? 0n;
+      w.pnls.push(p);
+      w.net += p;
+      if (p > 0n) w.wins += 1;
+      w.equity += p;
+      if (w.equity > w.peak) w.peak = w.equity;
+      if (w.peak - w.equity > w.maxDd) w.maxDd = w.peak - w.equity;
+      if (p < 0n) { w.streak += 1; w.longest = Math.max(w.longest, w.streak); } else w.streak = 0;
+      outcomes.set(r.sv, w);
+    }
+    const feeBy = new Map(feeAgg.map((f) => [f.sv, f]));
+    const fillBy = new Map(fillAgg.map((f) => [f.sv, f]));
+
+    const versions = [...new Set([...cand.map((c) => c.sv), ...promoBy.keys()])].sort();
+    const strategies = versions.map((sv) => {
+      const c = cand.find((x) => x.sv === sv);
+      const f = fillBy.get(sv);
+      const w = outcomes.get(sv);
+      const fee = feeBy.get(sv);
+      const promo = promoBy.get(sv);
+      const evidence = promo ? (promo.evidence as {
+        walkForward?: { folds: number; brier: number; logLoss: number; ece: number; n: number; purged: boolean };
+        netEvPerCost?: { mean: number; ciLo: number; ciHi: number; n: number };
+        frictions?: { feesIncluded: boolean; spreadIncluded: boolean; latencyIncluded: boolean; adverseSelectionIncluded: boolean };
+      } | null) : null;
+      const calib = promo?.calibrationArtifactId ? calibBy.get(promo.calibrationArtifactId) : undefined;
+      const calibMetrics = calib ? (calib.metrics as { brier: number; logLoss: number; ece: number; n: number }) : null;
+
+      // realized per-trade net CI (95%, normal approximation) — display-grade floats at the edge
+      let ci6: { lo: string; hi: string } | null = null;
+      if (w && w.pnls.length >= 2) {
+        const xs = w.pnls.map((p) => Number(p));
+        const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+        const sd = Math.sqrt(xs.reduce((a, b) => a + (b - mean) ** 2, 0) / (xs.length - 1));
+        const half = 1.96 * sd / Math.sqrt(xs.length);
+        ci6 = { lo: String(Math.round(mean - half)), hi: String(Math.round(mean + half)) };
+      }
+
+      return {
+        strategyVersion: sv,
+        candidates: { total: Number(c?.total ?? 0), approved: Number(c?.approved ?? 0) },
+        orders: { placed: Number(f?.placed ?? 0), filled: Number(f?.filledOrders ?? 0) },
+        fills: {
+          count: Number(f?.fillCount ?? 0),
+          shares6: f?.shares6 ?? "0",
+          avgPrice6: f?.avgPrice6 ?? null,
+          slippagePerShare6: f?.slip6 ?? null,
+        },
+        outcomes: w ? {
+          resolved: w.pnls.length,
+          wins: w.wins,
+          net6: w.net.toString(),
+          gross6: fee?.gross6 ?? "0",
+          fees6: fee?.fees6 ?? "0",
+          maxDrawdown6: w.maxDd.toString(),
+          longestLossStreak: w.longest,
+          ci6,
+        } : null,
+        adverse: advBy.get(sv) ? { n: advBy.get(sv)!.n, avgMarkout30s6: advBy.get(sv)!.avg6 } : null,
+        evidence: evidence ? {
+          brier: evidence.walkForward?.brier ?? null,
+          logLoss: evidence.walkForward?.logLoss ?? null,
+          ece: evidence.walkForward?.ece ?? null,
+          n: evidence.walkForward?.n ?? null,
+          folds: evidence.walkForward?.folds ?? null,
+          purged: evidence.walkForward?.purged ?? null,
+          netEvPerCost: evidence.netEvPerCost ?? null,
+          frictions: evidence.frictions ?? null,
+        } : null,
+        calibration: calib && calibMetrics ? {
+          method: calib.method,
+          brier: calibMetrics.brier, logLoss: calibMetrics.logLoss, ece: calibMetrics.ece, n: calibMetrics.n,
+        } : null,
+        promotion: promo ? {
+          status: promo.approved ? "PROMOTED" as const : "NOT_PROMOTED" as const,
+          reasons: (promo.reasons as string[]) ?? [],
+          mode: promo.mode,
+          decidedAtMs: promo.decidedAtMs,
+          active: promo.active,
+        } : { status: "NO_DECISION" as const, reasons: [], mode: null, decidedAtMs: null, active: false },
+      };
+    });
+
+    return jsonSafe({
+      strategies,
+      fillSelectionCost,
+      notes: [
+        "Score strength is not probability.",
+        "Being filled can be adverse information.",
+        "No trade is a valid decision.",
+      ],
     });
   });
 

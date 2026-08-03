@@ -55,10 +55,30 @@ export interface FillEvent {
   fee6: Usdc6;
   maker: boolean;
   tsMs: number;
+  /** order_fills row id for this fill (execution-timeline threading). */
+  fillId?: string;
+}
+
+/**
+ * Observation hooks for the execution-quality timeline (plan item 1b).
+ * Strictly additive: hooks fire AFTER the executor's own state/persistence
+ * changes, exceptions are swallowed, and no hook can alter fill behavior —
+ * the canonical paper path (QUEUE_REPLAY) stays bit-identical with or
+ * without them.
+ */
+export interface PaperExecHooks {
+  /** Order accepted by the simulated exchange (maker: now resting; taker: about to walk the book). */
+  onActivated?(o: PaperOrderRecord, nowMs: number): void;
+  /** Queue ahead of a resting maker order decreased by `consumed6` (trade tape replay). */
+  onQueueChanged?(o: PaperOrderRecord, consumed6: Shares6, tsMs: number): void;
+  /** Order reached a terminal status (MATCHED / CANCELED / REJECTED / EXPIRED). */
+  onFinished?(o: PaperOrderRecord, status: PaperOrderRecord["status"], reason: string, nowMs: number): void;
 }
 
 export class PaperExecutor {
   private orders = new Map<string, PaperOrderRecord>();
+  /** Optional timeline observation hooks; never affect execution. */
+  hooks: PaperExecHooks | null = null;
 
   constructor(
     private readonly db: DbHandle,
@@ -167,9 +187,11 @@ export class PaperExecutor {
       o.queueAhead6 = book.queueAtBid(o.price6); // join the back of the displayed queue
       o.status = "LIVE";
       await this.persistStatus(o, nowMs);
+      this.safeHook((h) => h.onActivated?.(o, nowMs));
       return;
     }
     // taker FAK: walk asks up to limit price, respect stake cap
+    this.safeHook((h) => h.onActivated?.(o, nowMs));
     let remaining = o.shares6;
     const rate = this.feeRatePpm();
     for (const lvl of book.sortedAsks()) {
@@ -223,6 +245,7 @@ export class PaperExecutor {
         const consumed = tradable < o.queueAhead6 ? tradable : o.queueAhead6;
         o.queueAhead6 -= consumed;
         tradable -= consumed;
+        this.safeHook((h) => h.onQueueChanged?.(o, consumed, tsMs));
       }
       if (tradable <= 0n) continue;
       const remaining = o.shares6 - o.filled6;
@@ -247,8 +270,9 @@ export class PaperExecutor {
     }
     o.filled6 += shares6;
     o.spent6 += cost + fee6;
+    const fillId = newId();
     await this.db.db.insert(orderFills).values({
-      id: newId(),
+      id: fillId,
       orderId: o.id,
       price6,
       shares6,
@@ -257,7 +281,7 @@ export class PaperExecutor {
       tsMs,
     });
     await this.db.db.update(ordersTable).set({ filledShares6: o.filled6, updatedAtMs: tsMs }).where(eq(ordersTable.id, o.id));
-    await this.onFill({ order: o, shares6, price6, fee6, maker, tsMs });
+    await this.onFill({ order: o, shares6, price6, fee6, maker, tsMs, fillId });
   }
 
   async cancel(orderId: string, reason: string, nowMs: number): Promise<boolean> {
@@ -284,6 +308,13 @@ export class PaperExecutor {
     await this.db.db.update(ordersTable)
       .set({ status, statusReason: reason, updatedAtMs: nowMs, filledShares6: o.filled6 })
       .where(eq(ordersTable.id, o.id));
+    this.safeHook((h) => h.onFinished?.(o, status, reason, nowMs));
+  }
+
+  /** Hooks are observation-only: any exception is contained here. */
+  private safeHook(fn: (h: PaperExecHooks) => void): void {
+    if (!this.hooks) return;
+    try { fn(this.hooks); } catch (e) { logger.warn("paper exec hook failed", { error: String(e) }); }
   }
 
   private async persistStatus(o: PaperOrderRecord, nowMs: number): Promise<void> {

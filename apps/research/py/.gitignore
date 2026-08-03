@@ -1,0 +1,6 @@
+# python env + generated outputs (artifacts/decisions are reproducible from
+# the manifest + trainer; the synthetic fixture regenerates deterministically)
+.venv/
+__pycache__/
+out/
+fixtures/synthetic_smoke.csv
