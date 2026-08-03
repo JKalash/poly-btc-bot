@@ -91,6 +91,7 @@ verify your jurisdiction before funding anything.
 - `docs/threat-model.md`
 - `docs/live-trading-checklist.md`
 - `docs/limitations.md` — explicit list of what is stubbed or partial
+- `docs/deploy.md` — VPS deployment (Docker or bare) for gap-free 24/7 collection
 - `docs/research/calibration-study-2026-08.md` — walk-forward study on 14,226 real markets: the
   mid-price beats our model at every horizon; maker fills cost −8.8pts; the late favorite drift is
   real but is the HFT latency pool

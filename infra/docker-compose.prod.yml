@@ -1,0 +1,90 @@
+# Production deployment: Postgres + Redis + split api/engine/web processes.
+# ALL ports bind to 127.0.0.1 on the host — access the dashboard through an
+# SSH tunnel, never the public internet:
+#   ssh -L 3000:127.0.0.1:3000 -L 8787:127.0.0.1:8787 <user>@<vps>
+#
+# Usage (from repo root on the server):
+#   cp .env.example .env   # set SESSION_SECRET + OPERATOR_PASSWORD_HASH!
+#   docker compose -f infra/docker-compose.prod.yml up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: b5p
+      POSTGRES_PASSWORD: b5p
+      POSTGRES_DB: b5p
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U b5p"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build: { context: .., dockerfile: Dockerfile }
+    command: ["pnpm", "--filter", "@b5p/db", "migrate"]
+    environment: &appenv
+      DATABASE_URL: postgres://b5p:b5p@postgres:5432/b5p
+      REDIS_URL: redis://redis:6379
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
+      OPERATOR_PASSWORD_HASH: ${OPERATOR_PASSWORD_HASH:-}
+      API_HOST: 0.0.0.0        # container-internal only; host binding stays 127.0.0.1
+      API_PORT: "8787"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  seed:
+    build: { context: .., dockerfile: Dockerfile }
+    command: ["pnpm", "--filter", "@b5p/research", "seed"]
+    environment: *appenv
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  engine:
+    build: { context: .., dockerfile: Dockerfile }
+    command: ["pnpm", "--filter", "@b5p/engine", "start"]
+    environment: *appenv
+    depends_on:
+      seed: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  api:
+    build: { context: .., dockerfile: Dockerfile }
+    command: ["pnpm", "--filter", "@b5p/api", "start"]
+    environment: *appenv
+    ports:
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      seed: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  web:
+    build: { context: .., dockerfile: Dockerfile }
+    command: ["pnpm", "--filter", "@b5p/web", "start"]
+    environment:
+      API_PROXY_TARGET: http://api:8787
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

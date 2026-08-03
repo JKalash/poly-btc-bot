@@ -1,0 +1,24 @@
+# Bare-VPS fallback (no Docker): embedded-PGlite mode under systemd.
+# Install:
+#   sudo cp infra/b5p-collector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now b5p-collector
+# Assumes the repo lives at /opt/b5p and node/pnpm are installed for user "b5p"
+# (see docs/deploy.md).
+[Unit]
+Description=BTC 5m Polymarket collector (paper engine + api + web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=b5p
+WorkingDirectory=/opt/b5p
+Environment=PATH=/home/b5p/.nvm/versions/node/v22.21.1/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/b5p/.nvm/versions/node/v22.21.1/bin/pnpm dev
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/b5p/data/logs/collector.log
+StandardError=append:/opt/b5p/data/logs/collector.log
+
+[Install]
+WantedBy=multi-user.target

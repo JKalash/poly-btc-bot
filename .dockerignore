@@ -1,0 +1,11 @@
+node_modules
+**/node_modules
+.next
+**/.next
+data
+*.log
+coverage
+playwright-report
+test-results
+.git
+apps/research/py/.venv
