@@ -27,6 +27,9 @@ servers are marked with a confidence note.
 | 019 | No staleness/pong watchdog in the WS stack — half-open connection starves all feeds until manual restart |
 | 027 | Kill switch/arm/disarm/resume silently dead in split-process mode without REDIS_URL |
 | 048 | `API_PROXY_TARGET` baked at Next build — split-process compose deploy ships a non-functional dashboard |
+| 058 | Strategy-validation/live-eligibility pipeline absent — `STRATEGY_UNVALIDATED` unreachable, shadow-validation and fill/candidate minimums dead |
+| 059 | Most spec'd automatic halt conditions never wired to `halt()` |
+| 060 | Restart silently clears the consecutive-loss stop and daily-drawdown peak |
 
 ## Medium severity
 
@@ -55,6 +58,15 @@ servers are marked with a confidence note.
 | 049 | Seeded tutorial trade counted as a real paper result in P&L/orders/positions |
 | 050 | Cockpit WebSocket hardcoded to 127.0.0.1 and never reconnects — realtime dead off-localhost |
 | 051 | Risk-page UI + .env.example still claim "no signing path" beside the live-arming card |
+| 057 | Tests inherit ambient DATABASE_URL — `pnpm test` can write to a production database |
+| 061 | Local resolution accepts an arbitrarily stale "final" Chainlink tick, then halts on its own mismatch |
+| 062 | `fee_collection_convention: "shares"` simulates taker trades fee-free |
+| 063 | Live resting orders unmanaged; arming-token expiry abandons them on the exchange |
+| 064 | Exit policies are an enum, not a feature — three of four values do nothing but get recorded |
+| 065 | Config risk limits ignored unless profile is "custom"; two spread tolerances govern one order |
+| 066 | Very-aggressive activation needs no server-side acknowledgement |
+| 067 | Five audit tables write-orphaned; limitations.md book-persistence claim false |
+| 068 | Eleven more dead config knobs (incl. `feeds.binance.required`, `volatility_model`, `maker_only`) |
 
 ## Low severity
 
@@ -80,6 +92,8 @@ servers are marked with a confidence note.
 | 054 | Data pages conflate error/loading with empty — "No orders yet" while the API is down |
 | 055 | Playwright smoke test cannot pass (`getByLabel` has no label association) |
 | 056 | Timing Lab never reloads its table after a refresh completes |
+| 069 | Operator cooling-off timer can never activate (`coolingOffUntilMs` hardcoded null) |
+| 070 | Spec-conformance rollup: absent capabilities not listed in docs/limitations.md |
 | 044 | `TickBuffer` never dedups; RTDS backfill collapses `medianGapMs` to 0 (reproduced) |
 | 045 | `aggregateCloses` bucket phase jitter makes EMA/RSI non-reproducible |
 | 046 | Order prices round-trip through floats, contradicting the fixed-point invariant (currently exact) |
