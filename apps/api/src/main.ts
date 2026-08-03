@@ -1,5 +1,8 @@
 import { makeDb, type DbHandle } from "@b5p/db";
 import { createEngineRuntime, logger, type EngineRuntime } from "@b5p/engine";
+import { seedCalibration } from "@b5p/research";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import { AuthService } from "./auth";
 import { buildServer, makeApiBus } from "./server";
 
@@ -21,6 +24,24 @@ if (process.env.EMBED_ENGINE === "1") {
 } else {
   db = await makeDb();
   await db.migrate();
+}
+
+// Ensure the calibration registry (model/calibration artifacts + promotion
+// decision) exists wherever this DB lives. Idempotent, seal-verified upsert;
+// silently absent when the sealed artifact pair is not shipped alongside.
+{
+  const seedDir = process.env.B5P_CALIBRATION_SEED_DIR
+    ?? path.join(import.meta.dirname, "..", "..", "research", "py", "out");
+  const artifactPath = path.join(seedDir, "calibrated_logistic_kachoio_T90.json");
+  const decisionPath = path.join(seedDir, "decision_kachoio_T90.json");
+  if (existsSync(artifactPath) && existsSync(decisionPath)) {
+    try {
+      const r = await seedCalibration(db, { artifactPath, decisionPath, nowMs: Date.now() });
+      logger.info(`api: calibration registry ensured — artifact ${r.modelArtifactId}, decision ${r.decisionId} (approved=${r.approved}, active=${r.active})`);
+    } catch (e) {
+      logger.warn(`api: calibration registry seed failed (continuing): ${(e as Error).message}`);
+    }
+  }
 }
 
 const auth = new AuthService();
