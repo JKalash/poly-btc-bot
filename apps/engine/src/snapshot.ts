@@ -95,7 +95,7 @@ export function buildDecisionSnapshot(args: {
         bestAsk: f.downBestAsk?.toFixed(3) ?? null,
         spread: f.downBestBid !== null && f.downBestAsk !== null ? (f.downBestAsk - f.downBestBid).toFixed(3) : null,
         depthTop5: "-",
-        ageMs: f.bookAgeMs ?? -1,
+        ageMs: f.downBookAgeMs ?? -1,
       },
       microprice: f.upMicroprice,
       imbalance: f.upImbalanceTop5,
@@ -129,6 +129,7 @@ export function buildDecisionSnapshot(args: {
           attributions: args.estimate.featureAttributions,
           calibrated: args.modelCalibrated,
           calibrationRequired: args.cfg.strategy.calibration_required,
+          candleSource: f.indicators?.candleSource ?? null,
         }
       : null,
     marketProbability: f.upMid === null ? null : f.upMid.toFixed(4),

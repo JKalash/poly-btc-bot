@@ -32,6 +32,7 @@ export interface CockpitState {
   sizingSimulation: string;
   bankroll: {
     bankroll6: string;
+    sessionStart6: string;
     sessionPeak6: string;
     dailyPeak6: string;
     consecutiveLosses: number;

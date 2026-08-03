@@ -26,7 +26,11 @@ export interface Candle {
   volume: number;
 }
 
+/** Provenance of the 1s candles the indicators were computed from. */
+export type CandleSource = "BINANCE_KLINES" | "CHAINLINK_SYNTHETIC";
+
 export interface IndicatorBlock {
+  candleSource: CandleSource;         // provenance: which feed produced the candles
   windowDeltaPct: number | null;      // % move from window open to now (dominant)
   microMomentumPct: number | null;    // % move over last 30s
   accelerationPct: number | null;     // momentum change: last 15s vs prior 15s
@@ -93,8 +97,9 @@ export const WEIGHTS_VERSION = "gist_composite_v1";
 export interface IndicatorInputs {
   nowMs: number;
   windowStartEpochSec: number;
-  candles1s: Candle[];       // Binance 1s klines, oldest first, spanning >= window + lookback
-  binanceTicks: TickBuffer;  // RTDS binance stream for tick trend
+  candles1s: Candle[];       // 1s candles, oldest first, spanning >= window + lookback
+  binanceTicks: TickBuffer;  // tick stream for tick trend (matches candleSource)
+  candleSource: CandleSource; // provenance recorded on the output block
 }
 
 export function computeIndicators(inp: IndicatorInputs): IndicatorBlock {
@@ -182,6 +187,7 @@ export function computeIndicators(inp: IndicatorInputs): IndicatorBlock {
 
   const confidence = Math.min(1, Math.abs(score));
   return {
+    candleSource: inp.candleSource,
     windowDeltaPct,
     microMomentumPct,
     accelerationPct,

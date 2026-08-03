@@ -96,6 +96,20 @@ export class PaperExecutor {
     return [...this.orders.values()].filter((o) => o.marketId === marketId);
   }
 
+  /**
+   * Drop terminal orders for an expired market from memory. All orders are
+   * persisted on every status change; keeping them in the map only makes the
+   * per-step scans slower and the process grow without bound on 24/7 runs.
+   * Non-terminal orders (should not exist for an expired market) are kept.
+   */
+  pruneMarket(marketId: string): void {
+    for (const o of this.orders.values()) {
+      if (o.marketId !== marketId) continue;
+      if (o.status === "LIVE" || o.status === "PARTIAL" || o.status === "PENDING") continue;
+      this.orders.delete(o.id);
+    }
+  }
+
   async submit(args: {
     decisionId: string;
     intentId: string;

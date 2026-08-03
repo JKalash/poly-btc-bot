@@ -51,7 +51,7 @@ describe("composite score (gist weights)", () => {
     const candles = candleSeries(400, (i) => 64000 + Math.max(0, i - 110) * 0.5); // rising after window open
     const ind = computeIndicators({
       nowMs: T0, windowStartEpochSec: windowStart, candles1s: candles,
-      binanceTicks: binTicks(candles.slice(-30).map((c) => c.close)),
+      binanceTicks: binTicks(candles.slice(-30).map((c) => c.close)), candleSource: "BINANCE_KLINES",
     });
     expect(ind.direction).toBe("UP");
     expect(ind.windowDeltaPct).toBeGreaterThan(0.1);
@@ -63,7 +63,7 @@ describe("composite score (gist weights)", () => {
     const candles = candleSeries(400, () => 64000);
     const ind = computeIndicators({
       nowMs: T0, windowStartEpochSec: windowStart, candles1s: candles,
-      binanceTicks: binTicks(candles.slice(-30).map((c) => c.close)),
+      binanceTicks: binTicks(candles.slice(-30).map((c) => c.close)), candleSource: "BINANCE_KLINES",
     });
     expect(ind.direction).toBeNull();
     expect(ind.confidence).toBeLessThan(0.01);
@@ -73,7 +73,7 @@ describe("composite score (gist weights)", () => {
     const flat = candleSeries(400, () => 64000, (i) => (i > 390 ? 100 : 1));
     const ind = computeIndicators({
       nowMs: T0, windowStartEpochSec: windowStart, candles1s: flat,
-      binanceTicks: binTicks(flat.slice(-30).map((c) => c.close)),
+      binanceTicks: binTicks(flat.slice(-30).map((c) => c.close)), candleSource: "BINANCE_KLINES",
     });
     expect(ind.volumeSurgeRatio!).toBeGreaterThan(5);
     expect(ind.direction).toBeNull(); // still flat
@@ -110,7 +110,7 @@ describe("late-snipe preset governance", () => {
       binanceMinusChainlinkUsd: null, binanceMinusChainlinkBps: null, chainlinkMedianGapMs: null,
       chainlinkMaxGapMs120s: null, upBestBid: null, upBestAsk: null, upMid: null, upSpread: null,
       upMicroprice: null, upImbalanceTop5: null, upDepthBidTop5: null, upDepthAskTop5: null,
-      downBestBid: null, downBestAsk: null, bookAgeMs: null, complementInconsistency: null,
+      downBestBid: null, downBestAsk: null, bookAgeMs: null, downBookAgeMs: null, complementInconsistency: null,
       upQuoteFlips: 0, lastTradePriceUp: null, lastTradeAgoMs: null, indicators: null,
       warmedUp: false, dataQualityScore: 0,
     };

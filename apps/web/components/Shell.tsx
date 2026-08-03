@@ -112,7 +112,10 @@ export default function Shell({ children }: { children: ReactNode }) {
 
   if (pathname.startsWith("/login")) return <>{children}</>;
 
-  const sessionPnl = s ? Number(s.bankroll.bankroll6) - Number(s.bankroll.sessionPeak6) : 0;
+  // Session P&L is measured from the session's starting bankroll; drawdown
+  // (bankroll − ratcheting peak, ≤ 0 by construction) is shown separately.
+  const sessionPnl = s ? Number(s.bankroll.bankroll6) - Number(s.bankroll.sessionStart6) : 0;
+  const drawdown = s ? Number(s.bankroll.bankroll6) - Number(s.bankroll.sessionPeak6) : 0;
 
   return (
     <CockpitCtx.Provider value={cockpit}>
@@ -152,6 +155,12 @@ export default function Shell({ children }: { children: ReactNode }) {
               <span className="text-muted">Session P&amp;L </span>
               <span className={`num font-semibold ${sessionPnl > 0 ? "text-good" : sessionPnl < 0 ? "text-critical" : "text-ink"}`}>
                 {sessionPnl >= 0 ? "+" : ""}{(sessionPnl / 1e6).toFixed(2)}
+              </span>
+            </div>
+            <div className="text-[12px]">
+              <span className="text-muted">Drawdown </span>
+              <span className={`num font-semibold ${drawdown < 0 ? "text-critical" : "text-ink"}`}>
+                {(drawdown / 1e6).toFixed(2)}
               </span>
             </div>
             <div className="text-[12px]">

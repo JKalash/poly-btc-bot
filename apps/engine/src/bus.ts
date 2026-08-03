@@ -7,7 +7,14 @@ import { logger } from "./log";
  * the API can embed the engine in one process (zero-install dev mode).
  */
 export interface Bus {
+  /** Fire-and-forget telemetry publish; failures are logged, never thrown. */
   publish(channel: string, payload: unknown): void;
+  /**
+   * Awaited publish for the CONTROL path (kill, disarm, arm, resume): rejects
+   * when the transport cannot deliver, so callers can surface the loss to the
+   * operator instead of silently dropping a safety-critical command.
+   */
+  publishReliable(channel: string, payload: unknown): Promise<void>;
   subscribe(channel: string, cb: (payload: unknown) => void): () => void;
   kind: "local" | "redis";
 }
@@ -22,6 +29,7 @@ export function getLocalBus(): Bus {
     const bus: Bus = {
       kind: "local",
       publish: (ch, payload) => { em.emit(ch, payload); },
+      publishReliable: (ch, payload) => { em.emit(ch, payload); return Promise.resolve(); },
       subscribe: (ch, cb) => { em.on(ch, cb); return () => em.off(ch, cb); },
     };
     g[GLOBAL_KEY] = bus;
@@ -45,10 +53,16 @@ export async function makeBus(): Promise<Bus> {
       try { h(payload); } catch (e) { logger.error("bus handler error", { channel, error: String(e) }); }
     }
   });
+  const serialize = (payload: unknown) => JSON.stringify(payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
   return {
     kind: "redis",
     publish: (ch, payload) => {
-      void pub.publish(ch, JSON.stringify(payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
+      // never a bare discarded promise: a Redis blip would otherwise become an
+      // unhandledRejection and take the publishing process down with it
+      pub.publish(ch, serialize(payload)).catch((e) => logger.error("bus publish failed", { channel: ch, error: String(e) }));
+    },
+    publishReliable: async (ch, payload) => {
+      await pub.publish(ch, serialize(payload));
     },
     subscribe: (ch, cb) => {
       if (!handlers.has(ch)) {
@@ -56,7 +70,14 @@ export async function makeBus(): Promise<Bus> {
         void sub.subscribe(ch);
       }
       handlers.get(ch)!.add(cb);
-      return () => { handlers.get(ch)?.delete(cb); };
+      return () => {
+        const hs = handlers.get(ch);
+        hs?.delete(cb);
+        if (hs && hs.size === 0) {
+          handlers.delete(ch);
+          sub.unsubscribe(ch).catch((e) => logger.warn("bus unsubscribe failed", { channel: ch, error: String(e) }));
+        }
+      };
     },
   };
 }
