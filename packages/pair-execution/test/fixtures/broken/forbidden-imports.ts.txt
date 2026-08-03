@@ -1,0 +1,19 @@
+// NEGATIVE-CONTROL FIXTURE for BPAIR-003 (test/capability-guard.test.ts).
+// Deliberately violates every capability-guard rule so the test can prove the
+// walker actually flags violations. Plain-text (.ts.txt) so it is never
+// compiled, typechecked, or executed — it is only read as text by the guard.
+// DO NOT rename to .ts and DO NOT copy any line of this file into src/.
+
+import { LiveClobAdapter } from "@b5p/polymarket"; // forbidden-package
+import { ClobClient } from "@polymarket/clob-client"; // forbidden-package (scope prefix)
+import { createWalletClient } from "viem"; // forbidden-package
+import { Wallet } from "ethers"; // forbidden-package
+import { execSync } from "node:child_process"; // forbidden-module
+import { liveAdapter } from "../../../../polymarket/src/live"; // escapes-package + live segment
+import { engineMain } from "../../../../../apps/engine/src/main"; // escapes-package
+
+export async function reachForbiddenCapabilities(): Promise<void> {
+  const wallet = await import("./wallet"); // live-or-wallet-segment (dynamic import)
+  const cp = require("child_process"); // forbidden-module (require)
+  void [LiveClobAdapter, ClobClient, createWalletClient, Wallet, execSync, liveAdapter, engineMain, wallet, cp];
+}

@@ -986,3 +986,461 @@ export const boundaryPriceObservations = pgTable("boundary_price_observations", 
   uniqueIndex("boundary_obs_capture_idx").on(t.source, t.symbol, t.boundaryEpoch, t.boundaryKind), // idempotent boundary capture per source
   index("boundary_obs_market_idx").on(t.marketId),
 ]);
+
+// ---- pair-execution persistence (spec §18) ----
+// §18.2–§18.8 below (agent B1). §18.9+ (pair_effect_outbox,
+// pair_paper_venue_operations, pair_inbox_evidence, pair_reconciliations,
+// research-run tables, orderbook_events, and the orders/order_fills
+// pair-linkage columns) are appended by agent B2 after this section.
+//
+// Conventions (spec §18.1):
+//  - epoch-ms columns (*_at_ms / *_ts_ms / *_ms deadlines): bigint
+//    mode "number" — safe-integer epoch milliseconds only;
+//  - every other bigint (economics *6, *_ppm rates, counts, versions,
+//    sequences, event ids): bigint mode "bigint" — never floating point;
+//  - closed enumerations and the >=0 / >0 economic CHECK invariants noted
+//    in comments are enforced in domain code + tests, matching the existing
+//    repo convention (drizzle-kit 0.30 has no CHECK support; see the note
+//    above paired_quote_cycles).
+//
+// NOTE: these pair_* tables are a NEW subsystem, deliberately distinct from
+// the older research tables paired_quote_cycles / paired_legs /
+// ctf_operations / hedge_actions / inventory_lots / inventory_snapshots
+// (e.g. pair_inventory_lots is intentionally NOT inventory_lots).
+
+import { primaryKey } from "drizzle-orm/pg-core";
+
+/** §18.2 — cluster correlated envelopes into an independent research unit. */
+export const pairOpportunityEpisodes = pgTable("pair_opportunity_episodes", {
+  id: text("id").primaryKey(),
+  marketId: text("market_id").notNull(),
+  strategyVersion: text("strategy_version").notNull(),
+  state: text("state").notNull(),
+  firstObservedAtMs: bigint("first_observed_at_ms", { mode: "number" }).notNull(),
+  lastObservedAtMs: bigint("last_observed_at_ms", { mode: "number" }).notNull(),
+  closedAtMs: bigint("closed_at_ms", { mode: "number" }),
+  closeReason: text("close_reason"),
+  minimumAskSum6: bigint("minimum_ask_sum6", { mode: "bigint" }),
+  maximumSignalNetPnl6: bigint("maximum_signal_net_pnl6", { mode: "bigint" }),
+  maximumActivationNetPnl6: bigint("maximum_activation_net_pnl6", { mode: "bigint" }),
+  envelopeCount: bigint("envelope_count", { mode: "bigint" }).notNull().default(sql`0`),
+  eligibleEnvelopeCount: bigint("eligible_envelope_count", { mode: "bigint" }).notNull().default(sql`0`),
+  scheduledGroupCount: integer("scheduled_group_count").notNull().default(0),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  index("pair_episodes_market_first_idx").on(t.marketId, t.firstObservedAtMs),
+  index("pair_episodes_state_last_idx").on(t.state, t.lastObservedAtMs),
+  // at most one open episode per (market_id, strategy_version); "open" is
+  // read fail-closed as closed_at_ms IS NULL (spec §18.2)
+  uniqueIndex("pair_episodes_open_uq")
+    .on(t.marketId, t.strategyVersion)
+    .where(sql`${t.closedAtMs} is null`),
+]);
+
+/**
+ * §18.2.1 — authoritative, immutable, resolvable paired-book evidence.
+ * capture_kind: SIGNAL | ACTIVATION_PARALLEL | ACTIVATION_FIRST_LEG |
+ * ACTIVATION_SECOND_LEG | RECOVERY_EVALUATION | SETTLEMENT_EVALUATION |
+ * RECONCILIATION_OBSERVATION | REPLAY_COUNTERFACTUAL (app-enforced).
+ * capture_hash covers economic book content/lineage WITHOUT use-site kind;
+ * use-site purpose is recorded in the causal event (spec §18.2.1).
+ */
+export const pairBookCaptures = pgTable("pair_book_captures", {
+  id: text("id").primaryKey(),
+  marketId: text("market_id").notNull(),
+  conditionId: text("condition_id").notNull(),
+  captureKind: text("capture_kind").notNull(),
+  capturedAtMs: bigint("captured_at_ms", { mode: "number" }).notNull(),
+  // FK -> orderbook_events(id) (§18.12): orderbook_events is declared by B2;
+  // B2 wires .references(() => orderbookEvents.id) here before generating
+  // the migration.
+  dataCutoffEventId: bigint("data_cutoff_event_id", { mode: "bigint" }),
+  dataCutoffEnvelopeId: text("data_cutoff_envelope_id"),
+  captureSequence: bigint("capture_sequence", { mode: "bigint" }).notNull(),
+
+  upTokenId: text("up_token_id").notNull(),
+  upBookVersion: bigint("up_book_version", { mode: "bigint" }).notNull(),
+  upConnectionEpoch: text("up_connection_epoch").notNull(),
+  upIntegrity: text("up_integrity").notNull(),
+  upSourceTsMs: bigint("up_source_ts_ms", { mode: "number" }),
+  upReceivedTsMs: bigint("up_received_ts_ms", { mode: "number" }).notNull(),
+  upSourceEventId: text("up_source_event_id"),
+  upExchangeHash: text("up_exchange_hash"),
+  upLocalHash: text("up_local_hash").notNull(),
+  upLevelsJson: jsonb("up_levels_json").notNull(), // decimal-string levels
+
+  downTokenId: text("down_token_id").notNull(),
+  downBookVersion: bigint("down_book_version", { mode: "bigint" }).notNull(),
+  downConnectionEpoch: text("down_connection_epoch").notNull(),
+  downIntegrity: text("down_integrity").notNull(),
+  downSourceTsMs: bigint("down_source_ts_ms", { mode: "number" }),
+  downReceivedTsMs: bigint("down_received_ts_ms", { mode: "number" }).notNull(),
+  downSourceEventId: text("down_source_event_id"),
+  downExchangeHash: text("down_exchange_hash"),
+  downLocalHash: text("down_local_hash").notNull(),
+  downLevelsJson: jsonb("down_levels_json").notNull(), // decimal-string levels
+
+  sourceSkewMs: integer("source_skew_ms").notNull(),
+  receiveSkewMs: integer("receive_skew_ms").notNull(),
+  // fee/constraint snapshot ids reference the token-aware snapshot rows
+  // (§18.13, extended by B2); token equality (up snapshot token == up_token_id,
+  // DOWN symmetric) is asserted transactionally + at reconciliation.
+  upFeeSnapshotId: text("up_fee_snapshot_id").notNull(),
+  downFeeSnapshotId: text("down_fee_snapshot_id").notNull(),
+  upConstraintSnapshotId: text("up_constraint_snapshot_id").notNull(),
+  downConstraintSnapshotId: text("down_constraint_snapshot_id").notNull(),
+  canonicalPayload: jsonb("canonical_payload").notNull(),
+  captureHash: text("capture_hash").notNull(),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_captures_hash_uq").on(t.captureHash),
+  index("pair_captures_market_ts_idx").on(t.marketId, t.capturedAtMs, t.id),
+  index("pair_captures_kind_ts_idx").on(t.captureKind, t.capturedAtMs),
+  index("pair_captures_cutoff_event_idx").on(t.dataCutoffEventId),
+]);
+
+/**
+ * §18.2.2 — one isolated counterfactual cash/accounting session and its
+ * current projection. session_key makes the single funding journal
+ * idempotent across restart.
+ */
+export const pairPaperAccounts = pgTable("pair_paper_accounts", {
+  id: text("id").primaryKey(),
+  accountModel: text("account_model").notNull(),
+  sessionKey: text("session_key").notNull(),
+  sourceConfigVersion: integer("source_config_version").notNull(),
+  // bankroll_snapshots id; deliberately no FK (spec §18.2.2 declares none —
+  // audit retention must not be blocked)
+  sourceBankrollSnapshotId: bigint("source_bankroll_snapshot_id", { mode: "bigint" }),
+  startingCash6: bigint("starting_cash6", { mode: "bigint" }).notNull(),
+  cashAvailable6: bigint("cash_available6", { mode: "bigint" }).notNull(),
+  cashReserved6: bigint("cash_reserved6", { mode: "bigint" }).notNull().default(sql`0`),
+  cashDebits6: bigint("cash_debits6", { mode: "bigint" }).notNull().default(sql`0`),
+  cashCredits6: bigint("cash_credits6", { mode: "bigint" }).notNull().default(sql`0`),
+  realizedPnl6: bigint("realized_pnl6", { mode: "bigint" }).notNull().default(sql`0`),
+  peakCash6: bigint("peak_cash6", { mode: "bigint" }).notNull(),
+  sessionDrawdown6: bigint("session_drawdown6", { mode: "bigint" }).notNull().default(sql`0`),
+  dailyRealizedPnl6: bigint("daily_realized_pnl6", { mode: "bigint" }).notNull().default(sql`0`),
+  dailyBucketUtc: text("daily_bucket_utc").notNull(),
+  activeGroupCount: integer("active_group_count").notNull().default(0),
+  aggregateWorstCaseLoss6: bigint("aggregate_worst_case_loss6", { mode: "bigint" }).notNull().default(sql`0`),
+  eventSequence: integer("event_sequence").notNull().default(0),
+  stateVersion: integer("state_version").notNull().default(0),
+  reconciliationStatus: text("reconciliation_status").notNull(),
+  lastReconciledAtMs: bigint("last_reconciled_at_ms", { mode: "number" }),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  closedAtMs: bigint("closed_at_ms", { mode: "number" }),
+}, (t) => [
+  uniqueIndex("pair_accounts_session_key_uq").on(t.sessionKey),
+]);
+
+/** §18.3 — immutable economic evidence at meaningful state transitions. */
+export const pairOpportunityObservations = pgTable("pair_opportunity_observations", {
+  id: text("id").primaryKey(),
+  episodeId: text("episode_id").references(() => pairOpportunityEpisodes.id),
+  marketId: text("market_id").notNull(),
+  conditionId: text("condition_id").notNull(),
+  strategyVersion: text("strategy_version").notNull(),
+  mode: text("mode").notNull(),
+  observationKind: text("observation_kind").notNull(),
+  triggerKind: text("trigger_kind").notNull(),
+  triggerId: text("trigger_id").notNull(),
+  captureId: text("capture_id").notNull().references(() => pairBookCaptures.id),
+  captureHash: text("capture_hash").notNull(), // denormalized from capture for integrity/query
+  upFeeSnapshotId: text("up_fee_snapshot_id").notNull(),
+  downFeeSnapshotId: text("down_fee_snapshot_id").notNull(),
+  upConstraintSnapshotId: text("up_constraint_snapshot_id").notNull(),
+  downConstraintSnapshotId: text("down_constraint_snapshot_id").notNull(),
+  policyHash: text("policy_hash").notNull(),
+  observerOperationalHash: text("observer_operational_hash").notNull(),
+  configVersion: integer("config_version").notNull(),
+  requestedCashCap6: bigint("requested_cash_cap6", { mode: "bigint" }).notNull(),
+  selectedPairShares6: bigint("selected_pair_shares6", { mode: "bigint" }),
+  grossTopOfBookEdge6: bigint("gross_top_of_book_edge6", { mode: "bigint" }),
+  grossWalkEdge6: bigint("gross_walk_edge6", { mode: "bigint" }),
+  netPreLatencyPnl6: bigint("net_pre_latency_pnl6", { mode: "bigint" }),
+  netPreLatencyEdgePpm: bigint("net_pre_latency_edge_ppm", { mode: "bigint" }),
+  oneTickWorsePnl6: bigint("one_tick_worse_pnl6", { mode: "bigint" }),
+  twoTicksWorsePnl6: bigint("two_ticks_worse_pnl6", { mode: "bigint" }),
+  worstCaseResidualLoss6: bigint("worst_case_residual_loss6", { mode: "bigint" }),
+  operationalRiskHaircut6: bigint("operational_risk_haircut6", { mode: "bigint" }),
+  depthStressJson: jsonb("depth_stress_json"),
+  primaryRejectionCode: text("primary_rejection_code"),
+  rejectionCodes: jsonb("rejection_codes").notNull(),
+  captureSummaryJson: jsonb("capture_summary_json").notNull(),
+  quoteJson: jsonb("quote_json"),
+  decisionJson: jsonb("decision_json").notNull(),
+  observedAtMs: bigint("observed_at_ms", { mode: "number" }).notNull(),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_observations_dedupe_uq").on(
+    t.strategyVersion, t.policyHash, t.mode, t.triggerKind, t.triggerId, t.captureHash,
+  ),
+  index("pair_observations_market_ts_idx").on(t.marketId, t.observedAtMs),
+  index("pair_observations_episode_ts_idx").on(t.episodeId, t.observedAtMs),
+  index("pair_observations_rejection_ts_idx").on(t.primaryRejectionCode, t.observedAtMs),
+  index("pair_observations_pnl_ts_idx").on(t.netPreLatencyPnl6, t.observedAtMs),
+]);
+
+/**
+ * §18.3.1 — durable, rebuildable funnel denominators (fixed UTC one-minute
+ * buckets in v0; incremented via atomic upsert; rebuildable projection).
+ */
+export const pairObserverBucketStats = pgTable("pair_observer_bucket_stats", {
+  bucketStartMs: bigint("bucket_start_ms", { mode: "number" }).notNull(),
+  bucketWidthMs: integer("bucket_width_ms").notNull(),
+  strategyVersion: text("strategy_version").notNull(),
+  policyHash: text("policy_hash").notNull(),
+  marketId: text("market_id").notNull(),
+  completeEnvelopes: bigint("complete_envelopes", { mode: "bigint" }).notNull().default(sql`0`),
+  validSynchronizedCaptures: bigint("valid_synchronized_captures", { mode: "bigint" }).notNull().default(sql`0`),
+  evaluatedCaptures: bigint("evaluated_captures", { mode: "bigint" }).notNull().default(sql`0`),
+  prefilterCaptures: bigint("prefilter_captures", { mode: "bigint" }).notNull().default(sql`0`),
+  grossDislocations: bigint("gross_dislocations", { mode: "bigint" }).notNull().default(sql`0`),
+  fullDepthExecutable: bigint("full_depth_executable", { mode: "bigint" }).notNull().default(sql`0`),
+  feePositive: bigint("fee_positive", { mode: "bigint" }).notNull().default(sql`0`),
+  stressPositive: bigint("stress_positive", { mode: "bigint" }).notNull().default(sql`0`),
+  sampledNegativeRows: bigint("sampled_negative_rows", { mode: "bigint" }).notNull().default(sql`0`),
+  rejectionCountsJson: jsonb("rejection_counts_json").notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  primaryKey({
+    name: "pair_observer_bucket_stats_pk",
+    columns: [t.bucketStartMs, t.bucketWidthMs, t.strategyVersion, t.policyHash, t.marketId],
+  }),
+]);
+
+/**
+ * §18.4 — current query projection and concurrency anchor.
+ * App-enforced checks (drizzle-kit 0.30 has no CHECK support):
+ * mode in ('paper'); target_gross_shares6 > 0; approved_cash_cap6 >= 0;
+ * approved_residual_loss6 >= 0; reserved_cash6 >= 0; all held/matched/
+ * residual quantities >= 0; recovery_attempts >= 0.
+ */
+export const pairOrderGroups = pgTable("pair_order_groups", {
+  id: text("id").primaryKey(),
+  observationId: text("observation_id").notNull().references(() => pairOpportunityObservations.id),
+  episodeId: text("episode_id").references(() => pairOpportunityEpisodes.id),
+  pairAccountId: text("pair_account_id").notNull().references(() => pairPaperAccounts.id),
+  signalDecisionId: text("signal_decision_id").notNull().references(() => decisionSnapshots.decisionId),
+  signalRiskDecisionId: text("signal_risk_decision_id").notNull().references(() => riskDecisions.id),
+  activationDecisionId: text("activation_decision_id").references(() => decisionSnapshots.decisionId),
+  activationRiskDecisionId: text("activation_risk_decision_id").references(() => riskDecisions.id),
+  latestOrderIntentId: text("latest_order_intent_id").references(() => orderIntents.id), // convenience only; history lives in pair_action_intents
+  marketId: text("market_id").notNull(),
+  conditionId: text("condition_id").notNull(),
+  strategyVersion: text("strategy_version").notNull(),
+  mode: text("mode").notNull(), // 'paper' only; 'live' is never a valid pair mode
+  route: text("route").notNull(),
+  dispatchModel: text("dispatch_model").notNull(),
+  settlementPolicy: text("settlement_policy").notNull(),
+  recoveryPolicy: text("recovery_policy").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestHash: text("request_hash").notNull(),
+  signalCaptureId: text("signal_capture_id").notNull().references(() => pairBookCaptures.id),
+  activationCaptureId: text("activation_capture_id").references(() => pairBookCaptures.id),
+  secondLegCaptureId: text("second_leg_capture_id").references(() => pairBookCaptures.id),
+  state: text("state").notNull(),
+  stateVersion: integer("state_version").notNull().default(0),
+  eventSequence: integer("event_sequence").notNull().default(0),
+  haltedAtMs: bigint("halted_at_ms", { mode: "number" }),
+  haltReason: text("halt_reason"),
+  targetGrossShares6: bigint("target_gross_shares6", { mode: "bigint" }).notNull(),
+  approvedCashCap6: bigint("approved_cash_cap6", { mode: "bigint" }).notNull(),
+  approvedResidualLoss6: bigint("approved_residual_loss6", { mode: "bigint" }).notNull(),
+  reservedCash6: bigint("reserved_cash6", { mode: "bigint" }).notNull(),
+  cashDebits6: bigint("cash_debits6", { mode: "bigint" }).notNull().default(sql`0`),
+  cashCredits6: bigint("cash_credits6", { mode: "bigint" }).notNull().default(sql`0`),
+  cashFees6: bigint("cash_fees6", { mode: "bigint" }).notNull().default(sql`0`),
+  settlementCosts6: bigint("settlement_costs6", { mode: "bigint" }).notNull().default(sql`0`),
+  upHeldShares6: bigint("up_held_shares6", { mode: "bigint" }).notNull().default(sql`0`),
+  downHeldShares6: bigint("down_held_shares6", { mode: "bigint" }).notNull().default(sql`0`),
+  matchedShares6: bigint("matched_shares6", { mode: "bigint" }).notNull().default(sql`0`),
+  residualSide: text("residual_side"),
+  residualShares6: bigint("residual_shares6", { mode: "bigint" }).notNull().default(sql`0`),
+  currentWorstCaseLoss6: bigint("current_worst_case_loss6", { mode: "bigint" }).notNull().default(sql`0`),
+  peakWorstCaseLoss6: bigint("peak_worst_case_loss6", { mode: "bigint" }).notNull().default(sql`0`),
+  signalNetPnl6: bigint("signal_net_pnl6", { mode: "bigint" }).notNull(),
+  activationNetPnl6: bigint("activation_net_pnl6", { mode: "bigint" }),
+  realizedPairPnl6: bigint("realized_pair_pnl6", { mode: "bigint" }),
+  realizedRecoveryPnl6: bigint("realized_recovery_pnl6", { mode: "bigint" }).notNull().default(sql`0`),
+  unrealizedResidualMark6: bigint("unrealized_residual_mark6", { mode: "bigint" }),
+  oneTickWorsePnl6: bigint("one_tick_worse_pnl6", { mode: "bigint" }),
+  twoTicksWorsePnl6: bigint("two_ticks_worse_pnl6", { mode: "bigint" }),
+  stressResultsJson: jsonb("stress_results_json").notNull(),
+  activateAtMs: bigint("activate_at_ms", { mode: "number" }).notNull(),
+  nextActionAtMs: bigint("next_action_at_ms", { mode: "number" }),
+  recoveryDeadlineMs: bigint("recovery_deadline_ms", { mode: "number" }),
+  recoveryAttempts: integer("recovery_attempts").notNull().default(0),
+  reconciliationStatus: text("reconciliation_status").notNull(),
+  lastReconciledAtMs: bigint("last_reconciled_at_ms", { mode: "number" }),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  closedAtMs: bigint("closed_at_ms", { mode: "number" }),
+}, (t) => [
+  uniqueIndex("pair_groups_idem_uq").on(t.idempotencyKey),
+  index("pair_groups_state_next_action_idx").on(t.state, t.nextActionAtMs),
+  index("pair_groups_market_created_idx").on(t.marketId, t.createdAtMs),
+  index("pair_groups_observation_idx").on(t.observationId),
+  index("pair_groups_signal_decision_idx").on(t.signalDecisionId),
+  index("pair_groups_latest_intent_idx").on(t.latestOrderIntentId),
+  index("pair_groups_recon_updated_idx").on(t.reconciliationStatus, t.updatedAtMs),
+  // at most one active group per market; "active" is read fail-closed as
+  // closed_at_ms IS NULL (any not-yet-closed group can still contain,
+  // create, recover, settle, or reconcile exposure — spec §18.4). Defense in
+  // depth alongside market_exposure_guards + creation-transaction locking.
+  uniqueIndex("pair_groups_active_market_uq")
+    .on(t.marketId)
+    .where(sql`${t.closedAtMs} is null`),
+]);
+
+/**
+ * §18.4.1 / §14.6 — shared pair-vs-directional mutual-exclusion guard.
+ * owner_kind: DIRECTIONAL_ORDER | DIRECTIONAL_POSITION | PAIR_GROUP.
+ * Authoritative invariant is the primary-key row per market plus
+ * transactional compare-and-swap via one shared MarketExposureGuardStore;
+ * the partial unique index is defense in depth.
+ */
+export const marketExposureGuards = pgTable("market_exposure_guards", {
+  marketId: text("market_id").primaryKey(),
+  ownerKind: text("owner_kind").notNull(),
+  ownerId: text("owner_id").notNull(),
+  ownerState: text("owner_state").notNull(),
+  stateVersion: integer("state_version").notNull().default(0),
+  acquiredAtMs: bigint("acquired_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  releasedAtMs: bigint("released_at_ms", { mode: "number" }),
+}, (t) => [
+  uniqueIndex("market_exposure_guards_owner_uq")
+    .on(t.ownerKind, t.ownerId)
+    .where(sql`${t.releasedAtMs} is null`),
+  index("market_exposure_guards_owner_state_idx").on(t.ownerState, t.updatedAtMs),
+]);
+
+/** §18.5 — immutable ordered aggregate event stream. */
+export const pairGroupEvents = pgTable("pair_group_events", {
+  id: text("id").primaryKey(),
+  groupId: text("group_id").notNull().references(() => pairOrderGroups.id),
+  sequence: integer("sequence").notNull(),
+  eventType: text("event_type").notNull(),
+  eventSchemaVersion: integer("event_schema_version").notNull(),
+  causationId: text("causation_id").notNull(),
+  correlationId: text("correlation_id").notNull(),
+  payload: jsonb("payload").notNull(),
+  occurredAtMs: bigint("occurred_at_ms", { mode: "number" }).notNull(),
+  recordedAtMs: bigint("recorded_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_group_events_group_seq_uq").on(t.groupId, t.sequence),
+  uniqueIndex("pair_group_events_group_causation_uq").on(t.groupId, t.causationId),
+  index("pair_group_events_type_ts_idx").on(t.eventType, t.occurredAtMs),
+]);
+
+/**
+ * §18.5.1 — one-row causal parent per aggregate action (not per leg).
+ * Deliberately no scalar effect_id: fan-out is represented by B2's
+ * pair_effect_outbox child rows, whose composite FK targets
+ * pair_action_intents_composite_uq below.
+ */
+export const pairActionIntents = pgTable("pair_action_intents", {
+  id: text("id").primaryKey(),
+  groupId: text("group_id").notNull().references(() => pairOrderGroups.id),
+  actionSequence: integer("action_sequence").notNull(),
+  actionKind: text("action_kind").notNull(),
+  captureId: text("capture_id").references(() => pairBookCaptures.id),
+  decisionId: text("decision_id").notNull().references(() => decisionSnapshots.decisionId),
+  riskDecisionId: text("risk_decision_id").notNull().references(() => riskDecisions.id),
+  orderIntentId: text("order_intent_id").references(() => orderIntents.id),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_action_intents_group_seq_uq").on(t.groupId, t.actionSequence),
+  // NULLs distinct; non-null order intent ids unique (spec's
+  // UNIQUE(order_intent_id) WHERE order_intent_id IS NOT NULL — Postgres
+  // default NULLS DISTINCT gives identical semantics; house style, see
+  // rebate_accruals_fill_idx)
+  uniqueIndex("pair_action_intents_order_intent_uq").on(t.orderIntentId),
+  // composite-FK target for B2's pair_effect_outbox child effects
+  uniqueIndex("pair_action_intents_composite_uq").on(t.id, t.groupId, t.actionSequence),
+]);
+
+/**
+ * §18.7 — immutable acquisition lots. App-enforced checks:
+ * gross_shares6 > 0; net_shares6 >= 0. remaining_shares6 lives only in a
+ * rebuildable read projection, never as mutable truth here.
+ */
+export const pairInventoryLots = pgTable("pair_inventory_lots", {
+  id: text("id").primaryKey(),
+  groupId: text("group_id").notNull().references(() => pairOrderGroups.id),
+  marketId: text("market_id").notNull(),
+  tokenId: text("token_id").notNull(),
+  outcome: text("outcome").notNull(), // UP | DOWN
+  sourceFillId: text("source_fill_id").notNull(), // order_fills id; no FK declared by spec §18.7
+  grossShares6: bigint("gross_shares6", { mode: "bigint" }).notNull(),
+  netShares6: bigint("net_shares6", { mode: "bigint" }).notNull(),
+  principalCost6: bigint("principal_cost6", { mode: "bigint" }).notNull(),
+  cashFee6: bigint("cash_fee6", { mode: "bigint" }).notNull(),
+  shareFee6: bigint("share_fee6", { mode: "bigint" }).notNull(),
+  acquiredAtMs: bigint("acquired_at_ms", { mode: "number" }).notNull(),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_inventory_lots_source_fill_uq").on(t.sourceFillId),
+]);
+
+/**
+ * §18.7 — immutable consumption rows. App-enforced check: shares6 > 0; the
+ * consuming transaction proves cumulative consumption <= lot net_shares6.
+ */
+export const pairInventoryConsumptions = pgTable("pair_inventory_consumptions", {
+  id: text("id").primaryKey(),
+  lotId: text("lot_id").notNull().references(() => pairInventoryLots.id),
+  groupId: text("group_id").notNull().references(() => pairOrderGroups.id),
+  eventId: text("event_id").notNull().references(() => pairGroupEvents.id),
+  consumptionKind: text("consumption_kind").notNull(),
+  shares6: bigint("shares6", { mode: "bigint" }).notNull(),
+  allocatedPrincipalCost6: bigint("allocated_principal_cost6", { mode: "bigint" }).notNull(),
+  allocatedBuyCashFee6: bigint("allocated_buy_cash_fee6", { mode: "bigint" }).notNull(),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_consumptions_event_lot_kind_uq").on(t.eventId, t.lotId, t.consumptionKind),
+]);
+
+/**
+ * §18.8 — balanced double-entry ledger lines. The application validates
+ * sum(amount6) == 0 per (journal_id, asset_id) before insert and again at
+ * reconciliation. Funding journals use null group/event references plus
+ * canonical account-creation causation metadata.
+ */
+export const pairLedgerEntries = pgTable("pair_ledger_entries", {
+  id: text("id").primaryKey(),
+  pairAccountId: text("pair_account_id").notNull().references(() => pairPaperAccounts.id),
+  groupId: text("group_id").references(() => pairOrderGroups.id),
+  journalId: text("journal_id").notNull(),
+  eventId: text("event_id").references(() => pairGroupEvents.id),
+  lineNumber: integer("line_number").notNull(),
+  account: text("account").notNull(),
+  assetId: text("asset_id").notNull(),
+  amount6: bigint("amount6", { mode: "bigint" }).notNull(),
+  inventoryLotId: text("inventory_lot_id").references(() => pairInventoryLots.id),
+  inventoryConsumptionId: text("inventory_consumption_id").references(() => pairInventoryConsumptions.id),
+  orderId: text("order_id"), // orders id; no FK declared by spec §18.8
+  fillId: text("fill_id"),   // order_fills id; no FK declared by spec §18.8
+  metadata: jsonb("metadata").notNull(),
+  occurredAtMs: bigint("occurred_at_ms", { mode: "number" }).notNull(),
+  recordedAtMs: bigint("recorded_at_ms", { mode: "number" }).notNull(),
+}, (t) => [
+  uniqueIndex("pair_ledger_journal_line_uq").on(t.journalId, t.lineNumber),
+  index("pair_ledger_group_ts_idx").on(t.groupId, t.occurredAtMs),
+  index("pair_ledger_account_ts_idx").on(t.pairAccountId, t.occurredAtMs),
+  index("pair_ledger_asset_group_idx").on(t.assetId, t.groupId),
+  index("pair_ledger_fill_idx").on(t.fillId).where(sql`${t.fillId} is not null`),
+]);
+
+// ---- end §18.2–§18.8 (B1) ----
+// B2 continues here with §18.9+: pair_effect_outbox (composite FK to
+// pair_action_intents_composite_uq), pair_paper_venue_operations,
+// pair_inbox_evidence, pair_reconciliations, pair_reconciliation_diffs,
+// pair_research_* tables, orderbook_events (then wire
+// pair_book_captures.data_cutoff_event_id FK above), the orders/order_fills
+// pair-linkage columns (§18.6), the fee/constraint snapshot extensions
+// (§18.13), and the single generated forward migration.
