@@ -16,6 +16,8 @@
   "dependencies": {
     "@b5p/domain": "workspace:*",
     "@b5p/strategy": "workspace:*",
+    "@polymarket/clob-client": "5.8.1",
+    "viem": "2.46.3",
     "zod": "3.24.1"
   },
   "devDependencies": {

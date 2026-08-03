@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, type AppConfig } from "@b5p/config";
 import {
   auditEvents, configVersions, decisionSnapshots, engineKv, featureSnapshots, healthEvents,
-  killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents,
+  killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents, orders,
   referencePriceTicks, resolutions, riskDecisions, signalCandidates, type DbHandle,
 } from "@b5p/db";
 import {
@@ -20,6 +20,7 @@ import {
 import { eq } from "drizzle-orm";
 import { Accounting } from "./accounting";
 import { CHANNELS, type Bus } from "./bus";
+import { LiveController, minArmUsdc, type ArmRequest } from "./live";
 import { logger } from "./log";
 import { PaperExecutor } from "./paper";
 import { ENGINE_VERSION, buildDecisionSnapshot } from "./snapshot";
@@ -61,12 +62,14 @@ export class Engine {
   private haltReason: string | null = null;
   accounting: Accounting;
   paper: PaperExecutor;
+  live: LiveController;
   cfg: AppConfig = DEFAULT_CONFIG;
   configVersion = 0;
   private lastCockpitPublish = 0;
   private usedIdempotencyKeys = new Set<string>();
   private tickPersistQueue: ReferenceTick[] = [];
   private lastFeaturePersistMs = 0;
+  private lastLiveRefreshMs = 0;
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
 
@@ -76,6 +79,7 @@ export class Engine {
     readonly mode: Exclude<Mode, "live">,
   ) {
     this.accounting = new Accounting(db, mode);
+    this.live = new LiveController(db); // boots DISARMED; only active if a hot-wallet key is configured
     this.paper = new PaperExecutor(
       db,
       () => this.activeFeeRate(),
@@ -135,13 +139,34 @@ export class Engine {
   }
 
   private async onControl(payload: unknown, nowMs: number): Promise<void> {
-    const msg = payload as { type?: string; reason?: string; actor?: string };
+    const msg = payload as { type?: string; reason?: string; actor?: string; acknowledgement?: string; ttlMinutes?: number; replyChannel?: string };
     switch (msg.type) {
       case "kill": {
         await this.db.db.insert(killSwitchEvents).values({
           id: newId(), scope: "engine", reason: msg.reason ?? "operator", actor: msg.actor ?? "operator", createdAtMs: nowMs,
         });
+        this.live.disarm(`kill switch: ${msg.reason ?? "operator"}`);
         await this.halt(`kill switch: ${msg.reason ?? "operator"}`, nowMs);
+        break;
+      }
+      case "arm": {
+        const req: ArmRequest = {
+          acknowledgement: msg.acknowledgement ?? "",
+          ttlMinutes: msg.ttlMinutes ?? this.cfg.live.arming_token_ttl_minutes,
+          minUsdc: minArmUsdc(),
+        };
+        const result = await this.live.arm(req, nowMs);
+        await this.audit("live", result.ok ? "armed" : "arm_rejected", { actor: msg.actor ?? "operator", reasons: result.reasons, wallet: result.walletAddress });
+        this.emitEvent({ type: "arm_result", ...result });
+        if (result.ok) await this.health("warning", "live", `LIVE TRADING ARMED by ${msg.actor ?? "operator"} until ${new Date(result.expiresAtMs ?? nowMs).toISOString()}`);
+        break;
+      }
+      case "disarm": {
+        this.live.disarm(`operator: ${msg.reason ?? "manual disarm"}`);
+        await this.paper.cancelAll("disarm", nowMs).catch(() => 0);
+        if (this.live.configured) await this.live.cancelAll().catch(() => 0);
+        await this.audit("live", "disarmed", { actor: msg.actor ?? "operator", reason: msg.reason });
+        this.emitEvent({ type: "disarmed", reason: msg.reason ?? "manual" });
         break;
       }
       case "resume": {
@@ -165,7 +190,9 @@ export class Engine {
   async halt(reason: string, nowMs: number): Promise<void> {
     if (this.engineState === "HALTED") return;
     this.haltReason = reason;
+    this.live.disarm(`halt: ${reason}`); // any halt condition disarms live immediately
     this.transitionEngine("HALTED", reason);
+    if (this.live.configured) await this.live.cancelAll().catch(() => 0);
     const canceled = await this.paper.cancelAll(`halt: ${reason}`, nowMs);
     await this.health("critical", "halt", reason, { canceledOrders: canceled });
     await this.audit("engine", "halt", { reason });
@@ -333,6 +360,11 @@ export class Engine {
     await this.captureBoundaries(nowMs);
     await this.paper.step(nowMs);
     await this.watchdogs(nowMs);
+    // refresh real USDC balance periodically while armed (drives live drawdown stops)
+    if (this.live.isArmed(nowMs) && nowMs - this.lastLiveRefreshMs > 30_000) {
+      this.lastLiveRefreshMs = nowMs;
+      await this.live.refreshBankroll();
+    }
 
     const active = this.activeMarket(nowMs);
     if (active) {
@@ -517,17 +549,25 @@ export class Engine {
       ? clampCustomProfile(customLimitsFromConfig(this.cfg)).limits
       : RISK_PROFILES[profileName];
 
+    // Live routing: armed + profile permits live. When armed, the typed
+    // acknowledgement has accepted trading an unproven model with real money,
+    // so the two GOVERNANCE gates (model-approved, strategy-validated) are
+    // satisfied — but every ECONOMIC and SAFETY gate (edge, break-even, caps,
+    // staleness, price ceiling, cutoff, drawdown stops) still applies unchanged.
+    const liveArmed = this.live.isArmed(nowMs) && limits.liveAllowed;
+    const decisionMode: Mode = liveArmed ? "live" : this.mode;
+
     const decisionId = newId();
     const correlationId = newId();
-    const bank = this.accounting.state();
+    const bank = liveArmed ? this.live.bankState() : this.accounting.state();
     const feeSchedule = { ratePpm: rt.fee?.ratePpm ?? ppm("0.07"), collection: this.cfg.paper.fee_collection_convention };
     const sideBook = side === "UP" ? this.bookFor(rt.ref.upTokenId) : this.bookFor(rt.ref.downTokenId);
     const bookAge = sideBook.ageMs(nowMs);
     const idemKey = idempotencyKey(decisionId, 1);
 
     const riskCtx: RiskContext = {
-      mode: this.mode,
-      engineArmedForMode: this.engineState === "PAPER" || this.engineState === "SHADOW",
+      mode: decisionMode,
+      engineArmedForMode: liveArmed ? true : (this.engineState === "PAPER" || this.engineState === "SHADOW"),
       limits,
       profileName,
       bankroll: bank,
@@ -553,8 +593,11 @@ export class Engine {
       secondsRemaining: f.secondsRemaining,
       conservativeProbability: conservative6,
       feeSchedule,
-      modelApprovedForMode: this.mode === "paper" || this.mode === "shadow" ? model.approvedForPaper : model.approvedForLive,
-      // live is structurally excluded from this engine build; paper/shadow need no live validation
+      // Paper/shadow require the model be paper-approved. When live-armed the
+      // operator has explicitly accepted an unproven model (typed arm
+      // acknowledgement), so these two governance gates pass; all economic and
+      // safety gates below remain in force.
+      modelApprovedForMode: liveArmed ? true : (this.mode === "paper" || this.mode === "shadow" ? model.approvedForPaper : model.approvedForLive),
       strategyValidatedForMode: true,
       coolingOffUntilMs: null,
       nowMs,
@@ -566,8 +609,10 @@ export class Engine {
     // pre-size to estimate impact for taker styles
     const preVerdict = evaluateOrderRisk(riskCtx);
     let stake6 = preVerdict.sizing?.stake6 ?? 0n;
+    // Paper uses the (possibly simulated) sizing modes; live uses the risk
+    // engine's real-bankroll stake directly (never the paper simulation).
     const sim = this.accounting.simulatedStake(this.cfg, stake6);
-    if (this.mode === "paper") stake6 = sim.stake6;
+    if (this.mode === "paper" && !liveArmed) stake6 = sim.stake6;
     let shares6 = roundSharesToLot(sharesForStake(stake6, price6), sharesOf("0.01"));
     if (style !== "maker_post_only") {
       const impact = sideBook.takerBuyImpact(shares6);
@@ -579,7 +624,7 @@ export class Engine {
     const snapshot = buildDecisionSnapshot({
       decisionId,
       correlationId,
-      mode: this.mode,
+      mode: decisionMode,
       nowMs,
       market: rt.ref,
       rulesHash: rt.rulesHash,
@@ -612,7 +657,7 @@ export class Engine {
     await this.db.db.insert(decisionSnapshots).values({
       decisionId,
       marketId: rt.ref.marketId,
-      mode: this.mode,
+      mode: decisionMode,
       correlationId,
       data: snapshot as unknown as Record<string, unknown>,
       createdAtMs: nowMs,
@@ -658,10 +703,34 @@ export class Engine {
       createdAtMs: nowMs,
     });
 
-    if (this.mode === "shadow") {
+    if (decisionMode === "shadow") {
       await this.audit("order", "shadow_would_submit", { decisionId, side, price: price6, shares: shares6 });
       this.emitEvent({ type: "shadow_would_submit", decisionId, marketId: rt.ref.marketId });
       this.transitionMarket(rt, "OBSERVING");
+      return;
+    }
+
+    // LIVE path: real order via the CLOB adapter.
+    if (liveArmed) {
+      this.transitionMarket(rt, "ORDER_PENDING");
+      const tokenId = side === "UP" ? rt.ref.upTokenId : rt.ref.downTokenId;
+      const res = await this.live.submit({
+        decisionId, intentId, marketId: rt.ref.marketId, tokenId, outcomeSide: side,
+        style, price6, shares6, stake6, tickSize6: rt.tickSize6, negRisk: false,
+        ...(style === "maker_post_only" ? { expireAtMs: (rt.ref.endEpoch - this.cfg.strategy.cancel_seconds_remaining) * 1000 } : {}),
+        idempotencyKey: idemKey, nowMs,
+      });
+      if (res.ok) {
+        this.live.markOpen(rt.ref.marketId);
+        this.transitionMarket(rt, res.status === "MATCHED" ? "FILLED" : "RESTING");
+        await this.audit("order", "live_submitted", { decisionId, orderId: res.orderId, side, price: price6, shares: shares6, stake: stake6, status: res.status });
+        this.emitEvent({ type: "live_order", orderId: res.orderId, marketId: rt.ref.marketId, decisionId, status: res.status });
+      } else {
+        this.transitionMarket(rt, "REJECTED");
+        this.transitionMarket(rt, "OBSERVING");
+        await this.audit("order", "live_rejected", { decisionId, reason: res.reason });
+        this.emitEvent({ type: "live_rejected", decisionId, marketId: rt.ref.marketId, reason: res.reason });
+      }
       return;
     }
 
@@ -754,6 +823,13 @@ export class Engine {
       }).onConflictDoNothing();
       await this.db.db.update(marketsTable).set({ status: "RESOLVED", outcome, updatedAtMs: nowMs }).where(eq(marketsTable.id, rt.ref.marketId));
       const pnl = await this.accounting.onResolution(rt.ref.marketId, outcome, nowMs);
+      // live position bookkeeping: mark closed (win/loss feeds consecutive-loss stop) and re-read real balance
+      if (this.live.hasOpenPosition(rt.ref.marketId)) {
+        const liveOrders = await this.db.db.select().from(orders).where(eq(orders.marketId, rt.ref.marketId));
+        const wonSide = liveOrders.find((o) => o.mode === "live" && o.filledShares6 > 0n)?.outcomeSide;
+        this.live.markClosed(rt.ref.marketId, wonSide === outcome);
+        await this.live.refreshBankroll();
+      }
       await this.audit("resolution", "resolved", { slug: rt.ref.slug, outcome, source, pnl: pnl ?? "no position" });
       this.emitEvent({ type: "resolved", slug: rt.ref.slug, outcome, pnl: pnl?.toString() ?? null });
       await this.crossCheckResolution(rt, nowMs);
@@ -843,6 +919,7 @@ export class Engine {
       profile: this.cfg.risk.profile,
       strategyVersion: this.cfg.strategy.active_version,
       sizingSimulation: this.cfg.paper.sizing_simulation,
+      live: this.live.status(nowMs),
       bankroll: {
         bankroll6: bank.bankroll,
         sessionPeak6: bank.sessionPeak,

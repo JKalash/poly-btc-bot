@@ -345,6 +345,39 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     return { ok: true };
   });
 
+  // ---------- live arming (real money) ----------
+  // The engine enforces every arming rule; the API relays the request and
+  // re-verifies the operator password (re-auth for live controls). The typed
+  // acknowledgement phrase must match exactly (engine-side check).
+
+  app.post("/api/arm", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const body = z.object({
+      acknowledgement: z.string(),
+      password: z.string(),
+      ttlMinutes: z.number().int().min(1).max(120).default(30),
+    }).safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "bad request" });
+    // re-authenticate for this sensitive control
+    const ok = await auth.reverify(body.data.password);
+    if (!ok) return reply.code(401).send({ error: "re-authentication failed" });
+    bus.publish(CHANNELS.control, {
+      type: "arm", actor: "operator",
+      acknowledgement: body.data.acknowledgement,
+      ttlMinutes: body.data.ttlMinutes,
+    });
+    await db.db.insert(auditEvents).values({ category: "live", action: "arm_requested", actor: "operator", correlationId: null, data: { ttlMinutes: body.data.ttlMinutes }, createdAtMs: Date.now() });
+    return { ok: true, note: "Arm request sent. Watch /api/state (live.state) and health events for the result — the engine runs wallet reconciliation before arming." };
+  });
+
+  app.post("/api/disarm", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const body = z.object({ reason: z.string().default("operator manual disarm") }).safeParse(req.body ?? {});
+    bus.publish(CHANNELS.control, { type: "disarm", actor: "operator", reason: body.success ? body.data.reason : "operator" });
+    await db.db.insert(auditEvents).values({ category: "live", action: "disarm_requested", actor: "operator", correlationId: null, data: null, createdAtMs: Date.now() });
+    return { ok: true };
+  });
+
   // ---------- audit / health / misc ----------
 
   app.get("/api/audit", async (req, reply) => {

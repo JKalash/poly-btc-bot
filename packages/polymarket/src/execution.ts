@@ -19,6 +19,10 @@ export interface OrderRequest {
   postOnly: boolean;
   price6: bigint;
   shares6: bigint;
+  /** USDC to spend (BUY market orders); the exchange fills up to this amount. */
+  stake6?: bigint;
+  tickSize6?: bigint;
+  negRisk?: boolean;
   expireAtMs?: number;
 }
 

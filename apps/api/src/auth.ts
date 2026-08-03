@@ -60,6 +60,11 @@ export class AuthService {
     return buf.length === expected.length && timingSafeEqual(buf, expected);
   }
 
+  /** Re-verify the operator password for a sensitive control (live arming). */
+  async reverify(password: string): Promise<boolean> {
+    return AuthService.verifyPassword(password, this.passwordHash);
+  }
+
   async ensurePasswordHash(): Promise<{ devDefault: boolean }> {
     if (this.passwordHash) return { devDefault: false };
     this.passwordHash = await AuthService.hashPassword("operator");

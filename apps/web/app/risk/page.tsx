@@ -3,6 +3,98 @@
 import { useState } from "react";
 import { useCockpitCtx } from "../../components/Shell";
 import { Card, Th, Td } from "../../components/ui";
+import { api } from "../../lib/api";
+
+const ARM_ACK_PHRASE =
+  "I understand this trades real money and can lose up to my configured per-trade risk on every trade";
+
+function LiveArmingCard() {
+  const { state: s } = useCockpitCtx();
+  const live = (s as unknown as { live?: {
+    configured: boolean; state: string; expiresInS: number; walletAddress: string | null;
+    liveBankroll6: string; disarmReason: string | null; lastPreflightReasons: string[];
+  } })?.live;
+  const [ack, setAck] = useState("");
+  const [password, setPassword] = useState("");
+  const [ttl, setTtl] = useState(30);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const armed = live?.state === "ARMED";
+  const canArm = ack.trim() === ARM_ACK_PHRASE && password.length > 0;
+
+  const arm = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      const r = await api<{ note: string }>("/api/arm", { method: "POST", body: JSON.stringify({ acknowledgement: ack, password, ttlMinutes: ttl }) });
+      setMsg(r.note); setPassword("");
+    } catch (e) { setMsg(String((e as Error).message)); }
+    finally { setBusy(false); }
+  };
+  const disarm = async () => {
+    setBusy(true); setMsg(null);
+    try { await api("/api/disarm", { method: "POST", body: JSON.stringify({ reason: "operator" }) }); setMsg("Disarm sent."); }
+    catch (e) { setMsg(String((e as Error).message)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card
+      title="LIVE TRADING — real money"
+      className="col-span-2"
+      right={<span className={`text-[12px] font-bold px-2 py-0.5 rounded border ${armed ? "text-critical border-critical/60 bg-critical/10" : "text-muted border-hairline"}`}>
+        {live?.configured ? (armed ? `ARMED · ${live.expiresInS}s left` : (live?.state ?? "DISARMED")) : "NOT CONFIGURED"}
+      </span>}
+    >
+      {!live?.configured ? (
+        <p className="text-[13px] text-ink2">
+          No hot-wallet key is configured on this deployment, so live trading cannot be armed. To enable it, set
+          <code className="text-ink"> LIVE_TRADING_ENABLED=1</code> and <code className="text-ink">HOT_WALLET_PRIVATE_KEY</code> (a
+          dedicated, low-balance Polygon wallet — never your main one) in the server secrets, then redeploy. See <code>docs/live-trading.md</code>.
+        </p>
+      ) : armed ? (
+        <div>
+          <div className="border border-critical/40 bg-critical/10 rounded p-3 mb-3 text-[13px]">
+            <div className="text-critical font-semibold mb-1">Live trading is ARMED. Real orders will be placed when the strategy finds edge.</div>
+            <div className="text-ink2">Wallet {live.walletAddress} · balance ${(Number(live.liveBankroll6) / 1e6).toFixed(2)} · auto-disarms in {live.expiresInS}s and on any halt/kill/restart.</div>
+          </div>
+          <button onClick={() => void disarm()} disabled={busy} className="bg-critical text-white font-bold rounded px-4 py-2 text-[13px]">DISARM NOW</button>
+          {msg && <span className="text-[12px] text-ink2 ml-3">{msg}</span>}
+        </div>
+      ) : (
+        <div>
+          <p className="text-[13px] text-ink2 mb-1">
+            Arming lets the engine place <span className="text-critical font-semibold">real orders with real USDC</span>. Every safety gate still
+            applies (edge, break-even, caps, staleness, drawdown stops, price ceiling), but you are explicitly accepting an
+            <span className="text-warning"> unproven strategy</span> — the research says expected value is likely negative. Bounded by your profile
+            (max 10%/trade, session/daily stops, 2-loss halt), never all-in.
+          </p>
+          {live.disarmReason && <p className="text-[12px] text-muted mb-2">last disarm: {live.disarmReason}</p>}
+          {(live.lastPreflightReasons?.length ?? 0) > 0 && (
+            <div className="text-[12px] text-warning mb-2">preflight blockers: {live.lastPreflightReasons.join("; ")}</div>
+          )}
+          <label className="block text-[12px] text-muted mb-1">Type the acknowledgement exactly:</label>
+          <div className="text-[11px] text-muted mb-1 font-mono select-all">{ARM_ACK_PHRASE}</div>
+          <input value={ack} onChange={(e) => setAck(e.target.value)}
+            className="w-full bg-page border border-hairline rounded px-3 py-2 text-[12px] text-ink mb-2 focus:outline-none focus:border-critical" />
+          <div className="flex items-center gap-3 mb-2">
+            <input type="password" placeholder="operator password (re-auth)" value={password} onChange={(e) => setPassword(e.target.value)}
+              className="flex-1 bg-page border border-hairline rounded px-3 py-2 text-[12px] text-ink focus:outline-none focus:border-critical" />
+            <label className="text-[12px] text-muted">arm for</label>
+            <select value={ttl} onChange={(e) => setTtl(Number(e.target.value))} className="bg-page border border-hairline rounded px-2 py-1 text-[12px]">
+              {[15, 30, 60, 120].map((t) => <option key={t} value={t}>{t}m</option>)}
+            </select>
+          </div>
+          <button onClick={() => void arm()} disabled={!canArm || busy}
+            className="bg-critical text-white font-bold rounded px-4 py-2 text-[13px] disabled:opacity-40">
+            {busy ? "Arming…" : "ARM LIVE TRADING"}
+          </button>
+          {msg && <span className="text-[12px] text-ink2 ml-3">{msg}</span>}
+        </div>
+      )}
+    </Card>
+  );
+}
 
 /**
  * Risk Center. Profiles are displayed from their canonical in-code definitions;
@@ -32,6 +124,7 @@ export default function RiskPage() {
 
   return (
     <div className="grid grid-cols-2 gap-4">
+      <LiveArmingCard />
       <Card title={`Risk profiles · active: ${s?.profile ?? "…"}`}>
         <table className="w-full">
           <thead><tr><Th>Profile</Th><Th>Base</Th><Th>Per-market cap</Th><Th>Session stop</Th><Th>Daily stop</Th><Th>Consec-loss stop</Th><Th>Live-capable</Th></tr></thead>
