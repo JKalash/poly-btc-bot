@@ -63,7 +63,10 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       }
     },
     onLastTrade: (msg, ts) => {
-      void engine.onTrade(msg.asset_id, msg.price, msg.size ?? "0", tsToMs(msg.timestamp, ts));
+      // caught: an out-of-spec trade payload must drop the message, not kill
+      // the process via an unhandled rejection
+      engine.onTrade(msg.asset_id, msg.price, msg.size ?? "0", tsToMs(msg.timestamp, ts))
+        .catch((e) => logger.warn("trade ingestion failed; message dropped", { error: String(e), tokenId: msg.asset_id }));
     },
     onStatus: (s, d) => logger.info("clob ws status", { status: s, detail: d }),
   });
@@ -98,6 +101,9 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       clob.setAssets(engine.subscriptionTokens(nowSec));
     } catch (e) {
       logger.warn("discovery error", { error: String(e) });
+      // surface in the health log too: a wedged discovery loop idles the
+      // whole engine with nothing visible in the cockpit otherwise
+      void engine.health("warning", "discovery", `market discovery cycle failed: ${String(e)}`);
     } finally {
       discovering = false;
     }
@@ -141,4 +147,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+  // Last-resort isolation: an escaped exception/rejection becomes a
+  // controlled HALT (orders canceled, live disarmed, health event) instead of
+  // silent process death that abandons resting orders on the exchange.
+  const fatal = (kind: string) => (err: unknown) => {
+    logger.error(`${kind}; halting engine (fail closed)`, { error: String(err), stack: (err as Error)?.stack });
+    void runtime.engine.halt(`${kind}: ${String(err)}`, Date.now()).catch(() => undefined);
+  };
+  process.on("uncaughtException", fatal("uncaught exception"));
+  process.on("unhandledRejection", fatal("unhandled rejection"));
 }

@@ -1,14 +1,27 @@
 /**
  * Reconnecting WebSocket base using Node 22's native WebSocket.
  * - Application-level text PING on a fixed interval (Polymarket requires it).
- * - Exponential backoff reconnect with resubscribe hook.
- * - Staleness tracking via lastMessageTsMs.
+ * - Staleness watchdog: a connection with no inbound message (data OR PONG)
+ *   for staleAfterMs is force-closed and reconnected — `onclose` alone never
+ *   fires on half-open TCP paths (NAT/LB silently dropping the route), which
+ *   would otherwise starve every feed until a human restarts the process.
+ * - Exponential backoff reconnect with resubscribe hook. Backoff resets only
+ *   after the connection PROVES healthy (first inbound message), not on the
+ *   handshake — accept-then-drop failures back off properly instead of
+ *   hammering the endpoint at 1 Hz forever.
+ * - Generation-tokened: events from superseded sockets are ignored, so
+ *   restart()/stop()/start() can never yield two live sockets or leaked
+ *   ping timers feeding duplicate data.
+ * - A throwing onMessage handler drops that message (status "error"), never
+ *   the socket or the process.
  */
 export interface WsBaseOptions {
   url: string;
   name: string;
   pingIntervalMs: number;
   pingText?: string;
+  /** Force-reconnect threshold for inbound silence. Default max(15s, 3× ping interval). */
+  staleAfterMs?: number;
   onOpen: (send: (data: string) => void) => void;
   onMessage: (data: string, receivedTsMs: number) => void;
   onStatus?: (status: WsStatus, detail?: string) => void;
@@ -22,6 +35,8 @@ export class ReconnectingWs {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private backoffMs = 1000;
   private stopped = false;
+  /** Monotonic connection token: handlers from superseded sockets no-op. */
+  private generation = 0;
   lastMessageTsMs = 0;
   reconnectCount = 0;
 
@@ -29,11 +44,18 @@ export class ReconnectingWs {
 
   start(): void {
     this.stopped = false;
+    this.clearReconnectTimer();
     this.connect();
+  }
+
+  private staleAfterMs(): number {
+    return this.opts.staleAfterMs ?? Math.max(15_000, this.opts.pingIntervalMs * 3);
   }
 
   private connect(): void {
     if (this.stopped) return;
+    const gen = ++this.generation;
+    this.teardownSocket(); // supersede any existing socket before opening a new one
     this.opts.onStatus?.("connecting");
     let ws: WebSocket;
     try {
@@ -43,39 +65,102 @@ export class ReconnectingWs {
       return;
     }
     this.ws = ws;
+    const openedAtMs = Date.now();
+    let proven = false; // healthy = at least one inbound message on THIS socket
 
     ws.onopen = () => {
-      this.backoffMs = 1000;
+      if (gen !== this.generation) return;
       this.opts.onStatus?.("open");
       this.opts.onOpen((data) => this.send(data));
-      this.pingTimer = setInterval(() => this.send(this.opts.pingText ?? "PING"), this.opts.pingIntervalMs);
+      this.pingTimer = setInterval(() => {
+        if (gen !== this.generation) return;
+        this.send(this.opts.pingText ?? "PING");
+        // Watchdog: silence beyond the threshold means the path is dead even
+        // though readyState says OPEN. Measured per-connection so a fresh
+        // socket gets a full grace period.
+        const lastSeen = Math.max(this.lastMessageTsMs, openedAtMs);
+        const idleMs = Date.now() - lastSeen;
+        if (idleMs > this.staleAfterMs()) {
+          this.forceReconnect(gen, `stale: no inbound message for ${idleMs}ms`);
+        }
+      }, this.opts.pingIntervalMs);
     };
     ws.onmessage = (ev) => {
+      if (gen !== this.generation) return;
       const now = Date.now();
       this.lastMessageTsMs = now;
+      if (!proven) {
+        proven = true;
+        this.backoffMs = 1000; // healthy: proven by inbound data, not by the handshake
+      }
       const data = typeof ev.data === "string" ? ev.data : "";
       if (data === "PONG" || data === "") return;
-      this.opts.onMessage(data, now);
+      try {
+        this.opts.onMessage(data, now);
+      } catch (e) {
+        // one malformed message must never take down the socket or the process
+        this.opts.onStatus?.("error", `onMessage handler threw (message dropped): ${String(e)}`);
+      }
     };
     ws.onerror = () => {
-      this.opts.onStatus?.("error");
+      if (gen === this.generation) this.opts.onStatus?.("error");
     };
     ws.onclose = () => {
+      if (gen !== this.generation) return; // superseded socket: ignore
       this.cleanup();
+      this.ws = null;
       if (!this.stopped) this.scheduleReconnect("closed");
     };
   }
 
+  /** Public forced reconnect (e.g. subscription set changed). Immediate, keeps backoff state. */
+  restart(reason: string): void {
+    if (this.stopped) return;
+    this.opts.onStatus?.("reconnecting", reason);
+    this.reconnectCount++;
+    this.clearReconnectTimer();
+    this.connect();
+  }
+
+  private forceReconnect(gen: number, why: string): void {
+    if (gen !== this.generation || this.stopped) return;
+    this.opts.onStatus?.("error", why);
+    this.cleanup();
+    this.teardownSocket();
+    this.scheduleReconnect(why);
+  }
+
   private scheduleReconnect(detail: string): void {
+    if (this.stopped) return;
+    this.clearReconnectTimer();
     this.opts.onStatus?.("reconnecting", detail);
     this.reconnectCount++;
     const delay = this.backoffMs;
     this.backoffMs = Math.min(30_000, this.backoffMs * 2);
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
   }
 
   private cleanup(): void {
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+  }
+
+  /** Detach and close the current socket without triggering reconnect logic. */
+  private teardownSocket(): void {
+    const old = this.ws;
+    this.ws = null;
+    if (!old) return;
+    old.onopen = null;
+    old.onmessage = null;
+    old.onerror = null;
+    old.onclose = null;
+    try { old.close(); } catch { /* already closed */ }
   }
 
   send(data: string): void {
@@ -86,11 +171,11 @@ export class ReconnectingWs {
 
   stop(): void {
     this.stopped = true;
+    this.generation++; // invalidate every in-flight socket event
     this.cleanup();
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.clearReconnectTimer();
     this.opts.onStatus?.("closed");
-    try { this.ws?.close(); } catch { /* already closed */ }
-    this.ws = null;
+    this.teardownSocket();
   }
 
   ageMs(now = Date.now()): number | null {

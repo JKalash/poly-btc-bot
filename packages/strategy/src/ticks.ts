@@ -11,8 +11,16 @@ export class TickBuffer {
 
   push(t: ReferenceTick): void {
     const last = this.ticks[this.ticks.length - 1];
-    if (last && t.sourceTsMs < last.sourceTsMs) {
-      // out-of-order tick: keep, but maintain sort
+    if (last && t.sourceTsMs <= last.sourceTsMs) {
+      // Overlap region — RTDS replays a backfill array on every (re)subscribe.
+      // Drop exact duplicates, or the zero-gaps collapse medianGapMs to 0 for
+      // 10 minutes after each reconnect, masking real cadence degradation.
+      for (let i = this.ticks.length - 1; i >= 0; i--) {
+        const e = this.ticks[i]!;
+        if (e.sourceTsMs < t.sourceTsMs) break;
+        if (e.sourceTsMs === t.sourceTsMs && e.value === t.value) return;
+      }
+      // genuinely new out-of-order tick: keep, but maintain sort
       this.ticks.push(t);
       this.ticks.sort((a, b) => a.sourceTsMs - b.sourceTsMs);
     } else {
