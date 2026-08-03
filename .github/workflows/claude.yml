@@ -1,0 +1,47 @@
+# Claude Code — mention-triggered only.
+#
+# Tag @claude in a PR/issue comment, PR review, or PR review comment and it
+# responds in-thread (code review, questions, small fixes). It does NOT run
+# on every PR — only when explicitly mentioned.
+#
+# Setup (one-time):
+#   1. Install the Claude GitHub App on this repo: https://github.com/apps/claude
+#   2. Add the ANTHROPIC_API_KEY repo secret (Settings → Secrets → Actions).
+#      (Pro/Max subscribers can instead run `claude setup-token` locally and
+#      add it as CLAUDE_CODE_OAUTH_TOKEN, then swap the input below.)
+#
+# Note: like all issue_comment-triggered workflows, this runs the version of
+# this file on the default branch.
+
+name: Claude
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read # lets Claude read CI results on the PR
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
