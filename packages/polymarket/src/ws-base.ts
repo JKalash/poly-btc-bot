@@ -1,8 +1,13 @@
+import { randomUUID } from "node:crypto";
+
 /**
  * Reconnecting WebSocket base using Node 22's native WebSocket.
  * - Application-level text PING on a fixed interval (Polymarket requires it).
  * - Exponential backoff reconnect with resubscribe hook.
  * - Staleness tracking via lastMessageTsMs.
+ * - Connection epochs (spec §12.3): every successful (re)connect generates a
+ *   fresh `connectionEpoch` BEFORE any message of that connection is
+ *   delivered, so consumers can invalidate stale books first.
  */
 export interface WsBaseOptions {
   url: string;
@@ -12,6 +17,13 @@ export interface WsBaseOptions {
   onOpen: (send: (data: string) => void) => void;
   onMessage: (data: string, receivedTsMs: number) => void;
   onStatus?: (status: WsStatus, detail?: string) => void;
+  /**
+   * Fired once per (re)connect, when the fresh connection epoch is generated —
+   * strictly BEFORE onStatus("open"), onOpen/resubscribe, and any onMessage of
+   * the new connection. `prevEpoch` is null on the first connect. Optional:
+   * existing consumers are unaffected.
+   */
+  onEpochChange?: (epoch: string, prevEpoch: string | null) => void;
 }
 
 export type WsStatus = "connecting" | "open" | "closed" | "reconnecting" | "error";
@@ -22,10 +34,14 @@ export class ReconnectingWs {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private backoffMs = 1000;
   private stopped = false;
+  private epoch: string | null = null;
   lastMessageTsMs = 0;
   reconnectCount = 0;
 
   constructor(private readonly opts: WsBaseOptions) {}
+
+  /** Epoch of the current connection; null until the first successful open. */
+  get connectionEpoch(): string | null { return this.epoch; }
 
   start(): void {
     this.stopped = false;
@@ -46,6 +62,9 @@ export class ReconnectingWs {
 
     ws.onopen = () => {
       this.backoffMs = 1000;
+      const prevEpoch = this.epoch;
+      this.epoch = randomUUID();
+      this.opts.onEpochChange?.(this.epoch, prevEpoch);
       this.opts.onStatus?.("open");
       this.opts.onOpen((data) => this.send(data));
       this.pingTimer = setInterval(() => this.send(this.opts.pingText ?? "PING"), this.opts.pingIntervalMs);
