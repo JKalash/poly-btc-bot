@@ -297,7 +297,59 @@ and HFT-presence claims are consistent with everything above.
 
 ---
 
-## 5. Reference index
+## 5. Deep comparison: `openmarket` vs this repo
+
+Repo facts (checked 2026-08-03): created 2026-07-01, frozen at v0.5.2, Apache-2.0, 13 crates
+(collectors for Binance + Polymarket, recorder, synchronizer, signal/execution engines,
+paper-executor, backtester, trainer, exporters), CI + Docker + `paper/` sources, 2 stars.
+Corpus: 109-day publication window over a 93-day event span (2026-02-12 → 05-15), 727M unified
+rows, 605.6M Polymarket ticks, 62.3M Binance trades, 4,450 markets tracked (2,251 modelable),
+2.94M explicit cross-venue lag pairs. Model v0.2.1: 43 features, 357,390 rows, **559 walk-forward
+windows**, OOS AUC 0.8377 vs naive mid prior 0.8405, negative simulated economics.
+
+**Different species, same conclusion.** openmarket is a *frozen dataset + paper* — the finished
+science of one experiment. This repo is a *living trading-operations system* — the instrument for
+running that class of experiment continuously, safely, with an operator in the loop. They are
+complementary, not competitors.
+
+| Dimension | openmarket | this repo |
+|---|---|---|
+| Goal | Reproducible research record; explicit "not a trading bot" | Operating console: observe/paper/research, execution-shaped |
+| Market | BTC 15-minute binaries | BTC 5-minute binaries |
+| Status | Archived, data ends 2026-05-15 | Live; collecting whenever running |
+| Data | 727M rows, millisecond, frozen | Own capture (young) + seeded stats; can ingest their corpus + kachoio |
+| Resolution source | Binance-paired features; no oracle feed | **Records the Chainlink resolution stream itself** (exact `full_accuracy_value`, boundary capture, tie rule) — enables oracle/boundary studies they cannot do |
+| Models | Calibrated GBM-class, 559-window walk-forward, honest null result | Null model + labeled-uncalibrated heuristics; calibration slot deliberately empty |
+| Execution realism | Backtest fees/slippage; negative economics reported | Live paper executor: latency, post-only-would-cross rejection, queue-behind fills, FAK cap logic |
+| Risk & safety | None needed (never trades) | Full risk engine, absolute 10% cap, kill switch, decision snapshots, audit, arming governance |
+| Money math | Research floats | Exact bigint micro-units, both fee conventions |
+| Ops surface | Notebooks, Parquet, paper | Dashboard, API, config versioning, health/audit |
+| Reproducibility polish | CI, CITATION, Docker, HF releases — better than ours | Dev-grade monorepo with 147 tests |
+
+**Where they are simply ahead of us:** they *finished* the experiment we built scaffolding for. The
+0.8377-vs-0.8405 walk-forward comparison over 559 windows is precisely the "beat the market's own
+price" null test our `calibrated_logistic` gate is waiting on — they ran it, at scale, and published
+the negative. Their lead–lag methodology (per-day transport-delay envelopes bounding clock drift to
+≤6ms; source-clock vs collector-clock separation) is more rigorous than our RTDS-envelope skew
+estimate. And 91.9%-one-tick spreads is a stylized fact we should treat as ambient truth: there is
+rarely room to improve a quote without crossing, so maker P&L is decided by queue position and
+adverse selection — which is exactly what our conservative fill model assumes.
+
+**Where we are ahead of them:** everything operational. They have no risk engine, no execution
+governance, no live safety story, no oracle capture, no product — because they never intended to
+trade. We capture the actual settlement feed (Chainlink), which their Binance-only pairing cannot
+see; boundary/tie/final-print questions are answerable only on our side. And we are still
+collecting, on the 5-minute series their corpus doesn't cover, after every public archive in this
+ecosystem has gone dark.
+
+**Concrete borrowings, ranked:** (1) run their pipeline/data (or replicate their AUC-vs-mid test)
+as the canonical implementation of our walk-forward gate before writing our own trainer; (2) adopt
+their source-clock/collector-clock separation for our latency instrumentation; (3) retrain their
+43-feature recipe on 5-minute data (kachoio corpus + our capture) — that produces the calibration
+artifact our engine's empty slot demands; (4) copy their reproducibility furniture (CITATION,
+release manifests) when we publish anything.
+
+## 6. Reference index
 
 | Resource | Link |
 |---|---|
