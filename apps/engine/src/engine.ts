@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG, type AppConfig } from "@b5p/config";
+import { AppConfigSchema, DEFAULT_CONFIG, type AppConfig } from "@b5p/config";
 import {
   auditEvents, configVersions, decisionSnapshots, engineKv, featureSnapshots, healthEvents,
   killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents, orders,
@@ -268,7 +268,18 @@ export class Engine {
       rows = await this.db.db.select().from(configVersions).where(eq(configVersions.active, true));
     }
     const row = rows.sort((a, b) => b.version - a.version)[0]!;
-    this.cfg = row.config as AppConfig;
+    // Re-parse the stored config through the schema so rows persisted before a
+    // schema extension gain the new blocks' defaults (a raw cast left new keys
+    // undefined — crashed evaluateMarket on extended_move_fade in production).
+    const reparsed = AppConfigSchema.safeParse(row.config);
+    if (reparsed.success) {
+      this.cfg = reparsed.data;
+    } else {
+      this.cfg = row.config as AppConfig;
+      logger.warn("stored config failed schema re-parse; running on raw stored config", {
+        issues: reparsed.error.issues.slice(0, 5).map((i) => `${i.path.join(".")}: ${i.message}`),
+      });
+    }
     this.configVersion = row.version;
     configureCalibratedModel({
       artifactPath: this.cfg.strategy.calibrated_artifact_path ?? null,
@@ -727,9 +738,9 @@ export class Engine {
       // extended_move_fade_v1 inputs: RESOLVED prior-window run only (never
       // inferred from the current window); absent fields fail closed in the preset.
       extendedMoveFade: {
-        minRunBlocks: this.cfg.strategy.extended_move_fade.minimum_run_blocks,
-        minRunMovePct: this.cfg.strategy.extended_move_fade.minimum_run_move_pct,
-        maxEntryPrice: Number(this.cfg.strategy.extended_move_fade.max_entry_price),
+        minRunBlocks: this.cfg.strategy.extended_move_fade?.minimum_run_blocks ?? DEFAULT_CONFIG.strategy.extended_move_fade.minimum_run_blocks,
+        minRunMovePct: this.cfg.strategy.extended_move_fade?.minimum_run_move_pct ?? DEFAULT_CONFIG.strategy.extended_move_fade.minimum_run_move_pct,
+        maxEntryPrice: Number(this.cfg.strategy.extended_move_fade?.max_entry_price ?? DEFAULT_CONFIG.strategy.extended_move_fade.max_entry_price),
         priorRun: this.priorRunFor(rt.ref.startEpoch),
       },
     };
