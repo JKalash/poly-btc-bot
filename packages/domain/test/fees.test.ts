@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   breakEvenMaker, breakEvenTakerShareCollected, breakEvenTakerUsdcCollected,
   fmtProb, fmtUsdc, lossErasesWins, makerEdgeSatisfied, makerEvPerCost,
-  netWinningSharesShareCollected, ppm, prob, shares, takerEdgeSatisfied,
+  netWinningSharesShareCollected, ONE, PPM, ppm, prob, shares, takerEdgeSatisfied,
   takerEvPerCost, takerFeeShares, takerFeeUsdc, toNumber, usdc,
 } from "../src/index";
 
@@ -55,6 +55,17 @@ describe("effective break-even", () => {
     for (const p of ["0.05", "0.25", "0.50", "0.75", "0.95", "0.99"]) {
       expect(breakEvenTakerUsdcCollected(prob(p), RATE) > prob(p)).toBe(true);
       expect(breakEvenTakerShareCollected(prob(p), RATE) > prob(p)).toBe(true);
+    }
+  });
+
+  it("share-collected break-even is the exact rational ceiling — never a micro-unit low", () => {
+    // q* = p / (1 - f*(1-p)); be must be the minimal integer with be*denom >= p*PPM*ONE
+    for (let pMicro = 997; pMicro < 1_000_000; pMicro += 997) {
+      const p = BigInt(pMicro);
+      const denom = PPM * ONE - RATE * (ONE - p);
+      const be = breakEvenTakerShareCollected(p, RATE);
+      expect(be * denom >= p * PPM * ONE).toBe(true);
+      expect((be - 1n) * denom < p * PPM * ONE).toBe(true);
     }
   });
 });

@@ -748,6 +748,7 @@ export class Engine {
       feeRebatePpm: rt.fee?.rebateRatePpm ?? 0n,
       feeCollection: feeSchedule.collection,
       verdict,
+      modelCalibrated: model.calibrated,
       profileName,
       limits: limitsToStrings(limits),
       cfg: this.cfg,

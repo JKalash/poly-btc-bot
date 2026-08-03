@@ -78,8 +78,10 @@ beforeEach(async () => {
   await db.migrate();
   engine = new Engine(db, getLocalBus(), "paper");
   await engine.start(NOW0 - 1000);
-  // the uncalibrated heuristic is the only paper-approved model that can show edge
+  // the uncalibrated heuristic is the only paper-approved model that can show edge;
+  // trading it now requires explicitly waiving the calibration requirement (issue #1)
   engine.cfg.strategy.probability_model = "distance_vol_heuristic";
+  engine.cfg.strategy.calibration_required = false;
   await engine.upsertDiscoveredMarkets([market()], NOW0 - 1000);
 });
 

@@ -2,15 +2,20 @@ import fastifyCookie from "@fastify/cookie";
 import fastifyWebsocket from "@fastify/websocket";
 import { validateConfig, diffConfigs, type AppConfig } from "@b5p/config";
 import {
-  auditEvents, calibrationArtifacts, configVersions, datasetManifests, decisionSnapshots,
-  engineKv, executionTimelineEvents, experimentDefinitions, experimentObservations,
-  experimentRuns, fillCounterfactuals, fillSelectionCostRecords, healthEvents,
-  killSwitchEvents, latencySamples, marketTradeTicks, markets, markoutObservations,
-  orderAttempts, orderFills, orders, paperVariantResults, pnlRecords, positions,
-  queueEstimates, researchMarkets, resolutions, riskDecisions, signalCandidates,
-  sourceEvidence, strategyPromotionDecisions, timingBucketStatistics, type DbHandle,
+  auditEvents, boundaryPriceObservations, calibrationArtifacts, configVersions, ctfOperations,
+  datasetManifests, decisionSnapshots, engineKv, executionTimelineEvents, experimentDefinitions,
+  experimentObservations, experimentRuns, feedBasisEstimates, fillCounterfactuals,
+  fillSelectionCostRecords, healthEvents, hedgeActions, inventorySnapshots, killSwitchEvents,
+  latencySamples, liquidityRewardAccruals, marketTradeTicks, markets, markoutObservations,
+  orderAttempts, orderFills, orders, pairedLegs, pairedQuoteCycles, paperVariantResults,
+  pnlRecords, positions, queueEstimates, rebateAccruals, researchMarkets, resolutions,
+  riskDecisions, signalCandidates, sourceEvidence, strategyPromotionDecisions,
+  timingBucketStatistics, type DbHandle,
 } from "@b5p/db";
-import { closingMinuteBucket } from "@b5p/domain";
+import {
+  ACCRUAL_STATES, BOUNDARY_KINDS, closingMinuteBucket, CTF_OPERATION_KINDS, HEDGE_ACTION_KINDS,
+  isRiskFree, PAIRED_CYCLE_STATES, PAIRED_LEG_STATES, type PairedCycleState, type PairedLegState,
+} from "@b5p/domain";
 import { newId } from "@b5p/domain/ids";
 import { CHANNELS, getLocalBus, makeBus, type Bus } from "@b5p/engine";
 import { backfillResolvedMarkets, runTimingStats } from "@b5p/research";
@@ -915,6 +920,389 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
       });
     } catch {
       return { manifests: [], note: EVIDENCE_NOTE };
+    }
+  });
+
+  // ---------- inventory lab (read-only over the R10 paired-cycle simulator's
+  // tables; the simulator is paper/shadow only and OFF by default, so these
+  // routes usually serve well-formed empty payloads — and degrade to the same
+  // shapes with a note when the tables are absent) ----------
+
+  const INVENTORY_NOTE = "inventory simulation tables unavailable (migration not applied)";
+  /** Mirrors inventory_research.maximum_one_leg_seconds (refinement brief): 2s. */
+  const ONE_LEG_CAP_MS = 2000;
+  const CYCLE_NOTES = [
+    "A split position is not risk-free while a leg is open.",
+    "One-leg exposure is directional risk.",
+  ];
+  const ACCRUAL_NOTES = [
+    "Rewards are revenue only when paid.",
+    "Rebate not included until paid.",
+    "Unpaid accruals NEVER count toward EV — realized income is PAID rows only.",
+  ];
+
+  app.get("/api/inventory/cycles", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(100, clampLimit(q.limit, 25));
+    if (q.state && !(PAIRED_CYCLE_STATES as readonly string[]).includes(q.state)) {
+      return reply.code(400).send({ error: "unknown cycle state", states: PAIRED_CYCLE_STATES });
+    }
+    const stateFilter = q.state as PairedCycleState | undefined;
+    try {
+      const rows = stateFilter
+        ? await db.db.select().from(pairedQuoteCycles)
+            .where(eq(pairedQuoteCycles.state, stateFilter))
+            .orderBy(desc(pairedQuoteCycles.createdAtMs)).limit(limit)
+        : await db.db.select().from(pairedQuoteCycles)
+            .orderBy(desc(pairedQuoteCycles.createdAtMs)).limit(limit);
+      const ids = rows.map((c) => c.id);
+      const legs = ids.length > 0
+        ? await db.db.select().from(pairedLegs).where(inArray(pairedLegs.cycleId, ids)).orderBy(pairedLegs.createdAtMs)
+        : [];
+      const hedges = ids.length > 0
+        ? await db.db.select().from(hedgeActions).where(inArray(hedgeActions.cycleId, ids)).orderBy(hedgeActions.decidedAtMs)
+        : [];
+      const ops = ids.length > 0
+        ? await db.db.select().from(ctfOperations).where(inArray(ctfOperations.cycleId, ids)).orderBy(ctfOperations.createdAtMs)
+        : [];
+      const legsBy = new Map<string, typeof legs>();
+      for (const l of legs) { const list = legsBy.get(l.cycleId) ?? []; list.push(l); legsBy.set(l.cycleId, list); }
+      const hedgesBy = new Map<string, typeof hedges>();
+      for (const h of hedges) { const list = hedgesBy.get(h.cycleId) ?? []; list.push(h); hedgesBy.set(h.cycleId, list); }
+      const opsBy = new Map<string, typeof ops>();
+      for (const o of ops) {
+        if (o.cycleId === null) continue;
+        const list = opsBy.get(o.cycleId) ?? []; list.push(o); opsBy.set(o.cycleId, list);
+      }
+      const cycles = rows.map((c) => {
+        const cycleLegs = legsBy.get(c.id) ?? [];
+        return {
+          ...c,
+          // THE risk-free predicate (domain isRiskFree): RECONCILED + every leg
+          // closed. Anything else may NEVER be labeled risk-free downstream.
+          riskFree: isRiskFree(
+            { state: c.state as PairedCycleState },
+            cycleLegs.map((l) => ({ state: l.state as PairedLegState })),
+          ),
+          legs: cycleLegs,
+          hedgeActions: hedgesBy.get(c.id) ?? [],
+          ctfOperations: opsBy.get(c.id) ?? [],
+        };
+      });
+      return jsonSafe({ cycles, states: PAIRED_CYCLE_STATES, legStates: PAIRED_LEG_STATES, notes: CYCLE_NOTES });
+    } catch {
+      return { cycles: [], states: PAIRED_CYCLE_STATES, legStates: PAIRED_LEG_STATES, notes: CYCLE_NOTES, note: INVENTORY_NOTE };
+    }
+  });
+
+  app.get("/api/inventory/summary", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const emptySummary = () => ({
+      cycles: {
+        total: 0,
+        byState: PAIRED_CYCLE_STATES.map((state) => ({ state, n: 0 })),
+        oneLegFilled: 0,
+        hedgeCompleted: 0,
+      },
+      legs: { byState: PAIRED_LEG_STATES.map((state) => ({ state, n: 0 })) },
+      hedges: { byKind: HEDGE_ACTION_KINDS.map((kind) => ({ kind, n: 0, done: 0, failed: 0 })) },
+      operations: {
+        byKind: CTF_OPERATION_KINDS.map((kind) => ({
+          kind, n: 0, confirmed: 0, partiallyConfirmed: 0, failed: 0, unknown: 0, estGas6: "0", actualGas6: "0",
+        })),
+        unknownOutcomes: 0,
+        estGas6: "0",
+        actualGas6: "0",
+        recent: [] as unknown[],
+      },
+      worstCaseLoss: { open: { n: 0, sum6: "0", max6: "0" }, all: { n: 0, sum6: "0", max6: "0" } },
+      unhedged: { n: 0, maxMs: null as number | null, avgMs: null as number | null, overCapCount: 0, capMs: ONE_LEG_CAP_MS },
+      notes: CYCLE_NOTES,
+    });
+    try {
+      const stateAgg = await db.db.select({ state: pairedQuoteCycles.state, n: sql<number>`count(*)` })
+        .from(pairedQuoteCycles).groupBy(pairedQuoteCycles.state);
+      const cycleTotals = await db.db.select({
+        n: sql<number>`count(*)`,
+        oneLeg: sql<number>`coalesce(sum(case when ${pairedQuoteCycles.oneLegFilledAtMs} is not null then 1 else 0 end), 0)`,
+        hedged: sql<number>`coalesce(sum(case when ${pairedQuoteCycles.hedgeCompletedAtMs} is not null then 1 else 0 end), 0)`,
+        wclSum6: sql<string>`coalesce(sum(${pairedQuoteCycles.worstCaseLoss6}), 0)::text`,
+        wclMax6: sql<string>`coalesce(max(${pairedQuoteCycles.worstCaseLoss6}), 0)::text`,
+      }).from(pairedQuoteCycles);
+      const openTotals = await db.db.select({
+        n: sql<number>`count(*)`,
+        wclSum6: sql<string>`coalesce(sum(${pairedQuoteCycles.worstCaseLoss6}), 0)::text`,
+        wclMax6: sql<string>`coalesce(max(${pairedQuoteCycles.worstCaseLoss6}), 0)::text`,
+      }).from(pairedQuoteCycles).where(sql`${pairedQuoteCycles.state} <> 'RECONCILED'`);
+      const unhedgedAgg = await db.db.select({
+        n: sql<number>`count(*)`,
+        maxMs: sql<number | null>`max(${pairedQuoteCycles.unhedgedDurationMs})`,
+        avgMs: sql<number | null>`avg(${pairedQuoteCycles.unhedgedDurationMs})::float8`,
+        over: sql<number>`coalesce(sum(case when ${pairedQuoteCycles.unhedgedDurationMs} > ${ONE_LEG_CAP_MS} then 1 else 0 end), 0)`,
+      }).from(pairedQuoteCycles).where(sql`${pairedQuoteCycles.unhedgedDurationMs} is not null`);
+      const legAgg = await db.db.select({ state: pairedLegs.state, n: sql<number>`count(*)` })
+        .from(pairedLegs).groupBy(pairedLegs.state);
+      const hedgeAgg = await db.db.select({
+        kind: hedgeActions.kind,
+        n: sql<number>`count(*)`,
+        done: sql<number>`coalesce(sum(case when ${hedgeActions.state} = 'DONE' then 1 else 0 end), 0)`,
+        failed: sql<number>`coalesce(sum(case when ${hedgeActions.state} = 'FAILED' then 1 else 0 end), 0)`,
+      }).from(hedgeActions).groupBy(hedgeActions.kind);
+      const opAgg = await db.db.select({
+        kind: ctfOperations.kind,
+        n: sql<number>`count(*)`,
+        confirmed: sql<number>`coalesce(sum(case when ${ctfOperations.state} = 'CONFIRMED' then 1 else 0 end), 0)`,
+        partiallyConfirmed: sql<number>`coalesce(sum(case when ${ctfOperations.state} = 'PARTIALLY_CONFIRMED' then 1 else 0 end), 0)`,
+        failed: sql<number>`coalesce(sum(case when ${ctfOperations.state} = 'FAILED' then 1 else 0 end), 0)`,
+        unknown: sql<number>`coalesce(sum(case when ${ctfOperations.state} = 'UNKNOWN' then 1 else 0 end), 0)`,
+        estGas6: sql<string>`coalesce(sum(${ctfOperations.estGasUsdc6}), 0)::text`,
+        actualGas6: sql<string>`coalesce(sum(${ctfOperations.actualGasUsdc6}), 0)::text`,
+      }).from(ctfOperations).groupBy(ctfOperations.kind);
+      const recentOps = await db.db.select().from(ctfOperations).orderBy(desc(ctfOperations.createdAtMs)).limit(50);
+
+      const stateBy = new Map(stateAgg.map((r) => [r.state, Number(r.n)]));
+      const legBy = new Map(legAgg.map((r) => [r.state, Number(r.n)]));
+      const hedgeBy = new Map(hedgeAgg.map((r) => [r.kind, r]));
+      const opBy = new Map(opAgg.map((r) => [r.kind, r]));
+      const t = cycleTotals[0];
+      const o = openTotals[0];
+      const u = unhedgedAgg[0];
+      const opsByKind = CTF_OPERATION_KINDS.map((kind) => {
+        const r = opBy.get(kind);
+        return {
+          kind,
+          n: Number(r?.n ?? 0),
+          confirmed: Number(r?.confirmed ?? 0),
+          partiallyConfirmed: Number(r?.partiallyConfirmed ?? 0),
+          failed: Number(r?.failed ?? 0),
+          unknown: Number(r?.unknown ?? 0),
+          estGas6: r?.estGas6 ?? "0",
+          actualGas6: r?.actualGas6 ?? "0",
+        };
+      });
+      return jsonSafe({
+        cycles: {
+          total: Number(t?.n ?? 0),
+          byState: PAIRED_CYCLE_STATES.map((state) => ({ state, n: stateBy.get(state) ?? 0 })),
+          // cycles that EVER had exactly one leg filled (incidence, not current state)
+          oneLegFilled: Number(t?.oneLeg ?? 0),
+          hedgeCompleted: Number(t?.hedged ?? 0),
+        },
+        legs: { byState: PAIRED_LEG_STATES.map((state) => ({ state, n: legBy.get(state) ?? 0 })) },
+        hedges: {
+          byKind: HEDGE_ACTION_KINDS.map((kind) => ({
+            kind,
+            n: Number(hedgeBy.get(kind)?.n ?? 0),
+            done: Number(hedgeBy.get(kind)?.done ?? 0),
+            failed: Number(hedgeBy.get(kind)?.failed ?? 0),
+          })),
+        },
+        operations: {
+          byKind: opsByKind,
+          unknownOutcomes: opsByKind.reduce((a, r) => a + r.unknown, 0),
+          estGas6: opsByKind.reduce((a, r) => a + BigInt(r.estGas6), 0n).toString(),
+          actualGas6: opsByKind.reduce((a, r) => a + BigInt(r.actualGas6), 0n).toString(),
+          recent: recentOps,
+        },
+        worstCaseLoss: {
+          open: { n: Number(o?.n ?? 0), sum6: o?.wclSum6 ?? "0", max6: o?.wclMax6 ?? "0" },
+          all: { n: Number(t?.n ?? 0), sum6: t?.wclSum6 ?? "0", max6: t?.wclMax6 ?? "0" },
+        },
+        unhedged: {
+          n: Number(u?.n ?? 0),
+          maxMs: u?.maxMs === null || u?.maxMs === undefined ? null : Number(u.maxMs),
+          avgMs: u?.avgMs === null || u?.avgMs === undefined ? null : Number(u.avgMs),
+          overCapCount: Number(u?.over ?? 0),
+          capMs: ONE_LEG_CAP_MS,
+        },
+        notes: CYCLE_NOTES,
+      });
+    } catch {
+      return { ...emptySummary(), note: INVENTORY_NOTE };
+    }
+  });
+
+  app.get("/api/inventory/accruals", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    // THE TWO LEDGERS ARE STRICTLY SEPARATE (brief: never merge their
+    // eligibility or accounting). realized totals sum paid_amount6 of PAID rows
+    // ONLY — estimated amount6 never becomes revenue.
+    const zeroLedger = (program: "MAKER_REBATE" | "LIQUIDITY_REWARD") => ({
+      program,
+      byState: ACCRUAL_STATES.map((state) => ({ state, n: 0, amount6: "0" })),
+      realized: { n: 0, paid6: "0" },
+      unrealized: { n: 0, amount6: "0" },
+      inconsistentRows: 0,
+    });
+    interface StateAgg { state: string; n: number; amount6: string; paid6: string }
+    const shapeLedger = (program: "MAKER_REBATE" | "LIQUIDITY_REWARD", rows: StateAgg[], inconsistentRows: number) => {
+      const by = new Map(rows.map((r) => [r.state, r]));
+      const paid = by.get("PAID");
+      let unrealizedN = 0;
+      let unrealized6 = 0n;
+      for (const r of rows) {
+        if (r.state === "PAID") continue;
+        unrealizedN += Number(r.n);
+        unrealized6 += BigInt(r.amount6);
+      }
+      return {
+        program,
+        byState: ACCRUAL_STATES.map((state) => ({
+          state, n: Number(by.get(state)?.n ?? 0), amount6: by.get(state)?.amount6 ?? "0",
+        })),
+        realized: { n: Number(paid?.n ?? 0), paid6: paid?.paid6 ?? "0" },
+        unrealized: { n: unrealizedN, amount6: unrealized6.toString() },
+        inconsistentRows,
+      };
+    };
+    try {
+      const rebateAgg = await db.db.select({
+        state: rebateAccruals.state,
+        n: sql<number>`count(*)`,
+        amount6: sql<string>`coalesce(sum(${rebateAccruals.amount6}), 0)::text`,
+        paid6: sql<string>`coalesce(sum(${rebateAccruals.paidAmount6}), 0)::text`,
+      }).from(rebateAccruals).groupBy(rebateAccruals.state);
+      const rebateBad = await db.db.select({ n: sql<number>`count(*)` }).from(rebateAccruals)
+        .where(sql`(${rebateAccruals.state} = 'PAID') <> ${rebateAccruals.realized}
+          or ((${rebateAccruals.state} = 'PAID') and (${rebateAccruals.paidAmount6} is null or ${rebateAccruals.paidAtMs} is null))
+          or ((${rebateAccruals.state} <> 'PAID') and (${rebateAccruals.paidAmount6} is not null or ${rebateAccruals.paidAtMs} is not null))`);
+      const rewardAgg = await db.db.select({
+        state: liquidityRewardAccruals.state,
+        n: sql<number>`count(*)`,
+        amount6: sql<string>`coalesce(sum(${liquidityRewardAccruals.amount6}), 0)::text`,
+        paid6: sql<string>`coalesce(sum(${liquidityRewardAccruals.paidAmount6}), 0)::text`,
+      }).from(liquidityRewardAccruals).groupBy(liquidityRewardAccruals.state);
+      const rewardBad = await db.db.select({ n: sql<number>`count(*)` }).from(liquidityRewardAccruals)
+        .where(sql`(${liquidityRewardAccruals.state} = 'PAID') <> ${liquidityRewardAccruals.realized}
+          or ((${liquidityRewardAccruals.state} = 'PAID') and (${liquidityRewardAccruals.paidAmount6} is null or ${liquidityRewardAccruals.paidAtMs} is null))
+          or ((${liquidityRewardAccruals.state} <> 'PAID') and (${liquidityRewardAccruals.paidAmount6} is not null or ${liquidityRewardAccruals.paidAtMs} is not null))`);
+      return jsonSafe({
+        makerRebate: shapeLedger("MAKER_REBATE", rebateAgg, Number(rebateBad[0]?.n ?? 0)),
+        liquidityReward: shapeLedger("LIQUIDITY_REWARD", rewardAgg, Number(rewardBad[0]?.n ?? 0)),
+        states: ACCRUAL_STATES,
+        notes: ACCRUAL_NOTES,
+      });
+    } catch {
+      return {
+        makerRebate: zeroLedger("MAKER_REBATE"),
+        liquidityReward: zeroLedger("LIQUIDITY_REWARD"),
+        states: ACCRUAL_STATES,
+        notes: ACCRUAL_NOTES,
+        note: INVENTORY_NOTE,
+      };
+    }
+  });
+
+  app.get("/api/inventory/snapshots", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const limit = Math.min(100, clampLimit((req.query as Record<string, string>).limit, 25));
+    try {
+      const rows = await db.db.select().from(inventorySnapshots).orderBy(desc(inventorySnapshots.tsMs)).limit(limit);
+      const totals = await db.db.select({
+        n: sql<number>`count(*)`,
+        mismatches: sql<number>`coalesce(sum(case when ${inventorySnapshots.reconciled} then 0 else 1 end), 0)`,
+      }).from(inventorySnapshots);
+      return jsonSafe({
+        snapshots: rows,
+        totals: { n: Number(totals[0]?.n ?? 0), mismatches: Number(totals[0]?.mismatches ?? 0) },
+      });
+    } catch {
+      return { snapshots: [], totals: { n: 0, mismatches: 0 }, note: INVENTORY_NOTE };
+    }
+  });
+
+  app.get("/api/inventory/basis", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    const BASIS_NOTES = ["Binance is not the resolution source."];
+    const zeroBoundary = () => ({
+      byKind: BOUNDARY_KINDS.map((kind) => ({ kind, n: 0, matched: 0, mismatched: 0, unchecked: 0, late: 0 })),
+      totals: { n: 0, matched: 0, mismatched: 0, unchecked: 0, lateCaptures: 0 },
+      recent: [] as unknown[],
+    });
+    try {
+      const est = await db.db.select().from(feedBasisEstimates).orderBy(desc(feedBasisEstimates.tsMs)).limit(500);
+      interface PairAcc {
+        symbol: string; baseSource: string; refSource: string;
+        n: number; samples: number;
+        latest: (typeof est)[number];
+        meanPpmSum: number; meanPpmMin: number; meanPpmMax: number; stdPpmSum: number;
+      }
+      const byPair = new Map<string, PairAcc>();
+      for (const e of est) {
+        const key = `${e.symbol}|${e.baseSource}|${e.refSource}`;
+        const p = byPair.get(key);
+        if (!p) {
+          // rows are recent-first: the first row per pair is the latest estimate
+          byPair.set(key, {
+            symbol: e.symbol, baseSource: e.baseSource, refSource: e.refSource,
+            n: 1, samples: e.sampleCount, latest: e,
+            meanPpmSum: e.meanPpm, meanPpmMin: e.meanPpm, meanPpmMax: e.meanPpm, stdPpmSum: e.stdPpm,
+          });
+        } else {
+          p.n += 1;
+          p.samples += e.sampleCount;
+          p.meanPpmSum += e.meanPpm;
+          p.meanPpmMin = Math.min(p.meanPpmMin, e.meanPpm);
+          p.meanPpmMax = Math.max(p.meanPpmMax, e.meanPpm);
+          p.stdPpmSum += e.stdPpm;
+        }
+      }
+      const pairs = [...byPair.values()].map((p) => ({
+        symbol: p.symbol,
+        baseSource: p.baseSource,
+        refSource: p.refSource,
+        estimates: p.n,
+        samples: p.samples,
+        meanPpmAvg: p.meanPpmSum / p.n,
+        meanPpmMin: p.meanPpmMin,
+        meanPpmMax: p.meanPpmMax,
+        stdPpmAvg: p.stdPpmSum / p.n,
+        latest: {
+          meanPpm: p.latest.meanPpm, medianPpm: p.latest.medianPpm, stdPpm: p.latest.stdPpm,
+          madPpm: p.latest.madPpm, clockOffsetMs: p.latest.clockOffsetMs, leadLagMs: p.latest.leadLagMs,
+          regime: p.latest.regime, method: p.latest.method, sampleCount: p.latest.sampleCount,
+          windowStartMs: p.latest.windowStartMs, windowEndMs: p.latest.windowEndMs, tsMs: p.latest.tsMs,
+        },
+      }));
+
+      const bAgg = await db.db.select({
+        kind: boundaryPriceObservations.boundaryKind,
+        n: sql<number>`count(*)`,
+        matched: sql<number>`coalesce(sum(case when ${boundaryPriceObservations.matchesOfficial} is true then 1 else 0 end), 0)`,
+        mismatched: sql<number>`coalesce(sum(case when ${boundaryPriceObservations.matchesOfficial} is false then 1 else 0 end), 0)`,
+        unchecked: sql<number>`coalesce(sum(case when ${boundaryPriceObservations.matchesOfficial} is null then 1 else 0 end), 0)`,
+        late: sql<number>`coalesce(sum(case when ${boundaryPriceObservations.firstAtOrAfterBoundary} then 0 else 1 end), 0)`,
+      }).from(boundaryPriceObservations).groupBy(boundaryPriceObservations.boundaryKind);
+      const recent = await db.db.select().from(boundaryPriceObservations)
+        .orderBy(desc(boundaryPriceObservations.boundaryEpoch), desc(boundaryPriceObservations.receivedTsMs))
+        .limit(20);
+      const bBy = new Map(bAgg.map((r) => [r.kind, r]));
+      const byKind = BOUNDARY_KINDS.map((kind) => ({
+        kind,
+        n: Number(bBy.get(kind)?.n ?? 0),
+        matched: Number(bBy.get(kind)?.matched ?? 0),
+        mismatched: Number(bBy.get(kind)?.mismatched ?? 0),
+        unchecked: Number(bBy.get(kind)?.unchecked ?? 0),
+        late: Number(bBy.get(kind)?.late ?? 0),
+      }));
+      return jsonSafe({
+        basis: { pairs },
+        boundary: {
+          byKind,
+          totals: {
+            n: byKind.reduce((a, r) => a + r.n, 0),
+            matched: byKind.reduce((a, r) => a + r.matched, 0),
+            mismatched: byKind.reduce((a, r) => a + r.mismatched, 0),
+            unchecked: byKind.reduce((a, r) => a + r.unchecked, 0),
+            lateCaptures: byKind.reduce((a, r) => a + r.late, 0),
+          },
+          recent,
+        },
+        notes: BASIS_NOTES,
+      });
+    } catch {
+      return { basis: { pairs: [] }, boundary: zeroBoundary(), notes: BASIS_NOTES, note: INVENTORY_NOTE };
     }
   });
 

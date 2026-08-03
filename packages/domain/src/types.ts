@@ -150,6 +150,8 @@ export interface DecisionSnapshotData {
     uncertainty: number;
     dataQualityPenalty: number;
     attributions: Record<string, number>;
+    calibrated: boolean;
+    calibrationRequired: boolean;
   } | null;
   marketProbability: string | null;
   effectiveBreakEven: string | null;

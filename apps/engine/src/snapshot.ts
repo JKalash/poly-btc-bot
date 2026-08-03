@@ -34,6 +34,7 @@ export function buildDecisionSnapshot(args: {
   feeRebatePpm: Ppm;
   feeCollection: "usdc" | "shares";
   verdict: RiskVerdict;
+  modelCalibrated: boolean;
   profileName: string;
   limits: Record<string, string>;
   cfg: AppConfig;
@@ -126,6 +127,8 @@ export function buildDecisionSnapshot(args: {
           uncertainty: args.estimate.uncertainty,
           dataQualityPenalty: args.estimate.dataQualityPenalty,
           attributions: args.estimate.featureAttributions,
+          calibrated: args.modelCalibrated,
+          calibrationRequired: args.cfg.strategy.calibration_required,
         }
       : null,
     marketProbability: f.upMid === null ? null : f.upMid.toFixed(4),
