@@ -15,6 +15,7 @@ const NAV: Array<[string, string]> = [
   ["/decisions", "Decisions"],
   ["/orders", "Orders & Positions"],
   ["/pnl", "P&L Analytics"],
+  ["/evidence", "Evidence Lab"],
   ["/execution", "Execution Lab"],
   ["/strategy", "Strategy Comparison"],
   ["/timing-lab", "Timing Lab"],

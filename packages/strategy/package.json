@@ -18,6 +18,7 @@
     "@b5p/experiments": "workspace:*"
   },
   "devDependencies": {
+    "@b5p/config": "workspace:*",
     "typescript": "5.7.3",
     "vitest": "2.1.8"
   }

@@ -24,6 +24,12 @@ export interface StrategyDecision {
   checks: GateCheck[];
   desiredMakerPrice6: Prob6 | null;
   conservativeProbability6: Prob6 | null;
+  /**
+   * Optional: the probability estimate behind the decision. Research presets
+   * attach it so approvedForLive:false is auditable on the decision itself,
+   * not only inside the model registry.
+   */
+  estimate?: ProbabilityEstimate | null;
 }
 
 export interface GateConfig {

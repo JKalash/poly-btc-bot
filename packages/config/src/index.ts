@@ -50,7 +50,7 @@ export const AppConfigSchema = z.object({
   }).default({}),
 
   strategy: z.object({
-    active_version: z.enum(["book_distance_v1", "late_snipe_composite_v1"]).default("book_distance_v1"),
+    active_version: z.enum(["book_distance_v1", "late_snipe_composite_v1", "extended_move_fade_v1"]).default("book_distance_v1"),
     candidate_seconds_remaining_min: z.number().int().default(60),
     candidate_seconds_remaining_max: z.number().int().default(120),
     live_entry_cutoff_seconds: z.number().int().default(60),
@@ -80,6 +80,14 @@ export const AppConfigSchema = z.object({
     exit_policy: z.enum([
       "hold_to_resolution", "threshold_cross_invalidation", "probability_vs_bid_exit", "time_based_exit",
     ]).default("hold_to_resolution"),
+    /** Research hypothesis (brief R8): fade extended runs. Source-reproduction — never live. */
+    extended_move_fade: z.object({
+      live_allowed: z.literal(false).default(false),
+      minimum_run_blocks: z.number().int().min(4).default(4),
+      minimum_candidate_count: z.number().int().min(1).default(1000),
+      minimum_run_move_pct: z.number().positive().default(0.8),
+      max_entry_price: fraction.default("0.50"),
+    }).default({}),
   }).default({}),
 
   risk: z.object({
@@ -179,6 +187,28 @@ export const AppConfigSchema = z.object({
       stress_adverse_markout_penalty_bps: z.number().int().min(0).default(100),
     }).default({}),
   }).default({}),
+
+  /** Phase 3 inventory/CTF market-making risk limits (@b5p/risk inventory-risk.ts). All hard rejects. */
+  inventory_risk: z.object({
+    /** Paired/CTF market-making is research-only in this release. Literal so config cannot flip it. */
+    live_paired_allowed: z.literal(false).default(false),
+    max_unhedged_risk_fraction: fraction.default("0.01"),
+    max_one_leg_duration_ms: z.number().int().min(0).default(2000),
+    max_attempts_per_intent: z.number().int().min(1).default(1),
+    max_cancel_uncertainty_ms: z.number().int().min(0).default(2000),
+    /** USDC value of pending (unreconciled) CTF split/merge/redeem operations. */
+    max_pending_ctf_value_usdc: fraction.default("50"),
+    /** Shares per outcome side (1 share <= 1 USDC worst case). */
+    max_outcome_inventory_shares: fraction.default("200"),
+    /** UP + DOWN combined. */
+    max_gross_paired_inventory_shares: fraction.default("400"),
+    max_daily_operational_loss_usdc: fraction.default("20"),
+    /** Fraction of bankroll allocatable to SOURCE_REPRODUCTION strategies. */
+    max_source_claim_allocation_fraction: fraction.default("0.05"),
+    /** Brief invariants: unpaid rebates/rewards never enter pre-trade EV. */
+    rebates_in_pretrade_ev: z.literal(false).default(false),
+    rewards_in_pretrade_ev: z.literal(false).default(false),
+  }).default({}),
 });
 
 export type AppConfig = z.infer<typeof AppConfigSchema>;
@@ -253,6 +283,18 @@ export function validateConfig(raw: unknown): { ok: true; config: AppConfig } | 
     issues.push({
       path: "strategy.active_version",
       message: `'${cfg.strategy.active_version}' is a source-reproduction research strategy; it cannot be requested for live mode`,
+    });
+  }
+  if (Number(cfg.inventory_risk.max_unhedged_risk_fraction) > Number(ABSOLUTE_MAX_RISK_FRACTION)) {
+    issues.push({
+      path: "inventory_risk.max_unhedged_risk_fraction",
+      message: `exceeds the absolute safety cap ${ABSOLUTE_MAX_RISK_FRACTION}`,
+    });
+  }
+  if (Number(cfg.inventory_risk.max_source_claim_allocation_fraction) > Number(ABSOLUTE_MAX_RISK_FRACTION)) {
+    issues.push({
+      path: "inventory_risk.max_source_claim_allocation_fraction",
+      message: `unverified source claims can never command more than the absolute cap ${ABSOLUTE_MAX_RISK_FRACTION}`,
     });
   }
   if (cfg.research.promotion.min_net_ev_lower_ci < 0) {

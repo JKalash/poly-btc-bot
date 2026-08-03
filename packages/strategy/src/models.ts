@@ -28,7 +28,7 @@ export interface ProbabilityModel {
   estimate(f: FeatureSet): ProbabilityEstimate | null;
 }
 
-function calibrationBucket(f: FeatureSet): string {
+export function calibrationBucket(f: FeatureSet): string {
   const secBucket = f.secondsRemaining >= 120 ? "120+" : f.secondsRemaining >= 60 ? "60-120" : f.secondsRemaining >= 30 ? "30-60" : "<30";
   const px = f.upMid === null ? "na" : f.upMid < 0.3 ? "lo" : f.upMid < 0.7 ? "mid" : f.upMid < 0.9 ? "hi" : "extreme";
   return `t${secBucket}|p${px}`;

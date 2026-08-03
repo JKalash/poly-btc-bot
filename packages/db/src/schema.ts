@@ -691,3 +691,296 @@ export const fillSelectionCostRecords = pgTable("fill_selection_cost_records", {
   index("fill_selection_cost_ts_idx").on(t.tsMs),
   index("fill_selection_cost_market_idx").on(t.marketId, t.tsMs),
 ]);
+
+// ---------- CTF / inventory market-making spine (Phase 3, R10 + R12) ----------
+// Domain contracts live in @b5p/domain/src/inventory.ts. Paper/shadow only by
+// policy; mode columns are PAPER | SHADOW | LIVE (ExecutionMode).
+// Accrual tables flatten the domain AccrualStatus union: the invariant
+// realized === (state = 'PAID') is enforced in domain code + tests
+// (drizzle-kit 0.30 has no CHECK support); writers must keep it.
+
+export const pairedQuoteCycles = pgTable("paired_quote_cycles", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  marketId: text("market_id").notNull(),
+  mode: text("mode").notNull(), // PAPER | SHADOW | LIVE (risk-gated to paper/shadow)
+  kind: text("kind").notNull(), // SPLIT_SELL | BUY_BOTH_MERGE
+  state: text("state").notNull(), // PairedCycleState
+  targetPairPrice6: bigint("target_pair_price6", { mode: "bigint" }).notNull(), // up+down quote sum
+  collateralCommitted6: bigint("collateral_committed6", { mode: "bigint" }).notNull(),
+  worstCaseLoss6: bigint("worst_case_loss6", { mode: "bigint" }).notNull(), // planned failure-path loss
+  // ctf_operations ids; plain refs (set by UPDATE after the op row is inserted), deliberately no FK
+  splitOperationId: text("split_operation_id"),
+  mergeOperationId: text("merge_operation_id"),
+  oneLegFilledAtMs: bigint("one_leg_filled_at_ms", { mode: "number" }),
+  hedgeCompletedAtMs: bigint("hedge_completed_at_ms", { mode: "number" }),
+  unhedgedDurationMs: bigint("unhedged_duration_ms", { mode: "number" }),
+  spreadCaptured6: bigint("spread_captured6", { mode: "bigint" }),
+  fees6: bigint("fees6", { mode: "bigint" }),
+  realizedPnl6: bigint("realized_pnl6", { mode: "bigint" }), // trades only; NEVER unpaid accruals
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  reconciledAtMs: bigint("reconciled_at_ms", { mode: "number" }),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("paired_cycles_market_idx").on(t.marketId, t.createdAtMs),
+  index("paired_cycles_state_idx").on(t.state),
+  index("paired_cycles_correlation_idx").on(t.correlationId),
+]);
+
+export const pairedLegs = pgTable("paired_legs", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  cycleId: text("cycle_id").notNull().references(() => pairedQuoteCycles.id), // legs never precede their cycle
+  marketId: text("market_id").notNull(),
+  tokenId: text("token_id").notNull(),
+  outcomeSide: text("outcome_side").notNull(), // UP | DOWN
+  orderSide: text("order_side").notNull(),     // SELL (split-sell) | BUY (buy-both-merge)
+  state: text("state").notNull(),              // PairedLegState (incl. PARTIAL_LEG, UNHEDGED)
+  price6: bigint("price6", { mode: "bigint" }).notNull(),
+  size6: bigint("size6", { mode: "bigint" }).notNull(),
+  filledShares6: bigint("filled_shares6", { mode: "bigint" }).notNull(), // writers supply 0 explicitly
+  avgFillPrice6: bigint("avg_fill_price6", { mode: "bigint" }),
+  feeUsdc6: bigint("fee_usdc6", { mode: "bigint" }),
+  // order_attempts id; deliberately no FK — shadow legs have no attempt rows
+  attemptId: text("attempt_id"),
+  quotedAtMs: bigint("quoted_at_ms", { mode: "number" }),
+  firstFillAtMs: bigint("first_fill_at_ms", { mode: "number" }),
+  unhedgedStartedAtMs: bigint("unhedged_started_at_ms", { mode: "number" }),
+  hedgedAtMs: bigint("hedged_at_ms", { mode: "number" }),
+  closedAtMs: bigint("closed_at_ms", { mode: "number" }),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("paired_legs_cycle_idx").on(t.cycleId),
+  index("paired_legs_state_idx").on(t.state),
+  index("paired_legs_market_idx").on(t.marketId, t.createdAtMs),
+]);
+
+export const ctfOperations = pgTable("ctf_operations", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  cycleId: text("cycle_id").references(() => pairedQuoteCycles.id), // null = standalone inventory op
+  marketId: text("market_id").notNull(),
+  conditionId: text("condition_id").notNull(),
+  kind: text("kind").notNull(),   // SPLIT | MERGE | REDEEM
+  state: text("state").notNull(), // CtfOperationState
+  mode: text("mode").notNull(),
+  requestedAmount6: bigint("requested_amount6", { mode: "bigint" }).notNull(), // micro paired-units
+  confirmedAmount6: bigint("confirmed_amount6", { mode: "bigint" }),           // partial modeling
+  collateralDelta6: bigint("collateral_delta6", { mode: "bigint" }),           // signed: SPLIT -, MERGE/REDEEM +
+  estGasUsdc6: bigint("est_gas_usdc6", { mode: "bigint" }),
+  actualGasUsdc6: bigint("actual_gas_usdc6", { mode: "bigint" }),
+  relayed: boolean("relayed").notNull(),
+  txHash: text("tx_hash"),
+  failureReason: text("failure_reason"),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  submittedAtMs: bigint("submitted_at_ms", { mode: "number" }),
+  confirmedAtMs: bigint("confirmed_at_ms", { mode: "number" }),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("ctf_ops_cycle_idx").on(t.cycleId),
+  index("ctf_ops_market_idx").on(t.marketId, t.createdAtMs),
+  index("ctf_ops_state_idx").on(t.state),
+]);
+
+export const hedgeActions = pgTable("hedge_actions", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  cycleId: text("cycle_id").notNull().references(() => pairedQuoteCycles.id),
+  legId: text("leg_id").references(() => pairedLegs.id), // null = cycle-level action
+  marketId: text("market_id").notNull(),
+  tokenId: text("token_id"),
+  kind: text("kind").notNull(),   // COMPLETE_PAIR_TAKER | DUMP_SURVIVOR_TAKER | CANCEL_REMAINING_QUOTE | HOLD_TO_RESOLUTION
+  state: text("state").notNull(), // PLANNED | EXECUTING | DONE | FAILED
+  mode: text("mode").notNull(),
+  targetShares6: bigint("target_shares6", { mode: "bigint" }).notNull(),
+  executedShares6: bigint("executed_shares6", { mode: "bigint" }),
+  expectedCost6: bigint("expected_cost6", { mode: "bigint" }),
+  actualCost6: bigint("actual_cost6", { mode: "bigint" }),
+  feeUsdc6: bigint("fee_usdc6", { mode: "bigint" }),
+  attemptId: text("attempt_id"), // order_attempts id; no FK (may be absent in shadow)
+  unhedgedDurationMs: bigint("unhedged_duration_ms", { mode: "number" }),
+  decidedAtMs: bigint("decided_at_ms", { mode: "number" }).notNull(),
+  executedAtMs: bigint("executed_at_ms", { mode: "number" }),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("hedge_actions_cycle_idx").on(t.cycleId),
+  index("hedge_actions_leg_idx").on(t.legId),
+  index("hedge_actions_decided_idx").on(t.decidedAtMs),
+]);
+
+export const inventoryLots = pgTable("inventory_lots", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  cycleId: text("cycle_id").references(() => pairedQuoteCycles.id),
+  marketId: text("market_id").notNull(),
+  tokenId: text("token_id").notNull(),
+  outcomeSide: text("outcome_side").notNull(), // UP | DOWN
+  source: text("source").notNull(),            // SPLIT | FILL | HEDGE | TRANSFER_IN
+  sourceRef: text("source_ref"),               // ctf_operations id / order_fills id / tx hash
+  mode: text("mode").notNull(),
+  acquiredShares6: bigint("acquired_shares6", { mode: "bigint" }).notNull(),
+  remainingShares6: bigint("remaining_shares6", { mode: "bigint" }).notNull(), // 0 = consumed
+  costBasis6: bigint("cost_basis6", { mode: "bigint" }).notNull(),             // micro-USDC, whole lot
+  acquiredAtMs: bigint("acquired_at_ms", { mode: "number" }).notNull(),
+  consumedAtMs: bigint("consumed_at_ms", { mode: "number" }),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("inventory_lots_token_idx").on(t.tokenId, t.acquiredAtMs),
+  index("inventory_lots_market_idx").on(t.marketId),
+  index("inventory_lots_cycle_idx").on(t.cycleId),
+]);
+
+export const inventorySnapshots = pgTable("inventory_snapshots", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  marketId: text("market_id").notNull(),
+  mode: text("mode").notNull(),
+  upShares6: bigint("up_shares6", { mode: "bigint" }).notNull(),
+  downShares6: bigint("down_shares6", { mode: "bigint" }).notNull(),
+  pairedShares6: bigint("paired_shares6", { mode: "bigint" }).notNull(),
+  unpairedUpShares6: bigint("unpaired_up_shares6", { mode: "bigint" }).notNull(),
+  unpairedDownShares6: bigint("unpaired_down_shares6", { mode: "bigint" }).notNull(),
+  reservedUpShares6: bigint("reserved_up_shares6", { mode: "bigint" }).notNull(),   // locked in open quotes
+  reservedDownShares6: bigint("reserved_down_shares6", { mode: "bigint" }).notNull(),
+  collateralFree6: bigint("collateral_free6", { mode: "bigint" }),
+  exchangeUpShares6: bigint("exchange_up_shares6", { mode: "bigint" }),
+  exchangeDownShares6: bigint("exchange_down_shares6", { mode: "bigint" }),
+  onchainUpShares6: bigint("onchain_up_shares6", { mode: "bigint" }),
+  onchainDownShares6: bigint("onchain_down_shares6", { mode: "bigint" }),
+  reconciled: boolean("reconciled").notNull(),
+  divergence: jsonb("divergence"),
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("inventory_snapshots_market_ts_idx").on(t.marketId, t.tsMs),
+  index("inventory_snapshots_mode_ts_idx").on(t.mode, t.tsMs),
+]);
+
+export const rebateAccruals = pgTable("rebate_accruals", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  programVersion: text("program_version").notNull(), // versioned MAKER_REBATE program rules
+  marketId: text("market_id").notNull(),
+  cycleId: text("cycle_id").references(() => pairedQuoteCycles.id),
+  fillId: text("fill_id"), // order_fills id; unique when set (no double rebate per fill)
+  basisShares6: bigint("basis_shares6", { mode: "bigint" }),
+  basisNotional6: bigint("basis_notional6", { mode: "bigint" }),
+  amount6: bigint("amount6", { mode: "bigint" }).notNull(), // best estimate; NOT realized until PAID
+  state: text("state").notNull(),        // EXPECTED | ACCRUED | PENDING | PAID | DISPUTED
+  realized: boolean("realized").notNull(), // invariant: true iff state = PAID
+  paidAmount6: bigint("paid_amount6", { mode: "bigint" }), // null until PAID
+  paidAtMs: bigint("paid_at_ms", { mode: "number" }),      // null until PAID
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  uniqueIndex("rebate_accruals_fill_idx").on(t.fillId), // NULLs distinct; non-null fill ids unique
+  index("rebate_accruals_state_idx").on(t.state),
+  index("rebate_accruals_market_idx").on(t.marketId, t.createdAtMs),
+  index("rebate_accruals_cycle_idx").on(t.cycleId),
+]);
+
+export const liquidityRewardAccruals = pgTable("liquidity_reward_accruals", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  programVersion: text("program_version").notNull(), // versioned LIQUIDITY_REWARD program rules
+  marketId: text("market_id"), // null = epoch-level reward not attributable to one market
+  epochKey: text("epoch_key").notNull(),
+  qualifyingUptimeMs: bigint("qualifying_uptime_ms", { mode: "number" }),
+  scoreDetail: jsonb("score_detail"),
+  amount6: bigint("amount6", { mode: "bigint" }).notNull(), // best estimate; NOT realized until PAID
+  state: text("state").notNull(),
+  realized: boolean("realized").notNull(), // invariant: true iff state = PAID
+  paidAmount6: bigint("paid_amount6", { mode: "bigint" }),
+  paidAtMs: bigint("paid_at_ms", { mode: "number" }),
+  createdAtMs: bigint("created_at_ms", { mode: "number" }).notNull(),
+  updatedAtMs: bigint("updated_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  uniqueIndex("liquidity_reward_epoch_idx").on(t.programVersion, t.epochKey, t.marketId), // no double accrual per epoch scope
+  index("liquidity_reward_state_idx").on(t.state),
+]);
+
+export const walletResearchSnapshots = pgTable("wallet_research_snapshots", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  walletAddress: text("wallet_address").notNull(),
+  funderWallet: text("funder_wallet"), // linked proxy/funder wallet
+  observationStartMs: bigint("observation_start_ms", { mode: "number" }).notNull(),
+  observationEndMs: bigint("observation_end_ms", { mode: "number" }).notNull(),
+  completeInterval: boolean("complete_interval").notNull(),
+  tradesCount: integer("trades_count").notNull(),
+  splitsCount: integer("splits_count").notNull(),
+  mergesCount: integer("merges_count").notNull(),
+  redeemsCount: integer("redeems_count").notNull(),
+  transfersCount: integer("transfers_count").notNull(),
+  deposits6: bigint("deposits6", { mode: "bigint" }).notNull(),
+  withdrawals6: bigint("withdrawals6", { mode: "bigint" }).notNull(),
+  transfersIn6: bigint("transfers_in6", { mode: "bigint" }).notNull(),
+  transfersOut6: bigint("transfers_out6", { mode: "bigint" }).notNull(),
+  tradingPnl6: bigint("trading_pnl6", { mode: "bigint" }),      // separated from flows; null until separable
+  rebatesPaid6: bigint("rebates_paid6", { mode: "bigint" }),    // PAID incentives only
+  rewardsPaid6: bigint("rewards_paid6", { mode: "bigint" }),    // PAID incentives only
+  openPositionsValue6: bigint("open_positions_value6", { mode: "bigint" }),
+  inventoryCostBasis6: bigint("inventory_cost_basis6", { mode: "bigint" }),
+  timeWeightedCapital6: bigint("time_weighted_capital6", { mode: "bigint" }),
+  attribution: jsonb("attribution"), // directional / spread / CTF / incentives / scale breakdown
+  dataGaps: jsonb("data_gaps"),      // uncertainty from unavailable off-chain data
+  evidenceLabel: text("evidence_label").notNull(), // EvidenceLabel
+  source: text("source").notNull(),
+  capturedAtMs: bigint("captured_at_ms", { mode: "number" }).notNull(),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("wallet_research_wallet_idx").on(t.walletAddress, t.capturedAtMs),
+]);
+
+export const feedBasisEstimates = pgTable("feed_basis_estimates", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  symbol: text("symbol").notNull(),          // e.g. BTCUSD
+  baseSource: text("base_source").notNull(), // e.g. binance
+  refSource: text("ref_source").notNull(),   // e.g. chainlink
+  windowStartMs: bigint("window_start_ms", { mode: "number" }).notNull(),
+  windowEndMs: bigint("window_end_ms", { mode: "number" }).notNull(),
+  sampleCount: integer("sample_count").notNull(),
+  // pure statistics (ppm of ref price) — doubles by convention, never money math
+  meanPpm: doublePrecision("mean_ppm").notNull(),
+  medianPpm: doublePrecision("median_ppm"),
+  stdPpm: doublePrecision("std_ppm").notNull(),
+  madPpm: doublePrecision("mad_ppm"),
+  clockOffsetMs: doublePrecision("clock_offset_ms"),
+  leadLagMs: doublePrecision("lead_lag_ms"), // + = base leads ref
+  regime: text("regime"),
+  method: text("method").notNull(), // estimator version
+  tsMs: bigint("ts_ms", { mode: "number" }).notNull(), // causal as-of time (only past data)
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  index("feed_basis_symbol_ts_idx").on(t.symbol, t.tsMs),
+]);
+
+export const boundaryPriceObservations = pgTable("boundary_price_observations", {
+  id: text("id").primaryKey(),
+  correlationId: text("correlation_id").notNull(),
+  marketId: text("market_id"), // no FK: boundary capture may precede market discovery
+  symbol: text("symbol").notNull(),
+  boundaryKind: text("boundary_kind").notNull(), // OPEN (strike) | CLOSE (resolution)
+  boundaryEpoch: bigint("boundary_epoch", { mode: "number" }).notNull(), // unix sec, 300-aligned
+  valueText: text("value_text").notNull(), // exact decimal string (authoritative)
+  valueFloat: doublePrecision("value_float").notNull(), // features/display only
+  source: text("source").notNull(), // e.g. rtds_chainlink
+  sourceTsMs: bigint("source_ts_ms", { mode: "number" }).notNull(),
+  receivedTsMs: bigint("received_ts_ms", { mode: "number" }).notNull(),
+  sequence: text("sequence"), // feed sequence/round metadata
+  firstAtOrAfterBoundary: boolean("first_at_or_after_boundary").notNull(), // false = late capture, NOT authoritative
+  officialValueText: text("official_value_text"),
+  matchesOfficial: boolean("matches_official"),
+  configVersion: integer("config_version").notNull(),
+}, (t) => [
+  uniqueIndex("boundary_obs_capture_idx").on(t.source, t.symbol, t.boundaryEpoch, t.boundaryKind), // idempotent boundary capture per source
+  index("boundary_obs_market_idx").on(t.marketId),
+]);

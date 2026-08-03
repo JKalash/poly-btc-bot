@@ -4,6 +4,10 @@ import {
   type BankrollState, type CapResult, type ExecutionStyle, type FeeSchedule,
   type Mode, type Ppm, type Prob6, type RiskLimits, type Usdc6,
 } from "@b5p/domain";
+import {
+  evaluateInventoryRisk,
+  type InventoryRejectionCode, type InventoryRiskContext,
+} from "./inventory-risk";
 
 /**
  * Pure, deterministic risk evaluation. Receives the complete decision context,
@@ -42,7 +46,8 @@ export type RejectionCode =
   | "NO_EXECUTABLE_SIZE";
 
 export interface Rejection {
-  code: RejectionCode;
+  /** Directional gates plus the Phase-3 inventory hard rejects (all coded). */
+  code: RejectionCode | InventoryRejectionCode;
   message: string;
 }
 
@@ -92,6 +97,16 @@ export interface RiskContext {
   // sizing request
   requestedStakeFractionPpm: Ppm | null; // null -> use base/kelly
   minOrderStake6: Usdc6;
+
+  /**
+   * Phase 3 — optional paired-inventory/market-making context. When present,
+   * the inventory hard gates run and merge their rejections into the verdict.
+   * Absent/null for plain directional flow: behavior is identical to Phase 1.
+   * Every inventory code is a hard reject — the live-arm override cannot clear
+   * any of them (it exists only inside governanceForMode, which produces only
+   * the two governance booleans above).
+   */
+  inventory?: InventoryRiskContext | null;
 }
 
 export interface SizingResult {
@@ -242,6 +257,13 @@ export function evaluateOrderRisk(ctx: RiskContext): RiskVerdict {
   }
   if (ctx.idempotencyKeyIsDuplicate) {
     reasons.push(r("DUPLICATE_IDEMPOTENCY_KEY", "Duplicate decision/order idempotency key."));
+  }
+
+  // Phase 3 — inventory/market-making hard gates (paired cycles, CTF, accruals).
+  // Rejection-only: can never enlarge sizing, and none of these codes is
+  // touched by the live-arm governance bypass.
+  if (ctx.inventory != null) {
+    reasons.push(...evaluateInventoryRisk(ctx.inventory).reasons);
   }
 
   const sizing = computeSizing(ctx);

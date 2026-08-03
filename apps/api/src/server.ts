@@ -2,12 +2,13 @@ import fastifyCookie from "@fastify/cookie";
 import fastifyWebsocket from "@fastify/websocket";
 import { validateConfig, diffConfigs, type AppConfig } from "@b5p/config";
 import {
-  auditEvents, calibrationArtifacts, configVersions, decisionSnapshots, engineKv,
-  executionTimelineEvents, fillCounterfactuals, fillSelectionCostRecords, healthEvents,
+  auditEvents, calibrationArtifacts, configVersions, datasetManifests, decisionSnapshots,
+  engineKv, executionTimelineEvents, experimentDefinitions, experimentObservations,
+  experimentRuns, fillCounterfactuals, fillSelectionCostRecords, healthEvents,
   killSwitchEvents, latencySamples, marketTradeTicks, markets, markoutObservations,
   orderAttempts, orderFills, orders, paperVariantResults, pnlRecords, positions,
   queueEstimates, researchMarkets, resolutions, riskDecisions, signalCandidates,
-  strategyPromotionDecisions, timingBucketStatistics, type DbHandle,
+  sourceEvidence, strategyPromotionDecisions, timingBucketStatistics, type DbHandle,
 } from "@b5p/db";
 import { closingMinuteBucket } from "@b5p/domain";
 import { newId } from "@b5p/domain/ids";
@@ -722,6 +723,199 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
         "No trade is a valid decision.",
       ],
     });
+  });
+
+  // ---------- evidence lab (read-only provenance; rows arrive from seed-evidence
+  // and the R1–R8/R11 reproduction runners — every route degrades to a
+  // well-formed empty payload, and a failed reproduction is a result) ----------
+
+  // Mirrors packages/evidence/src/labels.ts EVIDENCE_LABELS. apps/api does not
+  // depend on @b5p/evidence (workspace link not declared); keep this list in
+  // sync with that module — the vocabulary only changes alongside a migration.
+  const EVIDENCE_LABEL_LIST = [
+    "SOURCE_CLAIM_UNVERIFIED",
+    "OFFICIAL_CURRENT_AT_RETRIEVAL",
+    "REPRODUCED_MATCH",
+    "REPRODUCED_MISMATCH",
+    "DATA_GATED",
+    "INTERNAL_HYPOTHESIS",
+    "LIVE_VALIDATED",
+    "REJECTED_ANTI_PATTERN",
+  ] as const;
+  const zeroLabelCounts = (): Record<string, number> =>
+    Object.fromEntries(EVIDENCE_LABEL_LIST.map((l) => [l, 0]));
+  const EVIDENCE_NOTE = "evidence tables unavailable (migration not applied)";
+  const LEDGER_NOTES = [
+    "A failed reproduction is a result.",
+    "No live order can be created by any unverified source claim.",
+  ];
+
+  interface ManifestFileEntry { path: string; sha256: string | null; bytes: number | null; rows: number | null }
+
+  app.get("/api/evidence/ledger", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const rows = await db.db.select().from(sourceEvidence)
+        .orderBy(sourceEvidence.sourceKey, sourceEvidence.claimKey);
+      const runIds = [...new Set(rows.map((r) => r.reproductionRunId).filter((x): x is string => x !== null))];
+      const runs = runIds.length > 0
+        ? await db.db.select({
+            id: experimentRuns.id, definitionId: experimentRuns.definitionId, runKey: experimentRuns.runKey,
+            status: experimentRuns.status, startedAtMs: experimentRuns.startedAtMs,
+            finishedAtMs: experimentRuns.finishedAtMs, codeVersion: experimentRuns.codeVersion,
+            resultChecksum: experimentRuns.resultChecksum, datasetManifestIds: experimentRuns.datasetManifestIds,
+          }).from(experimentRuns).where(inArray(experimentRuns.id, runIds))
+        : [];
+      const defIds = [...new Set(runs.map((r) => r.definitionId))];
+      const defs = defIds.length > 0
+        ? await db.db.select({
+            id: experimentDefinitions.id, experimentKey: experimentDefinitions.experimentKey,
+            title: experimentDefinitions.title, status: experimentDefinitions.status,
+          }).from(experimentDefinitions).where(inArray(experimentDefinitions.id, defIds))
+        : [];
+      const manifestIds = [...new Set(runs.flatMap((r) => (r.datasetManifestIds as string[] | null) ?? []))];
+      const manifests = manifestIds.length > 0
+        ? await db.db.select({
+            id: datasetManifests.id, datasetKey: datasetManifests.datasetKey, title: datasetManifests.title,
+            materialized: datasetManifests.materialized, contentChecksum: datasetManifests.contentChecksum,
+          }).from(datasetManifests).where(inArray(datasetManifests.id, manifestIds))
+        : [];
+      const runBy = new Map(runs.map((r) => [r.id, r]));
+      const defBy = new Map(defs.map((d) => [d.id, d]));
+      const manifestBy = new Map(manifests.map((m) => [m.id, m]));
+
+      const counts = zeroLabelCounts();
+      for (const r of rows) counts[r.label] = (counts[r.label] ?? 0) + 1;
+
+      const claims = rows.map((r) => {
+        const run = r.reproductionRunId ? runBy.get(r.reproductionRunId) ?? null : null;
+        const def = run ? defBy.get(run.definitionId) ?? null : null;
+        const datasets = run
+          ? ((run.datasetManifestIds as string[] | null) ?? []).flatMap((id) => {
+              const m = manifestBy.get(id);
+              return m ? [m] : [];
+            })
+          : [];
+        return {
+          id: r.id, sourceKey: r.sourceKey, claimKey: r.claimKey, title: r.title,
+          claimText: r.claimText, claimedValue: r.claimedValue, units: r.units,
+          label: r.label, url: r.url, retrievedAtMs: r.retrievedAtMs,
+          reproducedValue: r.reproducedValue, methodologyNotes: r.methodologyNotes,
+          configVersion: r.configVersion, createdAtMs: r.createdAtMs, updatedAtMs: r.updatedAtMs,
+          reproduction: run ? {
+            runId: run.id, runKey: run.runKey, status: run.status,
+            startedAtMs: run.startedAtMs, finishedAtMs: run.finishedAtMs,
+            codeVersion: run.codeVersion, resultChecksum: run.resultChecksum,
+            definitionId: run.definitionId,
+            experimentKey: def?.experimentKey ?? null, experimentTitle: def?.title ?? null,
+            dataGated: datasets.some((d) => !d.materialized),
+          } : null,
+          datasets,
+        };
+      });
+      return jsonSafe({ claims, counts, labels: EVIDENCE_LABEL_LIST, notes: LEDGER_NOTES });
+    } catch {
+      return { claims: [], counts: zeroLabelCounts(), labels: EVIDENCE_LABEL_LIST, notes: LEDGER_NOTES, note: EVIDENCE_NOTE };
+    }
+  });
+
+  app.get("/api/evidence/experiments", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const defs = await db.db.select().from(experimentDefinitions)
+        .orderBy(experimentDefinitions.experimentKey);
+      if (defs.length === 0) return { experiments: [] };
+      // resultSummary is intentionally omitted (it can be tens of KB — the full
+      // study JSON); resultChecksum identifies the artifact byte-exactly.
+      const runs = await db.db.select({
+        id: experimentRuns.id, definitionId: experimentRuns.definitionId, runKey: experimentRuns.runKey,
+        params: experimentRuns.params, datasetManifestIds: experimentRuns.datasetManifestIds,
+        codeVersion: experimentRuns.codeVersion, configVersion: experimentRuns.configVersion,
+        status: experimentRuns.status, startedAtMs: experimentRuns.startedAtMs,
+        finishedAtMs: experimentRuns.finishedAtMs, resultChecksum: experimentRuns.resultChecksum,
+      }).from(experimentRuns).orderBy(desc(experimentRuns.startedAtMs));
+      const runIds = runs.map((r) => r.id);
+      const obs = runIds.length > 0
+        ? await db.db.select().from(experimentObservations)
+            .where(inArray(experimentObservations.runId, runIds))
+            .orderBy(experimentObservations.metric, experimentObservations.scope)
+        : [];
+      const manifests = await db.db.select({
+        id: datasetManifests.id, datasetKey: datasetManifests.datasetKey, materialized: datasetManifests.materialized,
+      }).from(datasetManifests);
+      const materializedByKey = new Map<string, boolean>();
+      for (const m of manifests) {
+        materializedByKey.set(m.datasetKey, (materializedByKey.get(m.datasetKey) ?? false) || m.materialized);
+      }
+      const materializedById = new Map(manifests.map((m) => [m.id, m.materialized]));
+      const runsBy = new Map<string, typeof runs>();
+      for (const r of runs) {
+        const list = runsBy.get(r.definitionId) ?? [];
+        list.push(r);
+        runsBy.set(r.definitionId, list);
+      }
+      const obsBy = new Map<string, typeof obs>();
+      for (const o of obs) {
+        const list = obsBy.get(o.runId) ?? [];
+        list.push(o);
+        obsBy.set(o.runId, list);
+      }
+      const experiments = defs.map((d) => {
+        const datasetKeys = (d.datasetKeys as string[] | null) ?? [];
+        return {
+          id: d.id, experimentKey: d.experimentKey, title: d.title,
+          hypothesis: d.hypothesis, nullHypothesis: d.nullHypothesis,
+          primaryMetric: d.primaryMetric, successCriteria: d.successCriteria,
+          status: d.status, foldPlan: d.foldPlan, datasetKeys,
+          sourceEvidenceIds: (d.sourceEvidenceIds as string[] | null) ?? [],
+          // gated when the declared status says so, or any required dataset has
+          // no materialized manifest — awaiting data, never faked.
+          dataGated: d.status === "DATA_GATED" || datasetKeys.some((k) => materializedByKey.get(k) !== true),
+          createdAtMs: d.createdAtMs, updatedAtMs: d.updatedAtMs,
+          runs: (runsBy.get(d.id) ?? []).map((r) => {
+            const ids = (r.datasetManifestIds as string[] | null) ?? [];
+            return {
+              id: r.id, runKey: r.runKey, status: r.status,
+              startedAtMs: r.startedAtMs, finishedAtMs: r.finishedAtMs,
+              codeVersion: r.codeVersion, configVersion: r.configVersion,
+              resultChecksum: r.resultChecksum, params: r.params,
+              datasetManifestIds: ids,
+              dataGated: ids.some((id) => materializedById.get(id) !== true),
+              observations: (obsBy.get(r.id) ?? []).map((o) => ({
+                id: o.id, metric: o.metric, scope: o.scope, value: o.value,
+                valueText: o.valueText, n: o.n, ciLo: o.ciLo, ciHi: o.ciHi,
+              })),
+            };
+          }),
+        };
+      });
+      return jsonSafe({ experiments });
+    } catch {
+      return { experiments: [], note: EVIDENCE_NOTE };
+    }
+  });
+
+  app.get("/api/evidence/manifests", async (req, reply) => {
+    if (!(await guard(req, reply))) return;
+    try {
+      const rows = await db.db.select().from(datasetManifests).orderBy(datasetManifests.datasetKey);
+      return jsonSafe({
+        manifests: rows.map((m) => {
+          const files = (m.files as ManifestFileEntry[] | null) ?? [];
+          return {
+            id: m.id, datasetKey: m.datasetKey, title: m.title, source: m.source,
+            license: m.license, contentChecksum: m.contentChecksum, materialized: m.materialized,
+            rowCount: m.rowCount, timeRangeStartMs: m.timeRangeStartMs, timeRangeEndMs: m.timeRangeEndMs,
+            schemaDescription: m.schemaDescription, retrievedAtMs: m.retrievedAtMs, createdAtMs: m.createdAtMs,
+            files,
+            fileCount: files.length,
+            checksummedFiles: files.filter((f) => f.sha256 !== null).length,
+          };
+        }),
+      });
+    } catch {
+      return { manifests: [], note: EVIDENCE_NOTE };
+    }
   });
 
   // ---------- timing lab ----------
