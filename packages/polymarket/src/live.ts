@@ -156,6 +156,11 @@ export class LiveClobAdapter implements ExecutionAdapter {
   }
 
   async submit(req: OrderRequest): Promise<OrderResult> {
+    // Client-side sanity BEFORE any network/init work: a GTD whose intended
+    // expiry has already passed can never rest and must not be signed at all.
+    if (req.style === "maker_post_only" && req.expireAtMs !== undefined && req.expireAtMs <= Date.now()) {
+      return { accepted: false, status: "REJECTED", reason: "GTD expiration is not in the future; refusing to submit" };
+    }
     try {
       await this.init();
       const m = this.mods!;
@@ -164,9 +169,6 @@ export class LiveClobAdapter implements ExecutionAdapter {
       const options = { tickSize, negRisk: req.negRisk ?? false };
 
       if (req.style === "maker_post_only") {
-        if (req.expireAtMs !== undefined && req.expireAtMs <= Date.now()) {
-          return { accepted: false, status: "REJECTED", reason: "GTD expiration is not in the future; refusing to submit" };
-        }
         // GTD post-only maker order: price + size(shares). Polymarket applies a
         // documented 1-minute security threshold to GTD expirations: an order
         // meant to live until T must be submitted with expiration = T + 60s,

@@ -252,6 +252,12 @@ export class Engine {
     const orphans = await this.paper.reconcileOrphans(nowMs);
     if (orphans > 0) await this.health("warning", "reconcile", `${orphans} orphaned resting order(s) canceled on restart`);
     await this.accounting.reconcile(this.cfg, nowMs);
+    // Live loss-stop durability: rebuild the live streak from persisted live
+    // pnl_records, then re-evaluate cooling-off so a stop tripped before the
+    // restart is visible (COOLING_OFF_ACTIVE + audit) immediately, not only
+    // after the next resolution happens to run.
+    await this.live.reconcile();
+    await this.maybeTripCoolingOff(nowMs);
     // Reload recent idempotency keys so the duplicate-order gate survives the
     // restart scenarios it exists for (keys are content-derived and also
     // unique-constrained on order_intents as a fail-closed backstop).

@@ -6,7 +6,7 @@ import { newId } from "@b5p/domain/ids";
 import {
   mulDiv, PPM, usdc, type BankrollState, type Mode, type OutcomeSide, type Usdc6,
 } from "@b5p/domain";
-import { eq } from "drizzle-orm";
+import { and, desc, eq, gte } from "drizzle-orm";
 import { logger } from "./log";
 
 interface OpenPosition {
@@ -64,8 +64,9 @@ export class Accounting {
         openedAtMs: r.openedAtMs,
       });
     }
-    const snaps = await this.db.db.select().from(bankrollSnapshots).where(eq(bankrollSnapshots.mode, this.mode));
-    const latest = snaps.sort((a, b) => b.tsMs - a.tsMs)[0];
+    const latest = (await this.db.db.select().from(bankrollSnapshots)
+      .where(eq(bankrollSnapshots.mode, this.mode))
+      .orderBy(desc(bankrollSnapshots.tsMs)).limit(1))[0];
     this.startingBankroll = usdc(cfg.risk.starting_paper_bankroll_usdc);
     this.bankroll = latest ? latest.bankroll6 : this.startingBankroll;
     this.sessionStartBankroll = this.bankroll;
@@ -76,13 +77,16 @@ export class Accounting {
     // daily peak is the UTC-day's true maximum from bankroll snapshots — NOT
     // the current bankroll, which would grant a fresh daily loss budget
     // measured from the post-loss level after every deploy.
-    const prevSessions = await this.db.db.select().from(tradingSessions).where(eq(tradingSessions.mode, this.mode));
-    const prev = prevSessions.sort((a, b) => b.startedAtMs - a.startedAtMs)[0];
+    const prev = (await this.db.db.select().from(tradingSessions)
+      .where(eq(tradingSessions.mode, this.mode))
+      .orderBy(desc(tradingSessions.startedAtMs)).limit(1))[0];
     this.consecutiveLosses = prev?.consecutiveLosses ?? 0;
     const dayStartMs = Date.parse(`${this.dailyPeakDay}T00:00:00Z`);
+    const daySnaps = await this.db.db.select({ bankroll6: bankrollSnapshots.bankroll6 }).from(bankrollSnapshots)
+      .where(and(eq(bankrollSnapshots.mode, this.mode), gte(bankrollSnapshots.tsMs, dayStartMs)));
     let dayPeak = this.bankroll;
-    for (const s of snaps) {
-      if (s.tsMs >= dayStartMs && s.bankroll6 > dayPeak) dayPeak = s.bankroll6;
+    for (const s of daySnaps) {
+      if (s.bankroll6 > dayPeak) dayPeak = s.bankroll6;
     }
     this.dailyPeak = dayPeak;
     this.sessionId = newId();
