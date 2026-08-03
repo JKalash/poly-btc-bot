@@ -1,0 +1,75 @@
+# CI + deploy.
+#
+# checks: typecheck, unit tests (vitest; in-memory PGlite, no services needed),
+#         and the production Next.js build — on every PR and push to main.
+# deploy: pushes to main only, after checks pass. Deploys to Fly.io
+#         (app b5p-collector, see fly.toml) via a remote builder.
+#
+# Required repo secret: FLY_API_TOKEN — create one with
+#   fly tokens create deploy -a b5p-collector
+# and add it under Settings → Secrets and variables → Actions.
+#
+# Playwright e2e is intentionally not run here: it needs the full dev stack
+# (pnpm dev) running against a browser install; run locally via pnpm test:e2e.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # never cancel an in-flight main run (it may be mid-deploy); do cancel stale PR runs
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  checks:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # version comes from the packageManager field in package.json
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build web (Next.js production build)
+        run: pnpm --filter @b5p/web build
+
+  deploy:
+    name: Deploy to Fly.io
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
