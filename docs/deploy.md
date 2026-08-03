@@ -30,7 +30,7 @@ open http://localhost:3000
 ```
 
 Data lives on the `b5p_data` volume (`/data/pglite`); snapshot it with `fly volumes snapshots`.
-Cost ≈ \–12/month (shared-cpu-2x 2GB + 10GB volume).
+Cost ≈ $10–12/month (shared-cpu-2x 2GB + 10GB volume).
 
 ## Path A — Docker (canonical: Postgres + Redis, split processes)
 
