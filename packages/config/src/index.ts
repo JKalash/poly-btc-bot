@@ -104,6 +104,8 @@ export const AppConfigSchema = z.object({
     no_martingale: z.literal(true).default(true),
     no_averaging_down: z.literal(true).default(true),
     auto_rearm: z.literal(false).default(false),
+    /** Operator cooling-off after the consecutive-loss stop trips; 0 disables. */
+    cooling_off_minutes: z.number().int().min(0).default(30),
   }).default({}),
 
   execution: z.object({
