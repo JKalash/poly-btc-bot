@@ -14,11 +14,13 @@ parent_specifications:
 source_repository: "https://github.com/MrFadiAi/Polymarket-bot"
 source_revision: "82647014e0c355a5684e09666d8a0a522234640d"
 source_license: "MIT"
+local_repository_revision_reconciled: "908a978b9e2f9eb2be8630d76a2a4691840b3114"
+local_revision_note: "the repository now contains an armed directional live CLOB path; it is explicitly excluded from and forbidden as a dependency of the pair subsystem"
 implementation_scope: "pair-arbitrage observation, prospective paper execution, residual-inventory recovery simulation, reconciliation, persistence, research reporting, and operator visibility"
 explicitly_excluded_scope: "wallets, private keys, authenticated trading, live order submission, on-chain transactions, smart-money copying, DipArb deployment, and production CTF execution"
 default_feature_state: "observer-enabled; paper-execution-disabled"
 maximum_enabled_mode: "paper"
-live_trading_default: false
+pair_live_trading_default: false
 build_priority: "economic correctness, auditability, fail-closed safety, deterministic replay, execution realism, then throughput"
 ---
 
@@ -78,6 +80,7 @@ Then inspect the current implementation instead of assuming this brief's reposit
 - `packages/polymarket/src/ws-base.ts`
 - `packages/polymarket/src/clob-ws.ts`
 - `packages/polymarket/src/execution.ts`
+- `packages/polymarket/src/live.ts`
 - `packages/db/src/schema.ts`
 - every current migration under `packages/db/migrations/`
 - `apps/engine/src/engine.ts`
@@ -85,9 +88,11 @@ Then inspect the current implementation instead of assuming this brief's reposit
 - `apps/engine/src/accounting.ts`
 - `apps/engine/src/snapshot.ts`
 - `apps/engine/src/main.ts`
+- `apps/engine/src/live.ts`
 - `apps/api/src/server.ts`
 - the decisions, orders, P&L, risk, audit, and cockpit web pages
 - all related tests
+- `docs/live-trading.md`
 
 Do not begin with the upstream code. Begin with the local invariants, then use the upstream repository only as an evidence source for operational failure modes.
 
@@ -104,16 +109,16 @@ This document is additive to the two parent Fable specifications. When requireme
 - makes reconciliation stricter;
 - makes a claimed opportunity harder to declare;
 - prevents hidden route substitution;
-- prevents a live signing or transaction path from entering this release; or
+- prevents this pair subsystem from connecting to the repository's existing directional signing/transaction path; or
 - is easier to falsify through prospective evidence.
 
 The following rules are absolute for this implementation:
 
-1. No private-key type, field, environment variable, dependency, UI input, database column, log field, or signing code may be added.
-2. No authenticated CLOB submission may be added.
+1. No private-key type, field, environment variable, dependency, UI input, database column, log field, or signing code may be added to, referenced by, or made reachable from the pair subsystem.
+2. No authenticated pair CLOB submission may be added. The repository's existing directional live path is out of scope and is not authority to reuse it.
 3. No on-chain transaction may be built, signed, or broadcast.
 4. No configuration value may contain `live` as a valid pair-execution mode.
-5. The existing `DisabledLiveAdapter` must remain the only live-shaped execution adapter.
+5. Pair composition may instantiate only observer and durable paper adapters. It must not import, receive, downcast to, or route through the existing `LiveController` or `LiveClobAdapter`.
 6. Existing absolute 10% risk caps remain unchanged and pair capital receives no exemption.
 7. The default configuration must produce zero pair paper orders.
 8. Enabling observation must not implicitly enable paper execution.
@@ -263,7 +268,7 @@ The local repository already has stronger foundations than the upstream implemen
 - an engine kill switch;
 - restart reconciliation for the existing paper orders;
 - Chainlink-authoritative resolution; and
-- no signing path.
+- a newly added, separately armed directional live path that must remain completely isolated from this pair work.
 
 Do not weaken any of these to make paired execution easier.
 
@@ -315,6 +320,33 @@ It must also persist relevant trade ticks and current constraint/fee snapshots. 
 The existing calibration study examined 4.27 million one-second two-sided top-of-book ticks from 14,226 resolved BTC five-minute markets. It found buy-both top-of-book cost below one during approximately 24 seconds total before current-fee adjustment, approximately `0.00056%` of ticks. The mean buy-both cost was `1.0118`.
 
 Treat this as a strong prior that the pair observer will mostly record no executable opportunity. Do not tune thresholds to manufacture activity. The purpose of the new subsystem is to test current, full-depth, fee-regime-current, prospective execution and quantify residual risk.
+
+### 6.5 Reconciled local live-path boundary at revision `908a978`
+
+During preparation of this brief the local repository advanced to commit `908a978b9e2f9eb2be8630d76a2a4691840b3114`, which adds an armed directional `LiveController` and `LiveClobAdapter`. Preserve that user-owned work, but do not treat it as pair infrastructure.
+
+It is specifically unsuitable for paired execution because the audited new path:
+
+- accepts a hot-wallet private key and authenticated CLOB dependencies that this pair package must never import;
+- converts prices, shares, stakes, and external balances through JavaScript `number` at the venue boundary;
+- persists non-maker live style as `taker_fak` even when the request style can be `taker_fok`;
+- records an immediate matched fill at requested price/quantity with `feeUsdc6 = 0` as an acknowledged approximation;
+- does not provide exact user-trade reconciliation yet;
+- observes USDC balance/allowance but not an attributed two-token pair inventory ledger;
+- has no pair aggregate, residual state, complete-set settlement, or durable pair-operation evidence; and
+- exposes repository-wide `/api/arm`/`/api/disarm` controls that must have no pair side effect.
+
+Therefore add explicit dependency tests:
+
+```text
+packages/pair-execution/** must not import packages/polymarket/src/live
+apps/engine/src/pair-*.ts must not import LiveController or LiveClobAdapter
+pair package dependency graph must not reach @polymarket/clob-client or viem
+pair runtime must not read LIVE_TRADING_ENABLED or HOT_WALLET_PRIVATE_KEY
+arming/disarming the directional live controller must not change pair capability authority
+```
+
+When global `app.mode` is `live` or the directional controller is armed, pair observation may continue, but runtime pair paper scheduling must return `MODE_UNSUPPORTED`; run counterfactual pair execution in the dedicated paper/research process instead. Existing directional live arming does not authorize pair live execution.
 
 ## 7. Explicit non-goals and prohibited shortcuts
 
@@ -870,7 +902,7 @@ Public feed normalization must retain:
 - connection epoch; and
 - reconnect/reset events.
 
-`packages/polymarket/src/execution.ts` remains disabled for live behavior. Pair paper execution uses a local adapter implemented in the engine application, not this future external integration boundary.
+The repository now also contains `packages/polymarket/src/live.ts` for separately armed directional trading. Pair paper execution uses its own local durable adapter implemented in the engine application. The pair package and all `pair-*` composition files must not import or receive the directional live adapter/controller. Existing `packages/polymarket/src/execution.ts` types may be reused only if doing so does not make the live adapter structurally assignable to the pair port; the preferred choice is a distinct pair paper port.
 
 ### 10.6 Changes to `packages/db`
 
@@ -883,6 +915,7 @@ apps/engine/src/
   pair-runtime.ts
   pair-store.ts
   paper-pair-venue.ts
+  pair-paper-operation-store.ts
   pair-portfolio.ts
   pair-market-data.ts
   pair-outbox-dispatcher.ts
@@ -894,6 +927,7 @@ Responsibilities:
 - `pair-runtime.ts`: connect complete market-data envelopes and the engine clock to the facade; serialize per market.
 - `pair-store.ts`: Drizzle implementation of event/projection/observation/ledger ports.
 - `paper-pair-venue.ts`: deterministic direct-book FOK/FAK simulation with scripted fault hooks.
+- `pair-paper-operation-store.ts`: durable idempotent paper operation/result transaction and restart observation by client operation ID.
 - `pair-portfolio.ts`: one coherent view of available paper cash, existing directional reservations, and pair reservations.
 - `pair-market-data.ts`: construct paired captures and persist replay events/checkpoints.
 - `pair-outbox-dispatcher.ts`: claim committed effects once and feed outcomes back as facts.
@@ -1000,7 +1034,6 @@ export interface PairMarketContext {
   readonly rulesVerified: boolean;
   readonly rulesHash: string;
   readonly resolutionSource: "CHAINLINK";
-  readonly constraintsSnapshotId: string;
   readonly secondsRemaining: number;
   readonly configVersion: number;
 }
@@ -1008,9 +1041,19 @@ export interface PairMarketContext {
 export interface PairTokenTerms {
   readonly outcome: PairOutcome;
   readonly tokenId: string;
+  readonly constraints: PairConstraintSnapshot;
+  readonly fee: PairFeeSnapshot;
+}
+
+export interface PairConstraintSnapshot {
+  readonly snapshotId: string;
+  readonly tokenId: string;
   readonly tickSize6: Prob6;
   readonly minimumOrderShares6: Shares6;
-  readonly fee: PairFeeSnapshot;
+  readonly effectiveAtMs: number;
+  readonly fetchedAtMs: number;
+  readonly source: string;
+  readonly canonicalHash: string;
 }
 
 export interface PairFeeSnapshot {
@@ -1018,13 +1061,44 @@ export interface PairFeeSnapshot {
   readonly tokenId: string;
   readonly tokenFeeRatePpm: Ppm;
   readonly convention: "USDC" | "SHARES" | "UNKNOWN";
+  readonly conventionResolverVersion: string;
   readonly effectiveAtMs: number;
   readonly fetchedAtMs: number;
   readonly source: string;
+  readonly canonicalHash: string;
 }
 ```
 
+The snapshot identities for a leg are therefore `terms.constraints.snapshotId` and `terms.fee.snapshotId`; there is deliberately no market-wide constraint or fee snapshot ID in this contract. Assert that every nested snapshot's `tokenId` equals the containing `PairTokenTerms.tokenId`, and that the UP and DOWN terms match their declared outcomes.
+
 The externally discovered token-specific snapshots are authoritative. `paper.fee_collection_convention` may remain for legacy directional simulation but must not override pair fee discovery. If UP and DOWN terms differ, quote each leg with its own tick, minimum, rate, and convention. Mixed fee conventions are observer-only and paper-rejected in v0. Never collapse differing token terms into a single market-wide value.
+
+Discovery must sit behind exact, injectable ports rather than reading `number`-typed Gamma fields inside economic code:
+
+```ts
+export interface PairTokenTermsProvider {
+  currentTerms(input: {
+    readonly marketId: string;
+    readonly conditionId: string;
+    readonly upTokenId: string;
+    readonly downTokenId: string;
+    readonly asOfMs: number;
+  }): Promise<PairTokenTermsResult>;
+}
+
+export interface PairFeeConventionResolver {
+  readonly version: string;
+  resolve(input: {
+    readonly tokenId: string;
+    readonly rawFeeRate: string;
+    readonly rawVenueMetadata: Readonly<Record<string, string>>;
+  }):
+    | { readonly kind: "RESOLVED"; readonly convention: "USDC" | "SHARES" }
+    | { readonly kind: "UNKNOWN"; readonly reason: string };
+}
+```
+
+The provider parses canonical decimal strings directly into branded integers/fixed-point values, verifies token identity, persists or reuses immutable snapshots, and only then constructs `PairTokenTerms`. It must not round-trip an economic rate, tick, or minimum through JavaScript `number`. `PairTokenTermsResult` is a discriminated success/rejection union; transport failure, malformed precision, stale data, missing token identity, or unknown convention is an explicit rejection. The fee-convention resolver version and all raw-input provenance needed to repeat its answer belong in the fee snapshot. A convention that cannot be established from an authoritative, versioned rule remains `UNKNOWN`: observation may report it, but paper scheduling rejects it.
 
 V0 supports only verified ordinary BTC five-minute binary markets with exhaustive mutually exclusive outcomes, one-USDC complete-set payout, `negRisk === false`, verified Chainlink resolution semantics, and a verified void/invalid policy. Add stable rejections `NEG_RISK_UNSUPPORTED`, `MARKET_STRUCTURE_UNSUPPORTED`, and `VOID_POLICY_UNVERIFIED`. Do not infer complete-set safety from the presence of two labels alone.
 
@@ -1133,8 +1207,10 @@ export interface PairQuote {
   readonly down: PairLegQuote;
   readonly grossPrincipal6: Usdc6;
   readonly totalFeeCash6: Usdc6;
-  readonly settlementBuffer6: Usdc6;
-  readonly operationalBuffer6: Usdc6;
+  readonly modeledNonrefundableSettlementCost6: Usdc6;
+  readonly settlementCashReserve6: Usdc6;
+  readonly recoveryCashReserve6: Usdc6;
+  readonly operationalRiskHaircut6: Usdc6;
   readonly reservedCash6: Usdc6;
   readonly guaranteedPayout6: Usdc6;
   readonly grossWalkEdge6: Usdc6;
@@ -1163,6 +1239,8 @@ export interface PairPortfolioSnapshot {
   /** Already net of all directional reservations and open-order commitments. */
   readonly directionalFreeCash6: Usdc6;
   readonly sharedCapAvailable6: Usdc6;
+  readonly globalAppMode: "observe" | "paper" | "shadow" | "live";
+  readonly directionalLiveArmed: boolean;
   readonly activePairGroupCount: number;
   readonly aggregatePairWorstCaseLoss6: Usdc6;
   readonly pairDailyRealizedPnl6: bigint;
@@ -1182,6 +1260,10 @@ export type PairRiskDecision =
       readonly approvedQuoteHash: string;
       readonly maximumReservedCash6: Usdc6;
       readonly maximumResidualLoss6: Usdc6;
+      readonly upOnlyWorstLoss6: Usdc6;
+      readonly downOnlyWorstLoss6: Usdc6;
+      readonly maximumLockedLossAfterCompletion6: Usdc6;
+      readonly maximumComplementCashDebit6: Usdc6;
       readonly issuedAtMs: number;
       readonly expiresAtMs: number;
     }
@@ -1277,6 +1359,105 @@ export interface PairPolicySnapshot {
 
 Persist this entire snapshot with the decision. The policy hash covers every listed field. Queue capacity, batch size, and metric sampling mechanics are persisted in a separate `PairObserverOperationalSnapshot` because they can affect data availability but not economics; its hash is also linked from observations/research manifests. Do not reinterpret an old group using current config.
 
+### 11.9 Existing `decision_snapshots.data` union
+
+Extend the repository's decision payload type through a discriminated union; do not cast pair JSON to the directional shape.
+
+```ts
+export type DecisionSnapshotData =
+  | ExistingDirectionalDecisionSnapshotData
+  | PairSignalDecisionSnapshotData
+  | PairActivationDecisionSnapshotData
+  | PairSerialComplementDecisionSnapshotData
+  | PairRecoveryDecisionSnapshotData
+  | PairSettlementDecisionSnapshotData;
+
+interface PairDecisionBaseJson {
+  readonly schemaVersion: 1;
+  readonly strategyVersion: "complete_set_pair_v0_RESEARCH_ONLY";
+  readonly mode: "paper";
+  readonly groupId: string;
+  readonly observationId: string;
+  readonly episodeId: string | null;
+  readonly marketId: string;
+  readonly conditionId: string;
+  readonly correlationId: string;
+  readonly policy: JsonSafePairPolicySnapshot;
+  readonly policyHash: string;
+  readonly configVersion: number;
+  readonly engineVersion: string;
+  readonly codeCommit: string;
+  readonly createdAtMs: number;
+}
+
+export interface PairSignalDecisionSnapshotData extends PairDecisionBaseJson {
+  readonly kind: "complete_set_pair_signal_v1";
+  readonly signalCaptureId: string;
+  readonly signalCaptureHash: string;
+  readonly quote: JsonSafePairQuote;
+  readonly portfolio: JsonSafePairPortfolioSnapshot;
+  readonly requestedAction: "SCHEDULE_PAPER_IF_AUTHORIZED";
+  readonly scheduledActivateAtMs: number;
+  readonly riskDecision: JsonSafePairRiskDecision;
+}
+
+export interface PairActivationDecisionSnapshotData extends PairDecisionBaseJson {
+  readonly kind: "complete_set_pair_activation_v1";
+  readonly parentSignalDecisionId: string;
+  readonly scheduledDueMs: number;
+  readonly actualDispatchMs: number;
+  readonly dataCutoffEventId: string | null;
+  readonly dataCutoffEnvelopeId: string | null;
+  readonly activationCaptureId: string;
+  readonly activationCaptureHash: string;
+  readonly quote: JsonSafePairQuote | null;
+  readonly gateResult: JsonSafePairGateResult;
+  readonly riskDecision: JsonSafePairRiskDecision;
+  readonly plannedLegs: readonly JsonSafePairLegPlan[];
+}
+
+export interface PairSerialComplementDecisionSnapshotData
+  extends PairDecisionBaseJson {
+  readonly kind: "complete_set_pair_serial_complement_v1";
+  readonly parentActivationDecisionId: string;
+  readonly firstLegFillEvidenceId: string;
+  readonly firstLegActualDebit6: string;
+  readonly currentInventory: JsonSafePairInventory;
+  readonly currentWorstCaseLoss6: string;
+  readonly scheduledDueMs: number;
+  readonly actualDispatchMs: number;
+  readonly captureId: string;
+  readonly maximumComplementDebit6: string;
+  readonly completedTerminalPnl6: string | null;
+  readonly lockedCompletionLoss6: string | null;
+  readonly gateResult: JsonSafePairGateResult;
+  readonly plannedLeg: JsonSafePairLegPlan | null;
+}
+
+export interface PairRecoveryDecisionSnapshotData extends PairDecisionBaseJson {
+  readonly kind: "complete_set_pair_recovery_v1";
+  readonly residualInventory: JsonSafePairInventory;
+  readonly captureId: string;
+  readonly alternatives: readonly JsonSafePairRecoveryAlternative[];
+  readonly selectedAlternative: string | null;
+  readonly selectionReason: string;
+  readonly attemptNumber: 0 | 1;
+  readonly gateResult: JsonSafePairGateResult;
+}
+
+export interface PairSettlementDecisionSnapshotData extends PairDecisionBaseJson {
+  readonly kind: "complete_set_pair_settlement_v1";
+  readonly inventoryBefore: JsonSafePairInventory;
+  readonly settlementPolicy: PairSettlementPolicy;
+  readonly matchedShares6: string;
+  readonly modeledCashCost6: string;
+  readonly effectId: string | null;
+  readonly gateResult: JsonSafePairGateResult;
+}
+```
+
+All economic bigint values inside JSON-safe types are canonical decimal strings. The associated `risk_decisions.cap_chain` uses `kind: "complete_set_pair_risk_v1"` and carries each cap input/result as strings. Existing decision APIs/UI must branch on `data.kind` and remain backward-compatible with directional rows.
+
 ## 12. Book consistency, capture, and reconnect rules
 
 ### 12.1 Accepted capture conditions
@@ -1289,14 +1470,27 @@ A paired capture is eligible for observer economic evaluation only when all cond
 4. Neither side is marked gap-suspected or reconnect-invalid.
 5. Both sides contain at least one valid ask for `DIRECT_BUY_BOTH`.
 6. Prices are in `(0, 1]`, quantities are positive, bids are descending, and asks are ascending after normalization.
-7. `nowMs - receivedTsMs` for each leg is nonnegative within future-clock tolerance and no greater than `maximumBookAgeMs`.
-8. Source timestamp skew is no greater than `maximumSourceSkewMs`.
-9. Receive timestamp skew is no greater than `maximumReceiveSkewMs`.
-10. The capture is made after the entire source envelope has been applied.
-11. The fee and constraint snapshots are present and current.
-12. The market is still accepting orders and is outside the entry cutoff.
+7. Each leg has an authentic venue source timestamp. For each leg, `sourceAgeMs = nowMs - sourceTsMs` is in the inclusive interval `[-maximumFutureTimestampMs, maximumBookAgeMs]`.
+8. For each leg, `receiveAgeMs = nowMs - receivedTsMs` is independently in the inclusive interval `[-maximumFutureTimestampMs, maximumBookAgeMs]`.
+9. Source timestamp skew is no greater than `maximumSourceSkewMs`.
+10. Receive timestamp skew is no greater than `maximumReceiveSkewMs`.
+11. The capture is made after the entire source envelope has been applied.
+12. Both token-specific fee snapshots and both token-specific constraint snapshots are present, current, and identity-matched.
+13. The market is still accepting orders and is outside the entry cutoff.
 
 Every failed condition maps to a stable rejection code; no thrown exception should be required for ordinary invalid data.
+
+The age bounds above are normative and inclusive. A value of exactly `maximumBookAgeMs` or exactly `-maximumFutureTimestampMs` is accepted; one millisecond beyond either boundary is rejected. Source age and local receive age are not substitutes for each other: a venue-stale book received moments ago fails the source-age gate, and a venue-current book delayed locally fails the receive-age gate. Use distinct stable codes so research can diagnose the cause:
+
+```text
+BOOK_SOURCE_TIMESTAMP_MISSING
+BOOK_SOURCE_TIMESTAMP_TOO_FAR_FUTURE
+BOOK_SOURCE_STALE
+BOOK_RECEIVE_TIMESTAMP_TOO_FAR_FUTURE
+BOOK_RECEIVE_STALE
+```
+
+Raw market-data events may retain a nullable source timestamp for honest provenance, but an accepted `PairBookCapture` may not synthesize one from receive time. Missing source time is observer rejection evidence and is never paper-eligible.
 
 Paper scheduling has an additional integrity gate. Both legs must be one of:
 
@@ -1474,8 +1668,18 @@ function findBestPairQuote(input: QuoteInput): QuoteSearchResult {
   const evaluated: PairQuote[] = [];
 
   for (const grossShares6 of candidates) {
-    const up = quoteDirectBuy(input.capture.up, grossShares6, input.fee);
-    const down = quoteDirectBuy(input.capture.down, grossShares6, input.fee);
+    const up = quoteDirectBuy(
+      input.capture.up,
+      grossShares6,
+      input.market.up.constraints,
+      input.market.up.fee,
+    );
+    const down = quoteDirectBuy(
+      input.capture.down,
+      grossShares6,
+      input.market.down.constraints,
+      input.market.down.fee,
+    );
 
     if (!up.fullyExecutable || !down.fullyExecutable) continue;
 
@@ -1574,6 +1778,11 @@ UP_BOOK_MISSING
 DOWN_BOOK_MISSING
 UP_BOOK_STALE
 DOWN_BOOK_STALE
+BOOK_SOURCE_TIMESTAMP_MISSING
+BOOK_SOURCE_TIMESTAMP_TOO_FAR_FUTURE
+BOOK_SOURCE_STALE
+BOOK_RECEIVE_TIMESTAMP_TOO_FAR_FUTURE
+BOOK_RECEIVE_STALE
 BOOK_SOURCE_SKEW
 BOOK_RECEIVE_SKEW
 BOOK_INVALID_AFTER_RECONNECT
@@ -1583,10 +1792,15 @@ BOOK_EMPTY_ASKS
 CAPTURE_HASH_INVALID
 FEE_SNAPSHOT_MISSING
 FEE_SNAPSHOT_STALE
+FEE_SNAPSHOT_TOKEN_MISMATCH
+FEE_SNAPSHOT_MALFORMED
 FEE_CONVENTION_UNKNOWN
 UNSUPPORTED_PAPER_FEE_COLLECTION
 UNSUPPORTED_SELL_FEE_COLLECTION
 CONSTRAINT_SNAPSHOT_MISSING
+CONSTRAINT_SNAPSHOT_STALE
+CONSTRAINT_SNAPSHOT_TOKEN_MISMATCH
+CONSTRAINT_SNAPSHOT_MALFORMED
 TICK_SIZE_INVALID
 MINIMUM_ORDER_NOT_MET
 NO_EXECUTABLE_SIZE
@@ -1822,6 +2036,24 @@ V0 rejects a pair for a market when any of these is true:
 
 The directional path must symmetrically skip a market with active pair state. Enforce this through both an in-process market queue and a database constraint/query; an in-memory boolean alone is insufficient after restart.
 
+Use a shared database guard, not two unrelated prechecks:
+
+```text
+market_exposure_guards
+  market_id text primary key
+  owner_kind text not null
+  owner_id text not null
+  owner_state text not null
+  state_version integer not null default 0
+  acquired_at_ms bigint not null
+  updated_at_ms bigint not null
+  released_at_ms bigint null
+```
+
+Active `owner_kind` values are `DIRECTIONAL_ORDER`, `DIRECTIONAL_POSITION`, and `PAIR_GROUP`. The transaction that creates a directional intent/order or a pair group first inserts/claims the market row. Same owner/key is idempotent; a different unreleased owner rejects. When a directional fill becomes a position, update owner kind/ID in the same transaction. Release only after a provably flat/canceled directional lifecycle or pair `RECONCILED_*` closure. Startup reconciliation repairs projection-only guard metadata but never releases a guard while orders, positions, pair inventory, unknown effects, or manual review remain.
+
+The pair active-group partial unique index is still required as defense in depth; the shared guard is what closes pair-versus-directional races.
+
 ### 14.7 No directional sizing logic
 
 Do not use:
@@ -1842,8 +2074,8 @@ A paper permit becomes unusable if any of the following changes before activatio
 
 - quote/capture hash;
 - selected quantity upward;
-- fee snapshot identity or convention;
-- constraint snapshot identity;
+- either token's fee snapshot identity, rate, convention, or resolver version;
+- either token's constraint snapshot identity, tick, or minimum;
 - rules hash;
 - policy hash;
 - portfolio health or available cash below reservation;
@@ -2008,6 +2240,9 @@ PAIR_LEG_DISPATCH_CLAIMED
 PAIR_LEG_RESULT_RECORDED
 PAIR_FILL_RECORDED
 PAIR_LEG_OUTCOME_UNKNOWN
+PAIR_SERIAL_COMPLEMENT_SCHEDULED
+PAIR_SERIAL_COMPLEMENT_DUE
+PAIR_SERIAL_COMPLEMENT_REJECTED
 PAIR_INVENTORY_RECOMPUTED
 PAIR_LEG_SKIPPED
 PAIR_CLASSIFIED_NO_INITIAL_FILL
@@ -2059,12 +2294,17 @@ Rows not listed are illegal unless they are exact duplicates identified by causa
 | `SCHEDULED` | halt or expiry; no effect claimed | `RECONCILING` | cancel/expire unclaimed effects, release after proof, reconcile |
 | `ACTIVATING` | as-of capture/gate fails before any fill | `ACTIVATION_REJECTED` | persist capture/decision/reasons; no order/effect |
 | `ACTIVATION_REJECTED` | reconciliation begins | `RECONCILING` | verify no inventory/effects; release reservation |
-| `ACTIVATING` | parallel entry gates pass | `SUBMITTING` | create activation decision/risk/one intent/two orders/two outbox effects atomically |
-| `ACTIVATING` | serial entry gates pass | `SUBMITTING` | create activation decision/risk/one intent/first-leg order/effect only; sibling remains `PLANNED` |
-| `SUBMITTING` | terminal initial result(s), zero aggregate fill; serial sibling skipped if applicable | `NO_INITIAL_FILL` | record outcomes, mark sibling `SKIPPED`, retain/release only proven amounts |
+| `ACTIVATING` | parallel entry gates pass | `SUBMITTING` | create activation decision/risk, one pair action, one CLOB intent, two orders, and two child outbox effects atomically |
+| `ACTIVATING` | serial entry gates pass | `SUBMITTING` | create activation decision/risk, one pair action, one CLOB intent, and the first-leg order/effect only; sibling remains `PLANNED` |
 | `SUBMITTING` | any initial result unknown | `OUTCOME_UNKNOWN` | retain full relevant reservation; enqueue reconciliation only |
-| `SUBMITTING` | terminal results yield equal positive holdings | `PAIRED` | post fills/lots/ledger; classify inventory |
-| `SUBMITTING` | terminal results yield unequal holdings | `RESIDUAL` | post fills/lots/ledger; classify residual and worst loss |
+| `SUBMITTING` | first parallel leg becomes terminal while its sibling is `EFFECT_PENDING`, `DISPATCH_CLAIMED`, or `DISPATCHED` | `SUBMITTING` | ingest this result exactly once; post any fill/lot/ledger; retain the sibling reservation; do not classify inventory yet |
+| `SUBMITTING` | serial first leg fills while sibling is `PLANNED` | `SUBMITTING` | ingest fill/lot/ledger; set `next_action_at_ms = first_actual_dispatch_ms + inter_leg_delay_ms`; append `PAIR_SERIAL_COMPLEMENT_SCHEDULED`; retain completion reservation; do not classify yet |
+| `SUBMITTING` | serial first leg is terminal zero-fill (`NO_FILL`, `REJECTED`, or `CANCELED`) while sibling is `PLANNED` | `NO_INITIAL_FILL` | ingest first result; atomically mark the sibling `SKIPPED`; append skip and no-initial-fill events; release only amounts proven unused |
+| `SUBMITTING` | serial complement timer becomes due | `SUBMITTING` | append due event; take a causally as-of capture; persist complement decision/risk/action intent and, only if approved, its one order/effect; clear or advance `next_action_at_ms` atomically |
+| `SUBMITTING` | serial complement decision rejects before an effect exists | `RESIDUAL` | persist decision/reasons, append complement-rejected, mark sibling `SKIPPED`, classify the proven first-leg holding and worst loss |
+| `SUBMITTING` | all intended initial legs are terminal or explicitly `SKIPPED`, and aggregate fill is zero | `NO_INITIAL_FILL` | record outcomes; mark an unsent serial sibling `SKIPPED`; retain/release only proven amounts |
+| `SUBMITTING` | all intended initial legs are terminal or explicitly `SKIPPED`, and holdings are equal and positive | `PAIRED` | post any not-yet-posted fills/lots/ledger exactly once; classify inventory |
+| `SUBMITTING` | all intended initial legs are terminal or explicitly `SKIPPED`, and holdings are unequal | `RESIDUAL` | post any not-yet-posted fills/lots/ledger exactly once; classify residual and worst loss |
 | `OUTCOME_UNKNOWN` | durable evidence/reconciliation proves zero fills | `NO_INITIAL_FILL` | record terminal evidence; skip unsent sibling |
 | `OUTCOME_UNKNOWN` | evidence proves equal positive holdings | `PAIRED` | ingest fills/ledger exactly once |
 | `OUTCOME_UNKNOWN` | evidence proves unequal holdings | `RESIDUAL` | ingest fills/ledger exactly once |
@@ -2096,6 +2336,8 @@ Rows not listed are illegal unless they are exact duplicates identified by causa
 | `MANUAL_REVIEW` | resolution arrives while inventory is deterministically known | `RECONCILING` | apply resolution; preserve unrelated diff for audit |
 
 `PAIR_GROUP_CLOSED` is appended in the same transaction that enters `RECONCILED_FLAT` or `RECONCILED_SETTLED`; there is no separate `CLOSED` state.
+
+For the three classification rows above, “terminal” means `FILLED`, `NO_FILL`, `REJECTED`, `CANCELED`, or `SKIPPED`; an `UNKNOWN` result takes the earlier unknown row instead. A first independently arriving result never authorizes `PAIRED` or `RESIDUAL` while another intended leg can still produce evidence. In the serial model, the complement due time is durable state, not a process-local timeout: `next_action_at_ms` plus `PAIR_SERIAL_COMPLEMENT_SCHEDULED` must be committed in the same transaction as the first fill. Startup reconstructs and fires that same due action under the replay tie rules. The complement timer creates the second-leg decision from the then-causally-available book; it never precreates a future-priced order.
 
 ### 15.10 Active-state database set
 
@@ -2675,10 +2917,10 @@ Group idempotency key:
 sha256(strategy_version | market_id | episode_id | policy_hash | scheduled_activation_bucket)
 ```
 
-Action idempotency key:
+Effect idempotency key:
 
 ```text
-sha256(group_id | action_kind | action_sequence | immutable_request_hash)
+sha256(group_id | action_kind | action_sequence | effect_ordinal | immutable_request_hash)
 ```
 
 Rules:
@@ -2763,6 +3005,7 @@ Claims contain `claim_token`, `claimed_at_ms`, and `claim_expires_at_ms`. Rules:
 ### 18.1 Migration policy
 
 - Add one new forward migration after the repository's current latest migration.
+- At the reconciled revision the latest migration is `0001_tricky_the_order.sql`; generate the pair migration as the next `0002_<generated-name>.sql` with matching Drizzle metadata/journal updates.
 - Preserve all existing migration files.
 - Use types supported by both PGlite and the deployed PostgreSQL version.
 - Store all new persisted times as epoch-millisecond bigint columns named `*_at_ms`/`*_ts_ms`, matching the current repository convention. Drizzle may use `mode: "number"` only for epoch milliseconds that remain within JavaScript's safe-integer range; economic values always use bigint mode. Do not mix SQL timestamp columns into this migration.
@@ -2844,7 +3087,8 @@ source_skew_ms integer not null
 receive_skew_ms integer not null
 up_fee_snapshot_id text not null
 down_fee_snapshot_id text not null
-constraint_snapshot_id text not null
+up_constraint_snapshot_id text not null
+down_constraint_snapshot_id text not null
 canonical_payload jsonb not null
 capture_hash text not null unique
 created_at_ms bigint not null
@@ -2928,7 +3172,8 @@ capture_id text not null
 capture_hash text not null
 up_fee_snapshot_id text not null
 down_fee_snapshot_id text not null
-constraint_snapshot_id text not null
+up_constraint_snapshot_id text not null
+down_constraint_snapshot_id text not null
 policy_hash text not null
 observer_operational_hash text not null
 config_version integer not null
@@ -2963,6 +3208,33 @@ INDEX(net_pre_latency_pnl6, observed_at_ms)
 ```
 
 `capture_id` is a foreign key to `pair_book_captures(id)` and `capture_hash` is denormalized for integrity/query convenience. JSON bigints are decimal strings even when a parallel indexed bigint column exists. Research scenario results belong to run/scenario tables, not this runtime uniqueness domain.
+
+### 18.3.1 `pair_observer_bucket_stats`
+
+Purpose: durable, rebuildable denominators for live API funnels when ordinary negative controls are sampled rather than individually persisted.
+
+```text
+bucket_start_ms bigint not null
+bucket_width_ms integer not null
+strategy_version text not null
+policy_hash text not null
+market_id text not null
+complete_envelopes bigint not null default 0
+valid_synchronized_captures bigint not null default 0
+evaluated_captures bigint not null default 0
+prefilter_captures bigint not null default 0
+gross_dislocations bigint not null default 0
+full_depth_executable bigint not null default 0
+fee_positive bigint not null default 0
+stress_positive bigint not null default 0
+sampled_negative_rows bigint not null default 0
+rejection_counts_json jsonb not null
+updated_at_ms bigint not null
+
+PRIMARY KEY(bucket_start_ms, bucket_width_ms, strategy_version, policy_hash, market_id)
+```
+
+Use fixed UTC one-minute buckets in v0. Increment through an atomic upsert after a complete evaluation. The table is a projection: the replay tool can rebuild/verify it from `orderbook_events`, config/policy, and observations. API trailing counts sum these buckets and disclose the latest incomplete bucket.
 
 ### 18.4 `pair_order_groups`
 
@@ -3060,6 +3332,17 @@ All capture ID columns are foreign keys to `pair_book_captures(id)`. Recovery ma
 
 Add a partial unique index allowing at most one active group per market. Active means any state that can still contain, create, recover, settle, or reconcile exposure. If portable partial indexes are unavailable, lock the market-scoped row and enforce inside the creation transaction.
 
+### 18.4.1 `market_exposure_guards`
+
+Add the shared guard table exactly as defined in Section 14.6, plus:
+
+```text
+UNIQUE(owner_kind, owner_id) WHERE released_at_ms IS NULL
+INDEX(owner_state, updated_at_ms)
+```
+
+Because PGlite/PostgreSQL partial-index portability may differ, the authoritative invariant is the primary-key row per market plus transactional compare-and-swap. Directional and pair code must use one shared `MarketExposureGuardStore`; do not let each implement its own SQL semantics.
+
 ### 18.5 `pair_group_events`
 
 Purpose: immutable ordered aggregate event stream.
@@ -3107,7 +3390,7 @@ Insert:
 
 No `order_intents` row is created yet because exact activation leg prices/evidence do not exist.
 
-#### Every venue-action decision
+#### Every effect-producing decision
 
 Before creating an order/effect, insert atomically:
 
@@ -3121,17 +3404,18 @@ complete_set_pair_settlement_v1
 ```
 
 2. a pair `risk_decisions` row referencing that decision;
-3. one immutable `order_intents` row referencing that decision and containing `payload.kind = 'complete_set_pair_order_intent_v1'`;
-4. one or more existing `orders` rows referencing that intent; and
-5. the pair action-intent link and outbox effect(s).
+3. exactly one `pair_action_intents` row representing this aggregate action decision;
+4. for a CLOB-shaped leg action, one immutable `order_intents` row referenced by that pair action and containing `payload.kind = 'complete_set_pair_order_intent_v1'`;
+5. one or more existing `orders` rows referencing that CLOB order intent; and
+6. one or more outbox effects referencing the pair action by `action_intent_id` and a zero-based `effect_ordinal`.
 
 Cardinality:
 
-- parallel initial activation: one decision, one risk row, one group-level order intent, exactly two orders/effects;
-- serial first leg: one decision, one risk row, one intent, exactly one order/effect;
-- serial complement: a new as-of capture, new decision, new risk row, new intent, exactly one order/effect;
-- recovery order: new capture/decision/risk/intent, exactly one order/effect; and
-- virtual merge: no existing `orders` row because it is not a CLOB order; it still has decision/risk/effect records and a settlement-action link.
+- parallel initial activation: one decision, one risk row, one pair action, one group-level CLOB order intent, exactly two orders, and exactly two effects with ordinals `0` and `1`;
+- serial first leg: one decision, one risk row, one pair action, one CLOB order intent, exactly one order/effect at ordinal `0`;
+- serial complement: a new as-of capture, new decision, new risk row, one pair action, one CLOB order intent, and exactly one order/effect at ordinal `0`;
+- recovery order: new capture/decision/risk, one pair action, one CLOB order intent, and exactly one order/effect at ordinal `0`; and
+- virtual merge: one settlement decision, one risk row, one pair action with `order_intent_id = null`, zero existing `orders` rows, and exactly one settlement effect at ordinal `0`.
 
 The group projection's `activation_decision_id` refers to the initial activation decision. `latest_order_intent_id` is convenience only; the complete immutable action history lives in the link table.
 
@@ -3147,12 +3431,14 @@ pair_action_intents
   decision_id text not null references decision_snapshots(decision_id)
   risk_decision_id text not null references risk_decisions(id)
   order_intent_id text null references order_intents(id)
-  effect_id text null
   created_at_ms bigint not null
 
 UNIQUE(group_id, action_sequence)
 UNIQUE(order_intent_id) WHERE order_intent_id IS NOT NULL
+UNIQUE(id, group_id, action_sequence) -- composite-FK target for child effects
 ```
+
+`pair_action_intents` is the one-row causal parent for an action, not one row per leg. It intentionally has no scalar `effect_id`: fan-out is represented by child outbox rows. A parallel action therefore still has one `UNIQUE(group_id, action_sequence)` parent while its two children are independently claimable and independently evidenced.
 
 An `order_intents.payload` example:
 
@@ -3216,6 +3502,18 @@ RECOVERY_SELL_DOWN
 ```
 
 Add unique indexes for non-null `client_order_id` and `effect_id`. Reuse `order_fills` only if each fill row can retain token ID, side, exact shares, exact price, fee convention, cash fee, share fee, source evidence, and timestamps. If any are absent, add nullable columns in this migration rather than hiding the information only in JSON.
+
+For current schema compatibility, add at least:
+
+```text
+order_fills.fee_convention text null
+order_fills.fee_shares6 bigint null
+order_fills.net_shares6 bigint null
+order_fills.source_evidence_id text null
+order_fills.received_at_ms bigint null
+```
+
+Existing directional rows keep their current `fee_usdc6` behavior. Pair rows require non-null convention/net shares/evidence under an application/database check where portable.
 
 Do not create an order whose token/side is `BOTH`.
 
@@ -3303,9 +3601,12 @@ The application must validate `sum(amount6) == 0` for every `(journal_id, asset_
 ```text
 id text primary key
 group_id text not null references pair_order_groups(id)
+action_intent_id text not null references pair_action_intents(id)
 action_kind text not null
 action_sequence integer not null
+effect_ordinal integer not null
 idempotency_key text not null unique
+client_operation_id text not null unique
 request_hash text not null
 request_payload jsonb not null
 state text not null
@@ -3325,8 +3626,14 @@ Indexes:
 
 ```text
 INDEX(state, not_before_ms)
-UNIQUE(group_id, action_sequence)
+UNIQUE(action_intent_id, effect_ordinal)
+UNIQUE(group_id, action_sequence, effect_ordinal)
+CHECK(effect_ordinal >= 0)
+FOREIGN KEY(action_intent_id, group_id, action_sequence)
+  REFERENCES pair_action_intents(id, group_id, action_sequence)
 ```
+
+For v0, a parallel initial action has exactly ordinals `0` and `1`, deterministically assigned by outcome order `UP`, then `DOWN`; every single-effect action has ordinal `0`. The duplicate group/action/ordinal key is defense in depth and must agree with the referenced parent. Outbox payloads carry the exact token/outcome so ordinals are never interpreted without the immutable request. Result evidence and each `orders.effect_id` point to the individual child effect, while decisions and the group action history point to the shared `pair_action_intents` parent.
 
 The first release allows at most one dispatch attempt for an initial leg. `attempt_count` exists for auditing, not as permission for automatic retry.
 
@@ -3562,18 +3869,48 @@ Use the existing `orderbook_snapshots` table as periodic checkpoints after addin
 
 ### 18.13 Fee and constraint snapshots
 
-Wire actual insertion into the already-declared `fee_schedule_snapshots` and `constraint_snapshots` tables. Persist a new snapshot when the canonical content hash changes and reference its ID from every observation and activation decision.
+Wire actual insertion into the already-declared `fee_schedule_snapshots` and `constraint_snapshots` tables. Persist a new snapshot when the canonical content hash changes and reference the independent UP and DOWN IDs from every capture, observation, and activation decision.
+
+The current market-wide declarations are insufficient for pair execution. Extend both existing tables additively with the following semantic fields, using the repository's actual naming convention in the migration:
+
+```text
+fee_schedule_snapshots
+  -- reuse: rate_ppm, collection, captured_at_ms, raw
+  token_id text null
+  source text null
+  source_payload_hash text null
+  canonical_hash text null
+  effective_at_ms bigint null
+  fetched_at_ms bigint null
+  convention_resolver_version text null
+
+constraint_snapshots
+  -- reuse: tick_size6, min_order_shares6, captured_at_ms, raw
+  token_id text null
+  source text null
+  source_payload_hash text null
+  canonical_hash text null
+  effective_at_ms bigint null
+  fetched_at_ms bigint null
+```
+
+Do not add aliases or competing economic columns. `PairFeeSnapshot.tokenFeeRatePpm` maps to existing `fee_schedule_snapshots.rate_ppm`, and `PairFeeSnapshot.convention` maps to existing `fee_schedule_snapshots.collection`. `PairConstraintSnapshot.tickSize6` maps to existing `constraint_snapshots.tick_size6`, while `PairConstraintSnapshot.minimumOrderShares6` maps to existing `constraint_snapshots.min_order_shares6`. Existing `captured_at_ms` remains retained for backward compatibility and ingestion audit; pair freshness uses the newly explicit `effective_at_ms` and `fetched_at_ms`. Existing `raw` stores the retained source fields whose canonical serialization produces `source_payload_hash`.
+
+The added columns may remain nullable for historical directional rows, but every snapshot referenced by a pair capture/observation/action must have non-null `token_id`, provenance, canonical hash, effective/fetched times, and all existing economic fields. Enforce this with pair-write validation and foreign keys/triggers/checks where portable. Add token-aware uniqueness for immutable content, recommended as `UNIQUE(token_id, canonical_hash) WHERE token_id IS NOT NULL`, while retaining the current historical key. `up_*_snapshot_id` must reference a row whose `token_id` equals `up_token_id`; the DOWN rule is symmetric. PostgreSQL deferred constraint triggers may enforce cross-table token equality; PGlite/application transactions must perform the same assertion and reconciliation must recheck it.
+
+`effective_at_ms` means when the terms became applicable according to the source; `fetched_at_ms` is local receipt time. Snapshot freshness checks use both according to the same source/receive-age principle as books. `source_payload_hash` hashes the retained raw authoritative fields, while `canonical_hash` hashes the normalized exact terms plus token identity and resolver version. Never overwrite a row when either hash changes.
 
 Unknown, expired, or missing snapshots fail closed.
 
 ### 18.14 Transaction boundaries
 
-#### Observation transaction
+#### Evaluation/observation transaction
 
-- insert/reuse immutable `pair_book_captures` row and verify hash;
-- open/update episode;
-- insert immutable observation referencing capture and both token fee snapshots;
-- update episode metrics;
+- compute/verify capture hash in memory and insert/reuse immutable `pair_book_captures` only when a persisted observation/action will reference it; ordinary unsampled controls rely on the append-only market event stream plus bucket counters;
+- atomically increment the durable observer bucket denominator/projection for every evaluated capture;
+- open/update an episode when relevant;
+- insert an immutable observation referencing the capture, both token fee snapshots, and both token constraint snapshots only for required transitions/eligible/rejected/sampled-control cases;
+- update episode metrics when an episode exists;
 - commit;
 - publish best-effort research event.
 
@@ -3594,8 +3931,8 @@ Unknown, expired, or missing snapshots fail closed.
 - insert/reuse the causally as-of activation capture;
 - insert activation decision and risk rows;
 - append activation approved/rejected event;
-- if parallel, create one order intent, two orders, two action links, and two outbox effects;
-- if serial, create one order intent, first-leg order/action link/effect only; keep sibling leg planned without a future limit/order row;
+- if parallel, create one pair action, one CLOB order intent, two orders, and two child outbox effects at deterministic ordinals `0/1`;
+- if serial, create one pair action, one CLOB order intent, and the first-leg order/effect at ordinal `0` only; keep the sibling leg planned without a future limit/order row;
 - advance projection/version;
 - commit.
 
@@ -3604,7 +3941,7 @@ Unknown, expired, or missing snapshots fail closed.
 - lock group/version and account;
 - insert/reuse new as-of capture;
 - evaluate completion/recovery-specific gates;
-- insert new decision, risk, order intent, order, action link, and one outbox effect;
+- insert a new decision, risk row, pair action, CLOB order intent, order, and one child outbox effect at ordinal `0`;
 - append causal events and advance projection;
 - commit.
 
@@ -3773,6 +4110,8 @@ live_execution_enabled != false
 ```
 
 Depth stress fractions must be strictly descending, greater than zero, and no greater than one.
+
+Implement pair cross-field comparisons by parsing fractions to exact ppm/bigint first. Do not copy the current broad config validator's `Number(...)` comparison pattern into pair economic/risk validation.
 
 Use the existing source-level `ABSOLUTE_MAX_RISK_FRACTION` directly for every 10% check. Do not duplicate it as mutable pair config. Persist its name, parsed exact value, and source version/commit in each policy snapshot so audits can detect drift.
 
@@ -4214,12 +4553,17 @@ Same dataset, config, version, and scenario must produce byte-identical canonica
 
 Merge timer events and market-data envelopes into one deterministic total order. A timer has `scheduledDueMs` and `actualDispatchMs`. At dispatch, use the latest complete valid reconstructed book whose envelope boundary has already been processed. Never inspect a row later in the total order.
 
-Tie rule for equal `received_ts_ms`:
+Tie rule `pair_replay_tie_v1` for equal `received_ts_ms`:
 
-1. process all rows of one market-data envelope in row-ID/envelope-sequence order;
-2. process its envelope boundary;
-3. run due timers;
-4. then process later row IDs at the same millisecond.
+1. process safety/control facts: engine halt, market closed, authoritative resolution;
+2. process already-recorded durable venue/effect evidence;
+3. process connection-reset facts;
+4. process every complete market-data envelope at that millisecond, ordered by stable envelope ID and row/envelope sequence; after each boundary, update the observer/episode state;
+5. process remaining diagnostic trade facts;
+6. run due timers ordered by `(scheduledDueMs, priority, groupId, actionSequence)` where priority is initial activation, serial complement, recovery, virtual settlement, reconciliation;
+7. publish/read-model work last.
+
+Safety/control facts first ensure no new simulated exposure is opened at the same millisecond the market is known closed or the engine halted. Effect evidence precedes new timers so state is not advanced from stale beliefs. All rows of an envelope remain atomic. A zero-latency group scheduled by an observer at step 4 may activate in step 6 of the same millisecond.
 
 The live runtime must persist a `dataCutoffEventId`/`dataCutoffEnvelopeId` with each activation so replay knows the exact causal boundary. Replay follows that persisted boundary when reproducing a live-public-feed group. Pure counterfactual replay without a persisted activation uses the same deterministic tie rule.
 
@@ -4642,6 +4986,12 @@ Static/lint test: pair economics, risk, ledger, and serialization source may not
 | Fee snapshot missing | Fail closed |
 | Fee snapshot stale | Fail closed |
 | Fee ID changes before activation | Activation rejected |
+| UP and DOWN fee rates differ | Each book walk uses its own token snapshot; no shared rate |
+| UP and DOWN ticks/minimums differ | Frontier and limit validation apply each token's own constraint snapshot |
+| Snapshot token ID mismatches leg | Reject before quoting and emit identity-mismatch evidence |
+| Decimal source field exceeds supported precision | Exact parser rejects; never rounds through `number` |
+| Same raw convention under two resolver versions | Distinct canonical fee snapshot hashes/IDs |
+| Constraint or fee source hash changes | Insert a new immutable snapshot; old observations remain reproducible |
 | USDC convention | Fee debits cash, gross/net shares equal |
 | Share convention observer | Fee reduces each leg's net token amount |
 | Share convention unequal fees | Matched payout uses minimum net balance; excess is residual |
@@ -4740,6 +5090,11 @@ Property tests:
 | New UP snapshot, old DOWN snapshot | Invalid |
 | Both new snapshots | Eligibility restored |
 | Different connection epochs | Reject |
+| Unsequenced delta after snapshot | Observer record allowed/labeled; paper scheduling rejected |
+| Local canonical hash only | Does not upgrade continuity |
+| Official hash verifier fixture matches | `HASH_CHAIN_VERIFIED` may be paper-eligible |
+| Official hash mismatch | Invalidate and alert |
+| Source timestamp missing | Observer rejection `BOOK_SOURCE_TIMESTAMP_MISSING`; never paper-eligible |
 | Source age exactly limit | Accepted under documented inclusive rule |
 | Source age limit + 1 ms | Reject |
 | Receive age exactly limit | Accepted |
@@ -4747,8 +5102,10 @@ Property tests:
 | Source skew exactly limit | Accepted |
 | Source skew limit + 1 ms | Reject |
 | Receive skew exact/+1 | Accepted/rejected respectively |
-| Future timestamp within tolerance | Accepted with diagnostic |
-| Future timestamp beyond tolerance | Reject and health event |
+| Source timestamp future by exactly tolerance | Accepted with diagnostic |
+| Source timestamp future by tolerance + 1 ms | `BOOK_SOURCE_TIMESTAMP_TOO_FAR_FUTURE` and health event |
+| Receive timestamp future by exactly tolerance | Accepted with diagnostic |
+| Receive timestamp future by tolerance + 1 ms | `BOOK_RECEIVE_TIMESTAMP_TOO_FAR_FUTURE` and health event |
 | Duplicate event same hash | Idempotent metric increment |
 | Duplicate event different hash | Invalidate and alert |
 | Sequence regression | Invalidate until snapshot |
@@ -4802,6 +5159,7 @@ Repeat with changes for both token IDs and with duplicate envelope delivery.
 | Policy hash changed | Permit invalid |
 | Winning/losing streak metadata changes | Has no sizing effect |
 | Live string | Compile/schema rejection |
+| Global app live or directional controller armed | Observer may record; runtime pair paper scheduling rejects `MODE_UNSUPPORTED` |
 
 Property: for any approved plan, aggregate reserved cash and peak modeled one-leg loss never exceed permit values.
 
@@ -4812,12 +5170,16 @@ Cover every legal happy transition and every illegal state/event combination. Na
 - scheduled → activation rejected → reconciled flat;
 - scheduled → halted before activation → reconciled flat;
 - parallel both fill → paired;
-- parallel both reject → both rejected;
+- parallel both reject → no initial fill with both-rejected reason;
+- first parallel terminal result while sibling is outstanding → remains `SUBMITTING`, with first fill/ledger applied at most once and no premature inventory classification;
 - UP fill/DOWN reject → UP residual;
 - DOWN fill/UP reject → DOWN residual;
 - one outcome unknown → reconciliation → filled/rejected classification;
 - serial first no-fill prevents second dispatch;
+- serial first fill atomically persists the exact complement due time/event, remains `SUBMITTING`, and survives restart without repeating the first leg;
+- serial complement due event creates its as-of decision/order/effect only at the due causal boundary;
 - serial first fill, second no-fill creates residual;
+- no `PAIRED`/`RESIDUAL` classification occurs until both intended legs are terminal or the unsent sibling is explicitly `SKIPPED`;
 - equal holdings after recovery → paired;
 - partial liquidation → smaller residual;
 - default recovery skip → await resolution;
@@ -4836,7 +5198,7 @@ For duplicate event delivery, assert same projection, same event count where ded
 - halt before group creation prevents creation;
 - halt after scheduling but before activation creates no leg effect;
 - halt after activation transaction but before dispatcher claim cancels only unclaimed effects;
-- halt after one serial fill prevents new exposure-increasing complement/recovery unless it was already irreversibly dispatched;
+- halt after one serial fill cancels an unclaimed complement/recovery and preserves residual; a claimed durable operation is observed/applied;
 - halt during parallel dispatch accepts late independent outcomes;
 - halt with unknown retains reservation;
 - halt with residual preserves inventory;
@@ -4867,12 +5229,14 @@ Run the same adapter contract suite against deterministic in-memory and engine-c
 
 For a signal at `t0`:
 
-- activation at exactly `t0 + L` uses that capture;
-- only capture at `t0 + L - 1` produces no activation data;
-- capture at `t0 + L + 1` is selected and actual delay recorded;
+- activation dispatched exactly at `t0 + L` uses the latest complete valid as-of state;
+- a last envelope at `t0 + L - 1` is eligible when still fresh/valid and no later envelope was processed;
+- an envelope at `t0 + L + 1` is invisible to a dispatch at `t0 + L`;
+- a late runtime dispatch at `t0 + L + 5` may use envelopes processed through that actual dispatch cutoff and records five milliseconds lateness;
 - parallel legs share activation capture;
-- serial second leg uses capture at/after first actual activation + delay;
-- no capture after second-leg due time creates residual after first fill;
+- serial second leg uses latest valid as-of state at its actual dispatch after first dispatch + delay;
+- no valid as-of state at second-leg dispatch creates a skipped sibling and residual after first fill;
+- equal-millisecond facts follow `pair_replay_tie_v1`, with halt/resolution/evidence before timers;
 - backwards clock is rejected/health event;
 - repeated tick at same time creates no duplicate effect;
 - late engine tick records late activation and uses contemporaneous book; and
@@ -4946,7 +5310,7 @@ Property and scenario assertions:
 
 ### 24.18 Persistence and transaction tests
 
-Run each against PGlite and PostgreSQL where CI supports it:
+Run each against PGlite in ordinary fast CI and against real PostgreSQL in the final acceptance/integration workflow. PostgreSQL is mandatory for completion even if resource-constrained pull-request CI skips that job:
 
 - migration from an existing populated schema;
 - all new defaults/nullable columns preserve old rows;
@@ -5005,12 +5369,44 @@ Inject a process-like failure at each boundary, reconstruct a new facade, run st
 22. during reconciliation projection repair; and
 23. after economic commit but before bus publication.
 
-Expected restart behavior must be explicitly asserted for each boundary; “process starts” is insufficient.
+Normative expected results:
+
+| # | Durable state after crash | Required restart result | Maximum adapter calls |
+|---|---|---|---|
+| 1 | Nothing | No observation/group; normal future event may reevaluate | 0 |
+| 2 | Observation transaction rolled back | Same as #1; no partial episode counter | 0 |
+| 3 | Observation committed, no group | Observer row remains; scheduling may idempotently create one group only if still authorized by the original causal workflow | 0 before group |
+| 4 | Group transaction wholly committed or wholly rolled back | If rollback, no reservation/group; if commit, complete group+decision+risk+balanced reserve journal exists | 0 |
+| 5 | Scheduled group and reservation committed | Startup reloads group; activation occurs once when due/currently legal | 0 before due |
+| 6 | No activation transaction commit | Group remains scheduled/activating without order/effect; retry requote from current causal state, preserving schedule/actual lateness | 0 |
+| 7 | Activation transaction rolled back | No activation decision/intent/order/effect visible; safe to rerun activation decision | 0 |
+| 8 | Activation transaction rolled back | Same as #7; an outbox effect cannot exist without the decision/order | 0 |
+| 9 | Activation and pending effect(s) committed | Dispatcher claims each effect once | 1 per effect |
+| 10 | Claimed effect, no durable venue operation | On lease expiry call `observe`; if null and still legal, execute same key/hash; halt/expiry cancels instead | 1 committed operation |
+| 11 | Durable venue operation exists, group inbox/result absent | `observe` returns stored evidence; ingest exactly once; do not recompute operation | 1 |
+| 12 | Unprocessed inbox evidence committed | Process evidence once via evidence key; no adapter call | 1 |
+| 13 | Result transaction rolled back before commit | No fill/lot/ledger/event partials; re-ingest durable evidence | 1 |
+| 14 | Result transaction rolled back before commit | Same as #13; transaction atomicity is mandatory | 1 |
+| 15 | First serial fill, lot, ledger, projection, complement-scheduled event, and exact `next_action_at_ms` committed | Reconcile exact interim risk; rehydrate the same due timer; create the second-leg decision/intent only at its causal timer; never repeat first | 1 first-leg call |
+| 16 | Both durable venue operations exist; one group result applied | `observe`/inbox applies missing result; existing fill remains idempotent | 1 per leg |
+| 17 | Recovery-alternative transaction rolled back | Original residual remains; recapture/evaluate if deadline/policy allows, otherwise skip | 0 recovery before commit |
+| 18 | Recovery effect claimed | Apply #10/#11 durable operation rule; never use a new key or second policy attempt | 1 recovery operation |
+| 19 | Merge effect pending/claimed/committed | Use durable merge operation store; apply confirmed/failed/unknown evidence once; never credit before confirmation | 1 merge operation |
+| 20 | Authoritative resolution exists; pair payout transaction absent/rolled back | Startup consumes persisted resolution and posts payout once by resolution ID | 0 venue calls |
+| 21 | Reservation-release transaction rolled back | Reservation remains conservatively held; reconciliation posts one balanced release journal | 0 |
+| 22 | Reconciliation repair transaction rolled back | Original projection remains; next check recomputes and applies one audited repair | 0 |
+| 23 | All economics committed, bus notification missing | Database/API state is correct; increment/retain notification failure telemetry; no economic retry | unchanged |
+
+Every result transaction must prove atomicity by querying from a second connection after injected failure. “Process starts” alone is insufficient.
 
 ### 24.21 Outbox concurrency tests
 
+- one parallel decision persists exactly one `pair_action_intents` parent, one CLOB `order_intents` row, two `orders`, and two child effects with ordinals `0/1`;
+- the two parallel child effects can be claimed/resulted independently without violating action uniqueness;
+- duplicate `(action_intent_id, effect_ordinal)` is rejected;
+- virtual merge persists one pair action with `order_intent_id = null`, zero orders, and one settlement effect at ordinal `0`;
 - two dispatchers race to claim one effect; exactly one wins;
-- expired claim becomes unknown/reconciled, not blindly retried;
+- expired claim first observes the durable paper-operation store; absent operations may execute once under the exact same key/hash and current legality, while durable unknown operations are never retried;
 - repeated polling after success has no adapter call;
 - effect request hash is immutable;
 - result evidence links to correct effect/group;
@@ -5045,7 +5441,7 @@ Expected restart behavior must be explicitly asserted for each boundary; “proc
 - complete envelope applied atomically;
 - reconnect invalidation reproduced;
 - activation uses the latest valid state causally available at actual dispatch, with no later event;
-- missing future capture causes no execution;
+- missing valid as-of capture at actual dispatch causes no execution; absence of a post-due update alone does not;
 - both serial orderings produce separately reproducible outputs;
 - fault fixture results are deterministic; and
 - report denominators equal underlying query counts.
@@ -5078,6 +5474,7 @@ Expected restart behavior must be explicitly asserted for each boundary; “proc
 - engine halt propagates exact semantics;
 - pair observer exception is isolated;
 - pair ledger mismatch disables scheduling; and
+- directional `/api/arm`/`/api/disarm` or `LiveController` state changes never enable pair effects; armed/live global state forces pair observer-only behavior; and
 - all existing directional tests pass unchanged.
 
 ### 24.26 API tests
@@ -5121,6 +5518,8 @@ Add a dependency/static audit that fails if the pair package or its engine compo
 - environment variables matching private key/seed phrases; or
 - a public type/config enum containing pair mode `live`.
 
+The audit must explicitly reject imports/references to `apps/engine/src/live.ts`, `packages/polymarket/src/live.ts`, `LiveController`, `LiveClobAdapter`, `@polymarket/clob-client`, `viem`, `LIVE_TRADING_ENABLED`, and `HOT_WALLET_PRIVATE_KEY` from pair package/composition files. The dependencies may exist elsewhere in the repository; the assertion is reachability from pair code, not global absence.
+
 Also assert logs and API fixtures contain no secrets from unrelated environment configuration.
 
 ### 24.29 Performance and soak tests
@@ -5138,12 +5537,15 @@ Performance failure must reduce/disable scheduling, never remove correctness che
 
 ### 24.30 Regression commands
 
-Use repository-native scripts discovered from `package.json`. At minimum the final implementation must pass the equivalents of:
+At the reconciled revision, run these exact repository scripts:
 
 ```text
+pnpm lint
 pnpm test
 pnpm typecheck
+pnpm db:migrate
 pnpm build
+pnpm test:e2e
 ```
 
 Also run migration/integration, replay determinism, API, UI/E2E, and capability-audit targets added by this work. Record exact commands and results in the final Fable handoff.
@@ -5307,7 +5709,7 @@ Also run migration/integration, replay determinism, API, UI/E2E, and capability-
 - Persist-before-effect test passes.
 - Both-fill, both-reject, residual, unknown, recovery, merge, resolution, halt, and restart cases pass.
 - Paper scheduling cannot occur unless explicitly configured and reconciled.
-- Live remains structurally absent.
+- Pair-live remains structurally absent and isolated from the existing directional live path.
 
 ### 25.8 Phase 6 — engine integration and read models
 
@@ -5461,8 +5863,8 @@ The following tasks are independently verifiable but must respect their dependen
 
 - **Depends on:** `BPAIR-020`.
 - **Files:** discovery/refresh pipeline, DB stores/tests.
-- **Action:** insert snapshots on canonical hash change and expose immutable current references.
-- **Acceptance:** refresh updates fee/tick/minimum/accepting fields; missing/stale snapshots fail closed.
+- **Action:** implement the exact-string `PairTokenTermsProvider`, versioned fee-convention resolver, token-aware snapshot extensions, and insert immutable UP/DOWN snapshots on canonical hash change.
+- **Acceptance:** refresh independently updates each token's fee/rate/convention/tick/minimum; token IDs and provenance survive round trip; a mismatched, malformed, unknown-convention, missing, or stale snapshot fails paper scheduling closed.
 
 ### 26.3 Schema tasks
 
@@ -5653,8 +6055,8 @@ The following tasks are independently verifiable but must respect their dependen
 
 - **Depends on:** `BPAIR-033`, `BPAIR-062`.
 - **Files:** `paper-pair-venue.ts`, contract tests.
-- **Action:** exact immutable-book FOK/FAK and scripted outcomes.
-- **Acceptance:** Section 24.13 passes; no existing `PaperExecutor`/network call.
+- **Action:** exact immutable-book FOK/FAK, scripted outcomes, and atomic durable `pair_paper_venue_operations` evidence keyed by client operation ID.
+- **Acceptance:** Section 24.13 and claim/call/result crash tests pass; `observe` survives a new process; no existing `PaperExecutor`/network call.
 
 #### `BPAIR-071` — Activation requote
 
@@ -5818,7 +6220,7 @@ The following tasks are independently verifiable but must respect their dependen
 - [ ] `@b5p/pair-execution` exists as a deep package with narrow public facade.
 - [ ] Existing directional executor/accounting/FSM remain semantically separate.
 - [ ] Pair mode type cannot represent live.
-- [ ] No signer, authenticated order client, wallet, allowance, or real CTF mutation path was added.
+- [ ] No signer, authenticated order client, wallet, allowance, or real CTF mutation path was added to/referenced by the pair subsystem; capability audit proves isolation from existing directional live files/dependencies.
 - [ ] Dependency/capability audit passes.
 
 ### 27.2 Economic correctness
@@ -5894,3 +6296,466 @@ The following tasks are independently verifiable but must respect their dependen
 - [ ] Architecture, limitations, threat model, checklist, and runbooks are updated.
 - [ ] Deviations file contains every material change from this brief.
 - [ ] Final handoff lists exact commands, outputs, migration ID, dataset/report hashes, known limitations, and default capability state.
+
+## 28. Explicit future-live boundary
+
+The local repository already contains a separately armed directional live path at the reconciled revision. This section governs only a hypothetical future **pair-live** capability. Nothing here removes, modifies, endorses, or reuses the current directional path.
+
+### 28.1 This brief grants no live authority
+
+Nothing in a pair observer result, pair paper report, promotion verdict, port name, existing directional arm state, or future-facing interface authorizes:
+
+- authenticated CLOB order submission;
+- a private key or wallet;
+- real USDC/token balance mutation;
+- allowance approval;
+- CTF split/merge/redeem transactions;
+- gas expenditure;
+- automatic real recovery; or
+- a dashboard execution control.
+
+The paper adapter is durable because correctness benefits from real failure semantics, not because it is a drop-in live adapter.
+
+### 28.2 A future RFC would need all of these independently
+
+Before a separate live RFC could even propose implementation:
+
+1. **Data integrity:** official sequencing or verified exchange-hash continuity for both token books; observer-only unsequenced data is insufficient.
+2. **Current official order semantics:** authoritative documentation/tests for FOK, amount units, limit/tick/minimum, fees, client IDs, status lookup, cancellation, and failure responses.
+3. **Authenticated user event stream:** reconnectable, deduplicated order/trade/fill evidence with stable IDs and status reconciliation.
+4. **Account observation:** exact USDC, both conditional token balances, open orders, allowance state, and attribution deltas before/after every action.
+5. **External idempotency:** proven client-order-key behavior across timeouts/restarts; the paper-only “absent durable operation means safe to execute” rule cannot be reused.
+6. **Unknown-result protocol:** status lookup and manual escalation that never blind-retries.
+7. **CTF semantics:** verified condition/index-set/collateral data, split/merge/redeem math, approvals, gas, receipt confirmation, reorg handling, and duplicate transaction protection.
+8. **Wallet/key security:** threat model, secret provider, key rotation/revocation, least privilege, redaction, dependency audit, workstation/server boundary, and incident response.
+9. **Risk authority:** real reconciled bankroll, global open-order/inventory caps, much lower initial limits, day/session stops, and independent kill path.
+10. **Operational readiness:** alerting, runbooks, on-call ownership, audit retention, database backups, disaster recovery, and reconciliation drills.
+11. **Legal/platform review:** current jurisdiction, market/platform terms, regulatory and tax obligations; this is outside this engineering brief but cannot be assumed.
+12. **Evidence:** extended shadow/live-read-only validation with zero unresolved reconciliation mismatches and externally reviewed statistics.
+
+### 28.3 Required new source changes
+
+A future RFC must add new source-level types/adapters deliberately. It cannot merely change config:
+
+```text
+PairRunMode currently: "observe" | "paper"
+future source review:  may propose a new type/version; never reuse v0 silently
+```
+
+It must also add a new threat-model section, migration if account evidence is persisted, API/UI capability model, capability audit updates, and a separately reviewed composition root. No dormant placeholder accepting credentials should be added now.
+
+### 28.4 Atomicity remains impossible
+
+Even with live infrastructure, two CLOB orders and an on-chain merge are not one atomic transaction. The future system must retain:
+
+- independent leg evidence;
+- outcome-unknown states;
+- residual inventory;
+- reconciliation;
+- bounded recovery;
+- settlement confirmation; and
+- halt behavior that preserves late fills.
+
+The deep aggregate is therefore the correct thing to borrow now; upstream parallel promises are not a substitute for atomicity.
+
+## 29. Exact golden vectors
+
+These vectors use the existing local crypto-fee fixture:
+
+```text
+ratePpm = 70_000        // 7%
+fee formula = ceil(shares6 * ratePpm * p6 * (1_000_000 - p6) / 10^18)
+collection = USDC unless explicitly marked shares
+operational haircut = 10_000 micro-USDC where shown
+```
+
+They are test fixtures, not a claim that the live-discovered fee rate will always be 7%. Runtime uses the persisted token-specific fee snapshot.
+
+### 29.1 Gross-positive display, fee-negative execution
+
+Input:
+
+```text
+pair quantity = 5.000000 shares = 5_000_000
+UP ask = 0.470000
+DOWN ask = 0.500000
+```
+
+UP:
+
+```text
+principal = 5_000_000 * 470_000 / 1_000_000 = 2_350_000
+fee      = 87_185
+all-in   = 2_437_185
+```
+
+DOWN:
+
+```text
+principal = 2_500_000
+fee      = 87_500
+all-in   = 2_587_500
+```
+
+Pair:
+
+```text
+display ask sum             = 0.970000
+gross pre-fee edge          = 150_000
+all-in cash cost            = 5_024_685
+matched terminal payout     = 5_000_000
+net pre-haircut P&L         = -24_685
+net with 10_000 haircut     = -34_685
+decision                    = reject
+```
+
+This is the canonical proof that `ask sum < 1` is not sufficient.
+
+### 29.2 Positive base and one-tick stress, negative two-tick stress
+
+Input:
+
+```text
+quantity = 5_000_000
+UP ask = 460_000
+DOWN ask = 480_000
+tick = 10_000 on each token for this fixture
+```
+
+Base:
+
+```text
+UP principal/fee   = 2_300_000 / 86_940
+DOWN principal/fee = 2_400_000 / 87_360
+total cash cost    = 4_874_300
+payout             = 5_000_000
+cash P&L           = 125_700
+approval P&L after 10_000 haircut = 115_700
+```
+
+One tick worse (`470_000`, `490_000`):
+
+```text
+principals = 2_350_000 + 2_450_000 = 4_800_000
+fees       = 87_185 + 87_465 = 174_650
+cash P&L   = 25_350
+after haircut = 15_350
+```
+
+Two ticks worse (`480_000`, `500_000`):
+
+```text
+principals = 4_900_000
+fees       = 87_360 + 87_500 = 174_860
+cash P&L   = -74_860
+after haircut = -84_860
+```
+
+With defaults (`require one tick = true`, `require two ticks = false`) the base can pass subject to all other gates, while the stored two-tick scenario is negative and visible. Enabling the two-tick hard gate rejects it.
+
+### 29.3 Multi-level exact walk
+
+Input quantity: `3_000_000`.
+
+UP asks:
+
+| Quantity | Price | Principal | Fee | All-in |
+|---:|---:|---:|---:|---:|
+| `1_000_000` | `450_000` | `450_000` | `17_325` | `467_325` |
+| `2_000_000` | `460_000` | `920_000` | `34_776` | `954_776` |
+
+```text
+UP total = 1_422_101
+```
+
+DOWN asks:
+
+| Quantity | Price | Principal | Fee | All-in |
+|---:|---:|---:|---:|---:|
+| `1_500_000` | `490_000` | `735_000` | `26_240` | `761_240` |
+| `1_500_000` | `500_000` | `750_000` | `26_250` | `776_250` |
+
+```text
+DOWN total            = 1_537_490
+pair cash cost        = 2_959_591
+payout                = 3_000_000
+cash P&L              = 40_409
+after 10_000 haircut  = 30_409
+```
+
+The fee is calculated and rounded per canonical consumed price level; calculating from rounded VWAP is not accepted.
+
+### 29.4 Share-collected equal-gross observation
+
+Input:
+
+```text
+gross quantity each = 5_000_000
+UP price = 470_000
+DOWN price = 500_000
+rate = 70_000 ppm
+```
+
+Share fees:
+
+```text
+UP fee shares   = 185_500
+UP net shares   = 4_814_500
+DOWN fee shares = 175_000
+DOWN net shares = 4_825_000
+matched shares  = 4_814_500
+residual        = 10_500 DOWN
+```
+
+Cash principals and conservative deterministic payout:
+
+```text
+cash principal cost = 2_350_000 + 2_500_000 = 4_850_000
+matched payout      = 4_814_500
+matched-only P&L    = -35_500
+```
+
+The observer persists the exact residual. V0 paper scheduling returns `UNSUPPORTED_PAPER_FEE_COLLECTION`; it does not pretend gross equality means matched net inventory.
+
+### 29.5 Recovery sell through bids
+
+Residual acquisition:
+
+```text
+2_000_000 UP bought at 470_000
+principal basis = 940_000
+buy cash fee    = 34_874
+```
+
+Recovery bids:
+
+| Quantity | Bid | Gross proceeds | Sell fee |
+|---:|---:|---:|---:|
+| `1_250_000` | `400_000` | `500_000` | `21_000` |
+| `750_000` | `390_000` | `292_500` | `12_490` |
+
+```text
+gross proceeds        = 792_500
+sell fees             = 33_490
+net proceeds          = 759_010
+analytic recovery P&L = 759_010 - 940_000 - 34_874
+                      = -215_864
+hold worst-case loss  = -974_874
+```
+
+The sale locks a loss but reduces worst-case loss. It uses bids; substituting asks would make the fixture fail.
+
+### 29.6 Micro-unit rounding
+
+Input:
+
+```text
+quantity = 1 micro-share
+price = 333_333
+rate = 70_000 ppm
+```
+
+```text
+buy principal ceil = 1 micro-USDC
+USDC fee ceil      = 1 micro-USDC
+total debit        = 2 micro-USDC
+share fee ceil     = 1 micro-share under the alternative convention
+```
+
+No result may round these nonzero liabilities down to zero.
+
+### 29.7 Cash-cap and lot boundary
+
+Zero-fee fixture for clarity:
+
+```text
+cash cap = 20_000_000
+UP ask = 400_000
+DOWN ask = 500_000
+pair lot = 10_000 shares6 = 0.01 share
+```
+
+At `22_220_000` shares6:
+
+```text
+UP cost   = 8_888_000
+DOWN cost = 11_110_000
+total     = 19_998_000 <= cap
+```
+
+At `22_230_000` shares6:
+
+```text
+UP cost   = 8_892_000
+DOWN cost = 11_115_000
+total     = 20_007_000 > cap
+```
+
+Selected cap-boundary quantity is `22_220_000`, assuming depth/minimum/other gates pass.
+
+### 29.8 Balanced journal and terminal P&L
+
+Use vector 29.2 and a `1_000_000_000` starting pair-account balance.
+
+Funding journal:
+
+```text
+ASSET_CASH_AVAILABLE  +1_000_000_000
+EQUITY_CAPITAL_SOURCE -1_000_000_000
+```
+
+Reserve `4_874_300`:
+
+```text
+ASSET_CASH_AVAILABLE -4_874_300
+ASSET_CASH_RESERVED  +4_874_300
+```
+
+UP BUY journal USDC lines:
+
+```text
+ASSET_CASH_RESERVED        -2_386_940
+ASSET_INVENTORY_COST_UP    +2_300_000
+EXPENSE_TRADING_FEE        +86_940
+sum = 0
+```
+
+DOWN BUY journal USDC lines:
+
+```text
+ASSET_CASH_RESERVED        -2_487_360
+ASSET_INVENTORY_COST_DOWN  +2_400_000
+EXPENSE_TRADING_FEE        +87_360
+sum = 0
+```
+
+Each token journal separately posts `+5_000_000 ASSET_TOKEN_INVENTORY` and `-5_000_000 CLEARING_TOKEN_ACQUISITION`.
+
+At resolution, either outcome pays `5_000_000`. USDC lines:
+
+```text
+ASSET_CASH_AVAILABLE         +5_000_000
+REVENUE_RESOLUTION           -5_000_000
+ASSET_INVENTORY_COST_UP      -2_300_000
+ASSET_INVENTORY_COST_DOWN    -2_400_000
+EXPENSE_REALIZED_COST_BASIS  +4_700_000
+```
+
+P&L:
+
+```text
+realized revenue = 5_000_000
+realized expense = 4_700_000 + 86_940 + 87_360 = 4_874_300
+realized P&L     = 125_700
+ending available cash = 1_000_125_700
+```
+
+The `10_000` operational approval haircut was never posted to the ledger.
+
+### 29.9 Serial complement that locks a small loss
+
+First UP fill:
+
+```text
+q = 5_000_000
+price = 470_000
+principal + fee = 2_350_000 + 87_185 = 2_437_185
+current one-leg worst loss = 2_437_185
+```
+
+At second-leg dispatch, DOWN asks moved to `520_000`:
+
+```text
+DOWN principal = 2_600_000
+DOWN fee       = 87_360
+completed total debit = 5_124_545
+matched payout        = 5_000_000
+locked completion loss= 124_545
+```
+
+The original positive-entry edge has disappeared, but completing reduces worst loss from `2_437_185` to `124_545`. The serial complement may proceed only if `124_545 <= maximumLockedLossAfterCompletion6`, remaining cash/reservation suffices, integrity/terms are valid, deadline remains, and the group is not halted. This is not a new arbitrage entry decision.
+
+## 30. Final Fable handoff artifact
+
+When implementation is complete, Fable must create `docs/research/pair-implementation-handoff.md` with this structure:
+
+```markdown
+# Pair implementation handoff
+
+## Capability state
+- observer enabled:
+- runtime paper scheduling enabled:
+- live execution available: false
+- recovery policy/default:
+- settlement policy/default:
+
+## Source and implementation versions
+- local starting commit:
+- final commit/worktree:
+- upstream provenance revision:
+- strategy/policy/schema versions:
+- migration ID:
+
+## File manifest
+- added:
+- modified:
+- explicitly untouched directional/live paths:
+
+## Architecture deviations
+- deviation ID:
+- reason:
+- invariant preserved:
+- tests:
+
+## Verification commands and exact results
+- install/build:
+- unit/property:
+- PGlite:
+- PostgreSQL:
+- replay determinism:
+- API/UI/E2E:
+- capability audit:
+- performance/soak:
+
+## Migration evidence
+- empty database:
+- populated upgrade:
+- schema/constraint/index verification:
+
+## Research evidence
+- dataset/run ID and hashes:
+- markets/days/episodes:
+- funnel:
+- latency/dispatch/depth results:
+- residual/reconciliation results:
+- report artifact paths/hashes:
+- promotion verdict:
+
+## Known limitations
+- data continuity:
+- fee/market scope:
+- sample size:
+- operational constraints:
+
+## Definition-of-done audit
+- every Section 27 checkbox copied with evidence link
+```
+
+Do not mark a criterion complete with “implemented” alone. Link it to code, test, migration, query, screenshot/artifact, or command result.
+
+## 31. Final borrow recommendation
+
+The maximum responsible borrow from [`MrFadiAi/Polymarket-bot`](https://github.com/MrFadiAi/Polymarket-bot/tree/82647014e0c355a5684e09666d8a0a522234640d) is architectural, not algorithmic:
+
+> Borrow the idea that two related legs are one durable lifecycle with independent outcomes, residual inventory, reconciliation, and eventual complete-set settlement. Rebuild the economics, sizing, data integrity, risk, accounting, persistence, and tests locally. Reject its mirrored-price shortcut, fee-free threshold, estimated-profit accounting, dynamic sizing, and live credential/CTF path.
+
+The expected near-term product is therefore:
+
+1. an always-safe observer that likely proves opportunities are extremely rare;
+2. a causal replay framework that measures whether they survive actual latency and both leg orderings;
+3. a separately disabled, exact, restart-safe counterfactual paper coordinator; and
+4. a read-only operator/research surface that makes every residual and reconciliation fact visible.
+
+If the observer produces no meaningful candidates, keep the capture/replay improvements and do not promote the executor. Those improvements are useful independently: they close existing data-lineage gaps, improve deterministic research, and strengthen the codebase without pretending the upstream edge transfers.
+
+Fable should implement through the observer, durable paper-disabled coordinator, replay/report, and read-only dashboard phases described here. It should stop at the pair source-level no-live boundary and remain isolated from the repository's separately armed directional live path.
