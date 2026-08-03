@@ -26,9 +26,9 @@ import {
 import {
   BookState, MODELS, STRATEGY_PRESETS, TickBuffer, computeFeatures, computeIndicators,
   configureCalibratedModel, presetAllowsMode,
-  type Candle, type FeatureSet, type PresetContext, type StrategyDecision,
+  type Candle, type CandleSource, type FeatureSet, type PresetContext, type StrategyDecision,
 } from "@b5p/strategy";
-import { eq } from "drizzle-orm";
+import { eq, gte } from "drizzle-orm";
 import { Accounting } from "./accounting";
 import { CHANNELS, type Bus } from "./bus";
 import { LiveController, minArmUsdc, type ArmRequest } from "./live";
@@ -77,7 +77,9 @@ export class Engine {
   cfg: AppConfig = DEFAULT_CONFIG;
   configVersion = 0;
   private lastCockpitPublish = 0;
-  private usedIdempotencyKeys = new Set<string>();
+  /** idempotency key -> createdAtMs, pruned after 24h (matching the restart-reload window). */
+  private usedIdempotencyKeys = new Map<string, number>();
+  private lastPruneMs = 0;
   private tickPersistQueue: ReferenceTick[] = [];
   private lastFeaturePersistMs = 0;
   private lastLiveRefreshMs = 0;
@@ -169,6 +171,12 @@ export class Engine {
     const orphans = await this.paper.reconcileOrphans(nowMs);
     if (orphans > 0) await this.health("warning", "reconcile", `${orphans} orphaned resting order(s) canceled on restart`);
     await this.accounting.reconcile(this.cfg, nowMs);
+    // Reload recent idempotency keys so the duplicate-order gate survives the
+    // restart scenarios it exists for (keys are content-derived and also
+    // unique-constrained on order_intents as a fail-closed backstop).
+    const recentIntents = await this.db.db.select({ key: orderIntents.idempotencyKey, createdAtMs: orderIntents.createdAtMs })
+      .from(orderIntents).where(gte(orderIntents.createdAtMs, nowMs - 24 * 3_600_000));
+    for (const r of recentIntents) this.usedIdempotencyKeys.set(r.key, r.createdAtMs);
     const target: EngineState = this.mode === "observe" ? "READ_ONLY" : this.mode === "paper" ? "PAPER" : "SHADOW";
     this.transitionEngine(target, "startup complete");
     await this.audit("engine", "start", { mode: this.mode, engineVersion: ENGINE_VERSION });
@@ -460,6 +468,7 @@ export class Engine {
       await this.maintainRestingOrders(active, nowMs);
     }
     await this.resolveDue(nowMs);
+    this.pruneExpired(nowMs);
     await this.publishCockpit(nowMs);
     // Execution-quality bookkeeping: strictly after the trading hot path.
     // The drain is awaited HERE (end of step, all trading actions done) rather
@@ -468,6 +477,38 @@ export class Engine {
     this.markouts.sample(nowMs);
     this.counterfactuals.expire(nowMs);
     await this.execTimeline.settle();
+  }
+
+  /**
+   * Bounded memory on 24/7 runs: market runtimes, book states, terminal paper
+   * orders and idempotency keys are all persisted in the DB — the in-memory
+   * copies exist only for the hot path and must not grow for the life of the
+   * process (a new market arrives every 5 minutes, forever).
+   *
+   * Settled markets linger 15 minutes past close (continuity cross-checks and
+   * late official-outcome refresh both look at most 3 windows back); markets
+   * that never became resolvable are abandoned after an hour instead of being
+   * rescanned by resolveDue every 500ms step forever.
+   */
+  private pruneExpired(nowMs: number): void {
+    if (nowMs - this.lastPruneMs < 60_000) return;
+    this.lastPruneMs = nowMs;
+    const nowSec = nowMs / 1000;
+    for (const [id, rt] of this.markets) {
+      const ageSec = nowSec - rt.ref.endEpoch;
+      const settled = rt.localOutcome !== null || rt.officialOutcome !== null;
+      if ((settled && ageSec > 15 * 60) || ageSec > 60 * 60) {
+        for (const intentId of this.marketIntents.get(id) ?? []) this.intentMeta.delete(intentId);
+        this.marketIntents.delete(id);
+        this.books.delete(rt.ref.upTokenId);
+        this.books.delete(rt.ref.downTokenId);
+        this.paper.pruneMarket(id);
+        this.markets.delete(id);
+      }
+    }
+    for (const [key, createdAtMs] of this.usedIdempotencyKeys) {
+      if (nowMs - createdAtMs > 24 * 3_600_000) this.usedIdempotencyKeys.delete(key);
+    }
   }
 
   activeMarket(nowMs: number): MarketRuntime | null {
@@ -555,12 +596,14 @@ export class Engine {
     // the resolution feed anyway, so momentum computed from it is more faithful.
     // Volume-surge degrades to null under synthesis; the composite handles that.)
     const klinesFresh = this.candlesUpdatedAtMs > 0 && nowMs - this.candlesUpdatedAtMs < 20_000;
-    const candles1s = klinesFresh && this.candles.length > 0
-      ? this.candles
-      : synthCandlesFromTicks(this.chainlink, nowMs);
-    const momentumTicks = klinesFresh ? this.binance : this.chainlink;
+    // Provenance is recorded on the indicator block and decision snapshot:
+    // Chainlink-synthesized candles must never be mistaken for Binance klines
+    // in the audit record (on US hosts the fallback is the common case).
+    const candleSource: CandleSource = klinesFresh && this.candles.length > 0 ? "BINANCE_KLINES" : "CHAINLINK_SYNTHETIC";
+    const candles1s = candleSource === "BINANCE_KLINES" ? this.candles : synthCandlesFromTicks(this.chainlink, nowMs);
+    const momentumTicks = candleSource === "BINANCE_KLINES" ? this.binance : this.chainlink;
     const indicators = candles1s.length > 30
-      ? computeIndicators({ nowMs, windowStartEpochSec: rt.ref.startEpoch, candles1s, binanceTicks: momentumTicks })
+      ? computeIndicators({ nowMs, windowStartEpochSec: rt.ref.startEpoch, candles1s, binanceTicks: momentumTicks, candleSource })
       : null;
     const f = computeFeatures({
       nowMs,
@@ -573,6 +616,7 @@ export class Engine {
       warmupSeconds: this.cfg.feeds.warmup_seconds,
       chainlinkMaxAgeMs: this.cfg.feeds.chainlink.max_age_ms,
       bookMaxAgeMs: this.cfg.feeds.clob.max_book_age_ms,
+      binanceMaxAgeMs: this.cfg.feeds.binance.max_age_ms,
       indicators,
     });
 
@@ -662,7 +706,10 @@ export class Engine {
     const feeSchedule = { ratePpm: rt.fee?.ratePpm ?? ppm("0.07"), collection: this.cfg.paper.fee_collection_convention };
     const sideBook = side === "UP" ? this.bookFor(rt.ref.upTokenId) : this.bookFor(rt.ref.downTokenId);
     const bookAge = sideBook.ageMs(nowMs);
-    const idemKey = idempotencyKey(decisionId, 1);
+    // Content-derived: a retry or restart re-submitting the same intent (same
+    // market, side, style, price) produces the SAME key, so the duplicate gate
+    // and the unique constraint on order_intents.idempotency_key can fire.
+    const idemKey = idempotencyKey(`${rt.ref.marketId}|${side}|${style}|${price6}`, 1);
 
     const riskCtx: RiskContext = {
       mode: decisionMode,
@@ -703,6 +750,8 @@ export class Engine {
         { approvedForPaper: model.approvedForPaper, approvedForLive: model.approvedForLive },
         this.livePromotion,
       ),
+      calibrationRequired: this.cfg.strategy.calibration_required,
+      modelCalibrated: model.calibrated,
       coolingOffUntilMs: null,
       nowMs,
       idempotencyKeyIsDuplicate: this.usedIdempotencyKeys.has(idemKey),
@@ -828,7 +877,7 @@ export class Engine {
     this.execTimeline.transition(intentId, "RISK_APPROVED", {
       utcMs: nowMs, detail: { stake6: stake6.toString(), shares6: shares6.toString() },
     });
-    this.usedIdempotencyKeys.add(idemKey);
+    this.usedIdempotencyKeys.set(idemKey, nowMs);
     await this.db.db.insert(orderIntents).values({
       id: intentId,
       decisionId,
@@ -1235,10 +1284,17 @@ export class Engine {
   feedHealth(nowMs: number): Record<string, { ageMs: number | null; healthy: boolean }> {
     const cl = this.chainlink.latest();
     const bn = this.binance.latest();
-    const anyBook = [...this.books.values()][0] ?? null;
     const clAge = cl ? nowMs - cl.receivedTsMs : null;
     const bnAge = bn ? nowMs - bn.receivedTsMs : null;
-    const bookAge = anyBook?.ageMs(nowMs) ?? null;
+    // CLOB health is the WORST of the active (or next) market's UP/DOWN books.
+    // Never "the first book ever inserted": that entry goes permanently stale
+    // as soon as the first window rotates and would pin the lamp red forever.
+    const target = this.activeMarket(nowMs) ?? this.nextMarket(nowMs);
+    const bookAges = target
+      ? [this.books.get(target.ref.upTokenId)?.ageMs(nowMs), this.books.get(target.ref.downTokenId)?.ageMs(nowMs)]
+          .filter((a): a is number => a !== null && a !== undefined)
+      : [];
+    const bookAge = bookAges.length > 0 ? Math.max(...bookAges) : null;
     const candleAge = this.candlesUpdatedAtMs === 0 ? null : nowMs - this.candlesUpdatedAtMs;
     return {
       chainlink: { ageMs: clAge, healthy: clAge !== null && clAge <= this.cfg.feeds.chainlink.max_age_ms },
@@ -1282,6 +1338,7 @@ export class Engine {
       live: this.live.status(nowMs),
       bankroll: {
         bankroll6: bank.bankroll,
+        sessionStart6: this.accounting.sessionStartBankroll,
         sessionPeak6: bank.sessionPeak,
         dailyPeak6: bank.dailyPeak,
         consecutiveLosses: bank.consecutiveLosses,
