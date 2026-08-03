@@ -17,10 +17,15 @@ export class BookState {
   constructor(public readonly tokenId: string) {}
 
   applySnapshot(bids: Array<{ price: string; size: string }>, asks: Array<{ price: string; size: string }>, sourceTsMs: number, receivedTsMs: number): void {
+    // Parse EVERYTHING before mutating: a throw on level N must not leave a
+    // half-cleared book behind (the caller drops the bad message and keeps
+    // the previous consistent state).
+    const parsedBids = bids.map((l) => [prob(l.price), parseSize(l.size)] as const);
+    const parsedAsks = asks.map((l) => [prob(l.price), parseSize(l.size)] as const);
     this.bids.clear();
     this.asks.clear();
-    for (const l of bids) this.bids.set(prob(l.price), parseSize(l.size));
-    for (const l of asks) this.asks.set(prob(l.price), parseSize(l.size));
+    for (const [p, s] of parsedBids) this.bids.set(p, s);
+    for (const [p, s] of parsedAsks) this.asks.set(p, s);
     this.sourceTsMs = sourceTsMs;
     this.receivedTsMs = receivedTsMs;
     this.trackFlip();
