@@ -26,6 +26,7 @@ servers are marked with a confidence note.
 | 018 | `mapResponse` classifies "unmatched" CLOB statuses as accepted LIVE orders — phantom positions, trading lockout |
 | 019 | No staleness/pong watchdog in the WS stack — half-open connection starves all feeds until manual restart |
 | 027 | Kill switch/arm/disarm/resume silently dead in split-process mode without REDIS_URL |
+| 048 | `API_PROXY_TARGET` baked at Next build — split-process compose deploy ships a non-functional dashboard |
 
 ## Medium severity
 
@@ -51,6 +52,9 @@ servers are marked with a confidence note.
 | 041 | Crossed book → negative uncertainty, inverted probability bounds, conservative widening lost (reproduced) |
 | 042 | `computeIndicators` has no staleness/gap handling; late-snipe can enter on a 19s-old picture |
 | 043 | `windowDeltaPct` silently rebases to buffer start after mid-window restarts (reproduced) |
+| 049 | Seeded tutorial trade counted as a real paper result in P&L/orders/positions |
+| 050 | Cockpit WebSocket hardcoded to 127.0.0.1 and never reconnects — realtime dead off-localhost |
+| 051 | Risk-page UI + .env.example still claim "no signing path" beside the live-arming card |
 
 ## Low severity
 
@@ -71,6 +75,11 @@ servers are marked with a confidence note.
 | 039 | Non-constant-time comparisons for session HMAC and CSRF token |
 | 040 | Concurrent first-boot migration race in split-process mode |
 | 047 | Unhealthy feed lamps never generate health events |
+| 052 | Missing indexes on hot dashboard queries; unbounded `markets` scan per P&L poll |
+| 053 | engine.test.ts: vacuous fail-closed test; tie-rule test never exercises resolution |
+| 054 | Data pages conflate error/loading with empty — "No orders yet" while the API is down |
+| 055 | Playwright smoke test cannot pass (`getByLabel` has no label association) |
+| 056 | Timing Lab never reloads its table after a refresh completes |
 | 044 | `TickBuffer` never dedups; RTDS backfill collapses `medianGapMs` to 0 (reproduced) |
 | 045 | `aggregateCloses` bucket phase jitter makes EMA/RSI non-reproducible |
 | 046 | Order prices round-trip through floats, contradicting the fixed-point invariant (currently exact) |
