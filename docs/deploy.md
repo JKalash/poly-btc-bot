@@ -17,6 +17,21 @@ except data — the only assets to protect are the dashboard login and the serve
   ufw enable` — and nothing else open. The app binds to 127.0.0.1 only; the dashboard is reached
   through an SSH tunnel, never the public internet.
 
+## Path 0 — Fly.io (chosen path, 2026-08-03)
+
+Single always-on machine in `iad` (Ashburn), embedded mode + PGlite on a Fly volume, NO public
+IP (no `[[services]]` in `fly.toml` — reachable only via `fly proxy`). See `fly.toml` for the
+full first-deploy command sequence. Access:
+
+```bash
+fly proxy 3000:3000 -a b5p-collector &   # web
+fly proxy 8787:8787 -a b5p-collector &   # api + websocket
+open http://localhost:3000
+```
+
+Data lives on the `b5p_data` volume (`/data/pglite`); snapshot it with `fly volumes snapshots`.
+Cost ≈ \–12/month (shared-cpu-2x 2GB + 10GB volume).
+
 ## Path A — Docker (canonical: Postgres + Redis, split processes)
 
 ```bash

@@ -1,0 +1,39 @@
+# Fly.io deployment: single always-on machine in iad (Ashburn, US-East),
+# embedded mode (api+engine in one process, PGlite on the volume) + web.
+#
+# NO public services on purpose: the app has no public IP surface. Access:
+#   fly proxy 3000:3000 & fly proxy 8787:8787   -> http://localhost:3000
+#
+# First deploy (after `fly auth login`):
+#   fly launch --copy-config --no-deploy --name <app>
+#   fly volumes create b5p_data --region iad --size 10
+#   fly secrets set SESSION_SECRET=$(openssl rand -hex 32) OPERATOR_PASSWORD_HASH='<hash>'
+#   fly deploy
+app = "b5p-collector"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  EMBED_ENGINE = "1"
+  PGLITE_DIR = "/data/pglite"
+  # 0.0.0.0 is safe here: the machine has no public IP (no [[services]] defined);
+  # only fly proxy / WireGuard over the private network can reach it.
+  API_HOST = "0.0.0.0"
+  API_PORT = "8787"
+  NODE_ENV = "production"
+
+[processes]
+  app = "node scripts/prod.mjs"
+
+[mounts]
+  source = "b5p_data"
+  destination = "/data"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2048mb"
