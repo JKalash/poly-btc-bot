@@ -47,6 +47,8 @@ function healthyCtx(overrides: Partial<RiskContext> = {}): RiskContext {
     conservativeProbability: prob("0.60"),
     feeSchedule: { ratePpm: ppm("0.07"), collection: "usdc" },
     modelApprovedForMode: true,
+    calibrationRequired: true,
+    modelCalibrated: true,
     strategyValidatedForMode: true,
     coolingOffUntilMs: null,
     nowMs: 1_000_000,
@@ -86,11 +88,14 @@ describe("hard rejection rules — each fires with a human-readable reason", () 
     ["cutoff", { secondsRemaining: 10 }, "PAST_ENTRY_CUTOFF"],
     ["taker not permitted", { style: "taker_fok" }, "TAKER_NOT_PERMITTED"],
     ["no edge", { conservativeProbability: prob("0.55") }, "INSUFFICIENT_EDGE"],
+    ["insufficient EV when the EV knob exceeds the edge knob", { limits: { ...RISK_PROFILES.very_aggressive, minExpectedValuePerCostPpm: ppm("0.20") } }, "INSUFFICIENT_EV"],
     ["spread", { spread: prob("0.05") }, "SPREAD_TOO_WIDE"],
     ["impact", { estimatedImpact: prob("0.01") }, "IMPACT_TOO_HIGH"],
+    ["taker impact unknown fails closed", { style: "taker_fok", takerPermittedByStrategy: true, estimatedImpact: null, conservativeProbability: prob("0.65") }, "IMPACT_UNKNOWN"],
     ["post-only would cross", { price: prob("0.56"), conservativeProbability: prob("0.62") }, "POST_ONLY_WOULD_CROSS"],
     ["data quality", { dataQualityScore: 0.5 }, "DATA_QUALITY_LOW"],
     ["model not approved", { modelApprovedForMode: false }, "MODEL_NOT_APPROVED"],
+    ["uncalibrated model while calibration required", { modelCalibrated: false }, "MODEL_UNCALIBRATED"],
     ["strategy unvalidated", { strategyValidatedForMode: false }, "STRATEGY_UNVALIDATED"],
     ["cooling off", { coolingOffUntilMs: 2_000_000 }, "COOLING_OFF_ACTIVE"],
     ["duplicate idempotency", { idempotencyKeyIsDuplicate: true }, "DUPLICATE_IDEMPOTENCY_KEY"],
@@ -105,6 +110,23 @@ describe("hard rejection rules — each fires with a human-readable reason", () 
       for (const reason of v.reasons) expect(reason.message.length).toBeGreaterThan(10);
     });
   }
+
+  it("maker orders legitimately carry no impact estimate — null impact approves", () => {
+    const v = evaluateOrderRisk(healthyCtx({ estimatedImpact: null }));
+    expect(v.reasons.map((x) => x.code)).not.toContain("IMPACT_UNKNOWN");
+    expect(v.approved).toBe(true);
+  });
+
+  it("uncalibrated model is allowed only when calibration_required is explicitly false", () => {
+    const v = evaluateOrderRisk(healthyCtx({ calibrationRequired: false, modelCalibrated: false }));
+    expect(v.reasons.map((x) => x.code)).not.toContain("MODEL_UNCALIBRATED");
+    expect(v.approved).toBe(true);
+  });
+
+  it("calibration_required holds in live mode too (no arming bypass)", () => {
+    const v = evaluateOrderRisk(healthyCtx({ mode: "live", limits: RISK_PROFILES.very_aggressive, modelCalibrated: false }));
+    expect(v.reasons.map((x) => x.code)).toContain("MODEL_UNCALIBRATED");
+  });
 
   it("live mode is rejected when profile disallows live", () => {
     const v = evaluateOrderRisk(healthyCtx({ mode: "live", limits: RISK_PROFILES.paper_exploration, profileName: "paper_exploration" }));
@@ -125,6 +147,16 @@ describe("sizing and caps", () => {
     const s = computeSizing(healthyCtx({ requestedStakeFractionPpm: ppm("0.19") }));
     expect(s.fractionPpm).toBe(ppm("0.10"));
     expect(s.capResult.binding).toBe("profile_max_per_market");
+    expect(s.stake6).toBe(usdc("100"));
+  });
+
+  it("absolute 10% cap binds inside the evaluator even with unclamped caller limits", () => {
+    const s = computeSizing(healthyCtx({
+      limits: { ...RISK_PROFILES.very_aggressive, maxRiskFractionPpm: ppm("0.50") },
+      requestedStakeFractionPpm: ppm("0.50"),
+    }));
+    expect(s.fractionPpm).toBe(ABSOLUTE_MAX_RISK_PPM);
+    expect(s.capResult.binding).toBe("absolute_max");
     expect(s.stake6).toBe(usdc("100"));
   });
 
@@ -183,6 +215,24 @@ describe("profiles", () => {
 
   it("paper exploration never allows live", () => {
     expect(RISK_PROFILES.paper_exploration.liveAllowed).toBe(false);
+  });
+
+  it("built-in profiles are frozen against mutation", () => {
+    expect(Object.isFrozen(RISK_PROFILES)).toBe(true);
+    for (const p of Object.values(RISK_PROFILES)) expect(Object.isFrozen(p)).toBe(true);
+    expect(() => { (RISK_PROFILES.very_aggressive as { maxRiskFractionPpm: bigint }).maxRiskFractionPpm = ppm("0.50"); }).toThrow();
+    expect(RISK_PROFILES.very_aggressive.maxRiskFractionPpm).toBe(ppm("0.10"));
+  });
+
+  it("custom loss stops clamp to the most aggressive built-in profile", () => {
+    const { limits, clamped } = clampCustomProfile({
+      ...RISK_PROFILES.very_aggressive,
+      sessionLossLimitPpm: ppm("1.0"),
+      dailyLossLimitPpm: ppm("1.0"),
+    });
+    expect(clamped).toBe(true);
+    expect(limits.sessionLossLimitPpm).toBe(RISK_PROFILES.very_aggressive.sessionLossLimitPpm);
+    expect(limits.dailyLossLimitPpm).toBe(RISK_PROFILES.very_aggressive.dailyLossLimitPpm);
   });
 
   it("spec profile numbers", () => {

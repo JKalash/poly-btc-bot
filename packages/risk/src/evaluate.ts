@@ -4,6 +4,7 @@ import {
   type BankrollState, type CapResult, type ExecutionStyle, type FeeSchedule,
   type Mode, type Ppm, type Prob6, type RiskLimits, type Usdc6,
 } from "@b5p/domain";
+import { ABSOLUTE_MAX_RISK_PPM } from "./profiles";
 
 /**
  * Pure, deterministic risk evaluation. Receives the complete decision context,
@@ -29,11 +30,14 @@ export type RejectionCode =
   | "PRICE_ABOVE_CEILING"
   | "PAST_ENTRY_CUTOFF"
   | "INSUFFICIENT_EDGE"
+  | "INSUFFICIENT_EV"
   | "SPREAD_TOO_WIDE"
   | "IMPACT_TOO_HIGH"
+  | "IMPACT_UNKNOWN"
   | "POST_ONLY_WOULD_CROSS"
   | "DATA_QUALITY_LOW"
   | "MODEL_NOT_APPROVED"
+  | "MODEL_UNCALIBRATED"
   | "STRATEGY_UNVALIDATED"
   | "COOLING_OFF_ACTIVE"
   | "DUPLICATE_IDEMPOTENCY_KEY"
@@ -83,6 +87,9 @@ export interface RiskContext {
 
   // model/strategy governance
   modelApprovedForMode: boolean;
+  /** Config policy `strategy.calibration_required`: when true, uncalibrated models may not drive trades in ANY mode. */
+  calibrationRequired: boolean;
+  modelCalibrated: boolean;
   strategyValidatedForMode: boolean;
   coolingOffUntilMs: number | null;
   nowMs: number;
@@ -135,6 +142,9 @@ export function computeSizing(ctx: RiskContext): SizingResult {
     { name: "session_remaining_budget", capPpm: toFraction(sessionBudget6) },
     { name: "daily_remaining_budget", capPpm: toFraction(dailyBudget6) },
     { name: "available_balance", capPpm: toFraction(bankroll.bankroll - bankroll.openExposure) },
+    // Defense-in-depth: the absolute 10% cap is an evaluator invariant, not a
+    // caller convention — it binds even if a caller passes unclamped limits.
+    { name: "absolute_max", capPpm: ABSOLUTE_MAX_RISK_PPM },
   ]);
 
   return {
@@ -218,8 +228,26 @@ export function evaluateOrderRisk(ctx: RiskContext): RiskVerdict {
       `No verified edge: conservative probability does not exceed effective break-even (${fmtP(be)}) plus minimum edge.`));
   }
 
+  // EV-per-cost gate: distinct from the edge gate only in threshold; enforced
+  // so the documented `min_expected_value_per_cost` knob is never a no-op.
+  const evOk =
+    ctx.style === "maker_post_only"
+      ? makerEdgeSatisfied(ctx.conservativeProbability, ctx.price, L.minExpectedValuePerCostPpm)
+      : takerEdgeSatisfied(ctx.conservativeProbability, ctx.price, ctx.feeSchedule, L.minExpectedValuePerCostPpm);
+  if (!evOk) {
+    reasons.push(r("INSUFFICIENT_EV",
+      `Expected value per cost is below the configured minimum (${fmtP(L.minExpectedValuePerCostPpm)}).`));
+  }
+
   if (ctx.spread === null || ctx.spread > L.maxSpread) {
     reasons.push(r("SPREAD_TOO_WIDE", `Spread ${ctx.spread === null ? "unknown" : fmtP(ctx.spread)} exceeds tolerance ${fmtP(L.maxSpread)}.`));
+  }
+  // Impact fails CLOSED for taker styles: the estimator returns null exactly
+  // when the visible book cannot fill the requested size — the worst-impact
+  // case. Maker post-only orders legitimately carry no impact estimate.
+  if (ctx.style !== "maker_post_only" && ctx.estimatedImpact === null) {
+    reasons.push(r("IMPACT_UNKNOWN",
+      "Taker price impact could not be estimated (displayed book cannot fill the requested size); failing closed."));
   }
   if (ctx.estimatedImpact !== null && ctx.estimatedImpact > L.maxPriceImpact) {
     reasons.push(r("IMPACT_TOO_HIGH", `Estimated impact ${fmtP(ctx.estimatedImpact)} exceeds tolerance ${fmtP(L.maxPriceImpact)}.`));
@@ -232,6 +260,10 @@ export function evaluateOrderRisk(ctx: RiskContext): RiskVerdict {
   }
   if (!ctx.modelApprovedForMode) {
     reasons.push(r("MODEL_NOT_APPROVED", `Model version is not approved for ${ctx.mode} use.`));
+  }
+  if (ctx.calibrationRequired && !ctx.modelCalibrated) {
+    reasons.push(r("MODEL_UNCALIBRATED",
+      "strategy.calibration_required is set and the selected model has no calibration artifact. Set calibration_required: false to explicitly accept an uncalibrated model."));
   }
   if (!ctx.strategyValidatedForMode) {
     reasons.push(r("STRATEGY_UNVALIDATED", `Strategy lacks required validation for ${ctx.mode} (walk-forward / shadow requirements).`));
