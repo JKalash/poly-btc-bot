@@ -91,3 +91,6 @@ verify your jurisdiction before funding anything.
 - `docs/threat-model.md`
 - `docs/live-trading-checklist.md`
 - `docs/limitations.md` — explicit list of what is stubbed or partial
+- `docs/research/reddit-5min-bot-ecosystem.md` — dossier on the r/algotrading 5-min bot ecosystem:
+  three independent builders replicating this repo's null result, plus free order-book datasets
+  (~26.8M ticks CC0; 727M rows Apache-2.0) usable for our calibration studies
