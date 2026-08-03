@@ -2,8 +2,12 @@
 
 ## Not implemented (stubs / documented seams)
 
-- **Live trading** — entire path absent by design. `DisabledLiveAdapter` refuses everything.
-  LIVE_* engine states exist in the FSM but are unreachable.
+- **Live trading** — a real signing path EXISTS (`LiveClobAdapter` +
+  `LiveController`), disarmed by default and gated by env config plus a typed operator
+  acknowledgement with a bounded TTL (`docs/live-trading.md`). `DisabledLiveAdapter` is a legacy
+  always-refusing stub, not the live path. Known live-path gaps: resting-order fills are polled
+  rather than streamed from the user WS channel, and live positions settle through a dedicated
+  live ledger separate from paper accounting.
 - **Shadow wallet reads** — shadow mode produces would-submit intents and snapshots, but reads no
   real wallet balances (requires authenticated CLOB API; deferred with the live adapter).
 - **Backtest/replay UI** — `backtest_runs` table and recorded tick/book/trade data exist and the

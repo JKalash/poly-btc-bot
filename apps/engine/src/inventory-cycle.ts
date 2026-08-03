@@ -597,6 +597,7 @@ export class PairedCycleSimulator {
       if (c.row.state === "MERGE_OR_SETTLE") {
         if (c.wantsMerge) {
           this.trySubmitMerge(c, nowMs, true);
+          // trySubmitMerge mutates row.state; re-read past TS's narrowing
           if ((c.row.state as PairedCycleState) === "MERGE_PENDING") this.completeMerge(c, nowMs);
         } else {
           this.settleAtResolution(c, outcome, nowMs);
@@ -617,6 +618,7 @@ export class PairedCycleSimulator {
     const leg = c.legs[legIndex];
     if (leg.state !== "QUOTED") return false;
     this.makerFill(c, legIndex, nowMs);
+    // makerFill mutates row.state; re-read past TS's narrowing
     if ((c.row.state as PairedCycleState) === "BOTH_LEGS_FILLED") this.windDown(c, nowMs);
     return true;
   }

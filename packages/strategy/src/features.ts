@@ -56,6 +56,7 @@ export interface FeatureSet {
   downBestBid: number | null;
   downBestAsk: number | null;
   bookAgeMs: number | null;
+  downBookAgeMs: number | null;
   complementInconsistency: number | null;
   upQuoteFlips: number;
   lastTradePriceUp: number | null;
@@ -78,6 +79,7 @@ export interface FeatureInputs {
   warmupSeconds: number;
   chainlinkMaxAgeMs: number;
   bookMaxAgeMs: number;
+  binanceMaxAgeMs?: number;
   indicators?: IndicatorBlock | null;
 }
 
@@ -115,15 +117,25 @@ export function computeFeatures(inp: FeatureInputs): FeatureSet {
 
   const vel = inp.chainlink.velocityBpsPerSec(nowMs, 10_000);
   const bookAge = inp.upBook.ageMs(nowMs);
+  const downBookAge = inp.downBook.ageMs(nowMs);
   const warmedUp = inp.chainlink.size >= 10 && earliestAgeMs(inp.chainlink, nowMs) >= inp.warmupSeconds * 1000;
 
   // data-quality score: multiplicative penalties for staleness/gaps/missing pieces
   let quality = 1.0;
   if (clAge === null || clAge > inp.chainlinkMaxAgeMs) quality *= 0.2;
   else quality *= 1 - Math.min(0.3, clAge / (inp.chainlinkMaxAgeMs * 4));
-  if (bookAge === null || bookAge > inp.bookMaxAgeMs) quality *= 0.5;
+  // worst-of both sides: a stale DOWN book must not hide behind a fresh UP book
+  const bookStale = (a: number | null) => a === null || a > inp.bookMaxAgeMs;
+  if (bookStale(bookAge) || bookStale(downBookAge)) quality *= 0.5;
   if (inp.priceToBeat === null) quality *= 0.1;
   if (!warmedUp) quality *= 0.5;
+  if (inp.indicators) {
+    // composite indicators consume Binance-derived inputs: degrade the score
+    // when candles were Chainlink-synthesized (volume indicator lost) or the
+    // Binance confirmation feed itself is stale.
+    if (inp.indicators.candleSource === "CHAINLINK_SYNTHETIC") quality *= 0.9;
+    else if (bnAge === null || bnAge > (inp.binanceMaxAgeMs ?? 10_000)) quality *= 0.7;
+  }
 
   const f: FeatureSet = {
     tsMs: nowMs,
@@ -169,6 +181,7 @@ export function computeFeatures(inp: FeatureInputs): FeatureSet {
     downBestBid: p6(inp.downBook.bestBid()),
     downBestAsk: p6(inp.downBook.bestAsk()),
     bookAgeMs: bookAge,
+    downBookAgeMs: downBookAge,
     complementInconsistency: complementConsistency(inp.upBook, inp.downBook),
     upQuoteFlips: inp.upBook.quoteFlipCount,
     lastTradePriceUp: p6(inp.upBook.lastTradePrice6),

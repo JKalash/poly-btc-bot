@@ -1,7 +1,7 @@
 import { AppConfigSchema, DEFAULT_CONFIG, type AppConfig } from "@b5p/config";
 import {
   auditEvents, configVersions, decisionSnapshots, engineKv, featureSnapshots, healthEvents,
-  killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents, orders,
+  killSwitchEvents, marketRuleSnapshots, markets as marketsTable, orderIntents,
   referencePriceTicks, resolutions, riskDecisions, signalCandidates, strategyPromotionDecisions,
   type DbHandle,
 } from "@b5p/db";
@@ -31,9 +31,9 @@ import {
 import {
   BookState, MODELS, STRATEGY_PRESETS, TickBuffer, computeFeatures, computeIndicators,
   configureCalibratedModel, presetAllowsMode,
-  type Candle, type ExtendedMoveFadePriorRun, type FeatureSet, type PresetContext, type StrategyDecision,
+  type Candle, type CandleSource, type ExtendedMoveFadePriorRun, type FeatureSet, type PresetContext, type StrategyDecision,
 } from "@b5p/strategy";
-import { eq } from "drizzle-orm";
+import { eq, gte } from "drizzle-orm";
 import { Accounting } from "./accounting";
 import { CHANNELS, type Bus } from "./bus";
 import { LiveController, minArmUsdc, type ArmRequest } from "./live";
@@ -82,10 +82,13 @@ export class Engine {
   cfg: AppConfig = DEFAULT_CONFIG;
   configVersion = 0;
   private lastCockpitPublish = 0;
-  private usedIdempotencyKeys = new Set<string>();
+  /** idempotency key -> createdAtMs, pruned after 24h (matching the restart-reload window). */
+  private usedIdempotencyKeys = new Map<string, number>();
+  private lastPruneMs = 0;
   private tickPersistQueue: ReferenceTick[] = [];
   private lastFeaturePersistMs = 0;
   private lastLiveRefreshMs = 0;
+  private lastLivePollMs = 0;
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
 
@@ -247,6 +250,12 @@ export class Engine {
     const orphans = await this.paper.reconcileOrphans(nowMs);
     if (orphans > 0) await this.health("warning", "reconcile", `${orphans} orphaned resting order(s) canceled on restart`);
     await this.accounting.reconcile(this.cfg, nowMs);
+    // Reload recent idempotency keys so the duplicate-order gate survives the
+    // restart scenarios it exists for (keys are content-derived and also
+    // unique-constrained on order_intents as a fail-closed backstop).
+    const recentIntents = await this.db.db.select({ key: orderIntents.idempotencyKey, createdAtMs: orderIntents.createdAtMs })
+      .from(orderIntents).where(gte(orderIntents.createdAtMs, nowMs - 24 * 3_600_000));
+    for (const r of recentIntents) this.usedIdempotencyKeys.set(r.key, r.createdAtMs);
     const target: EngineState = this.mode === "observe" ? "READ_ONLY" : this.mode === "paper" ? "PAPER" : "SHADOW";
     this.transitionEngine(target, "startup complete");
     await this.audit("engine", "start", { mode: this.mode, engineVersion: ENGINE_VERSION });
@@ -529,6 +538,12 @@ export class Engine {
     await this.captureBoundaries(nowMs);
     await this.paper.step(nowMs);
     await this.watchdogs(nowMs);
+    // Poll live fills while ANY live order is on the exchange (configured is
+    // enough — a disarm must not blind the books to fills on resting orders).
+    if (this.live.configured && nowMs - this.lastLivePollMs > 5000) {
+      this.lastLivePollMs = nowMs;
+      await this.live.pollOpenOrders(nowMs).catch((e) => logger.warn("live order poll failed", { error: String(e) }));
+    }
     // refresh real USDC balance periodically while armed (drives live drawdown stops)
     if (this.live.isArmed(nowMs) && nowMs - this.lastLiveRefreshMs > 30_000) {
       this.lastLiveRefreshMs = nowMs;
@@ -552,6 +567,7 @@ export class Engine {
     // R10 paired-cycle research loop: config-gated (OFF by default), paper/
     // shadow only, and strictly after the canonical trading path.
     this.stepInventoryResearch(active, nowMs);
+    this.pruneExpired(nowMs);
     await this.publishCockpit(nowMs);
     // Execution-quality bookkeeping: strictly after the trading hot path.
     // The drain is awaited HERE (end of step, all trading actions done) rather
@@ -595,6 +611,38 @@ export class Engine {
       this.inventorySim.step(nowMs);
     } catch (e) {
       logger.error("paired-cycle simulator step failed (contained)", { error: String(e) });
+    }
+  }
+
+  /**
+   * Bounded memory on 24/7 runs: market runtimes, book states, terminal paper
+   * orders and idempotency keys are all persisted in the DB — the in-memory
+   * copies exist only for the hot path and must not grow for the life of the
+   * process (a new market arrives every 5 minutes, forever).
+   *
+   * Settled markets linger 15 minutes past close (continuity cross-checks and
+   * late official-outcome refresh both look at most 3 windows back); markets
+   * that never became resolvable are abandoned after an hour instead of being
+   * rescanned by resolveDue every 500ms step forever.
+   */
+  private pruneExpired(nowMs: number): void {
+    if (nowMs - this.lastPruneMs < 60_000) return;
+    this.lastPruneMs = nowMs;
+    const nowSec = nowMs / 1000;
+    for (const [id, rt] of this.markets) {
+      const ageSec = nowSec - rt.ref.endEpoch;
+      const settled = rt.localOutcome !== null || rt.officialOutcome !== null;
+      if ((settled && ageSec > 15 * 60) || ageSec > 60 * 60) {
+        for (const intentId of this.marketIntents.get(id) ?? []) this.intentMeta.delete(intentId);
+        this.marketIntents.delete(id);
+        this.books.delete(rt.ref.upTokenId);
+        this.books.delete(rt.ref.downTokenId);
+        this.paper.pruneMarket(id);
+        this.markets.delete(id);
+      }
+    }
+    for (const [key, createdAtMs] of this.usedIdempotencyKeys) {
+      if (nowMs - createdAtMs > 24 * 3_600_000) this.usedIdempotencyKeys.delete(key);
     }
   }
 
@@ -697,12 +745,14 @@ export class Engine {
     // the resolution feed anyway, so momentum computed from it is more faithful.
     // Volume-surge degrades to null under synthesis; the composite handles that.)
     const klinesFresh = this.candlesUpdatedAtMs > 0 && nowMs - this.candlesUpdatedAtMs < 20_000;
-    const candles1s = klinesFresh && this.candles.length > 0
-      ? this.candles
-      : synthCandlesFromTicks(this.chainlink, nowMs);
-    const momentumTicks = klinesFresh ? this.binance : this.chainlink;
+    // Provenance is recorded on the indicator block and decision snapshot:
+    // Chainlink-synthesized candles must never be mistaken for Binance klines
+    // in the audit record (on US hosts the fallback is the common case).
+    const candleSource: CandleSource = klinesFresh && this.candles.length > 0 ? "BINANCE_KLINES" : "CHAINLINK_SYNTHETIC";
+    const candles1s = candleSource === "BINANCE_KLINES" ? this.candles : synthCandlesFromTicks(this.chainlink, nowMs);
+    const momentumTicks = candleSource === "BINANCE_KLINES" ? this.binance : this.chainlink;
     const indicators = candles1s.length > 30
-      ? computeIndicators({ nowMs, windowStartEpochSec: rt.ref.startEpoch, candles1s, binanceTicks: momentumTicks })
+      ? computeIndicators({ nowMs, windowStartEpochSec: rt.ref.startEpoch, candles1s, binanceTicks: momentumTicks, candleSource })
       : null;
     const f = computeFeatures({
       nowMs,
@@ -715,6 +765,7 @@ export class Engine {
       warmupSeconds: this.cfg.feeds.warmup_seconds,
       chainlinkMaxAgeMs: this.cfg.feeds.chainlink.max_age_ms,
       bookMaxAgeMs: this.cfg.feeds.clob.max_book_age_ms,
+      binanceMaxAgeMs: this.cfg.feeds.binance.max_age_ms,
       indicators,
     });
 
@@ -812,7 +863,10 @@ export class Engine {
     const feeSchedule = { ratePpm: rt.fee?.ratePpm ?? ppm("0.07"), collection: this.cfg.paper.fee_collection_convention };
     const sideBook = side === "UP" ? this.bookFor(rt.ref.upTokenId) : this.bookFor(rt.ref.downTokenId);
     const bookAge = sideBook.ageMs(nowMs);
-    const idemKey = idempotencyKey(decisionId, 1);
+    // Content-derived: a retry or restart re-submitting the same intent (same
+    // market, side, style, price) produces the SAME key, so the duplicate gate
+    // and the unique constraint on order_intents.idempotency_key can fire.
+    const idemKey = idempotencyKey(`${rt.ref.marketId}|${side}|${style}|${price6}`, 1);
 
     const riskCtx: RiskContext = {
       mode: decisionMode,
@@ -983,7 +1037,7 @@ export class Engine {
     this.execTimeline.transition(intentId, "RISK_APPROVED", {
       utcMs: nowMs, detail: { stake6: stake6.toString(), shares6: shares6.toString() },
     });
-    this.usedIdempotencyKeys.add(idemKey);
+    this.usedIdempotencyKeys.set(idemKey, nowMs);
     await this.db.db.insert(orderIntents).values({
       id: intentId,
       decisionId,
@@ -1056,7 +1110,7 @@ export class Engine {
           decisionId, intentId, marketId: rt.ref.marketId, tokenId, outcomeSide: side,
           style, price6, shares6, stake6, tickSize6: rt.tickSize6, negRisk: false,
           ...(style === "maker_post_only" ? { expireAtMs: cancelCutoffMs } : {}),
-          idempotencyKey: idemKey, nowMs,
+          idempotencyKey: idemKey, exitPolicy: this.cfg.strategy.exit_policy, nowMs,
         });
       } catch (e) {
         // Transport/adapter exception: outcome unknown. Quarantine the intent —
@@ -1315,11 +1369,16 @@ export class Engine {
       }).onConflictDoNothing();
       await this.db.db.update(marketsTable).set({ status: "RESOLVED", outcome, updatedAtMs: nowMs }).where(eq(marketsTable.id, rt.ref.marketId));
       const pnl = await this.accounting.onResolution(rt.ref.marketId, outcome, nowMs);
-      // live position bookkeeping: mark closed (win/loss feeds consecutive-loss stop) and re-read real balance
+      // Live settlement from RECORDED fills only: settle() computes win/loss
+      // from the position ledger and returns null when no fill was recorded —
+      // unknown is never counted as a loss. Then re-read the real balance.
       if (this.live.hasOpenPosition(rt.ref.marketId)) {
-        const liveOrders = await this.db.db.select().from(orders).where(eq(orders.marketId, rt.ref.marketId));
-        const wonSide = liveOrders.find((o) => o.mode === "live" && o.filledShares6 > 0n)?.outcomeSide;
-        this.live.markClosed(rt.ref.marketId, wonSide === outcome);
+        // catch up on any fills the 5s poll hasn't seen yet before settling
+        await this.live.pollOpenOrders(nowMs).catch(() => undefined);
+        const liveNet = await this.live.settle(rt.ref.marketId, outcome, nowMs);
+        if (liveNet !== null) {
+          await this.audit("resolution", "live_settled", { slug: rt.ref.slug, outcome, net6: liveNet.toString() });
+        }
         await this.live.refreshBankroll();
       }
       await this.audit("resolution", "resolved", { slug: rt.ref.slug, outcome, source, pnl: pnl ?? "no position" });
@@ -1398,10 +1457,17 @@ export class Engine {
   feedHealth(nowMs: number): Record<string, { ageMs: number | null; healthy: boolean }> {
     const cl = this.chainlink.latest();
     const bn = this.binance.latest();
-    const anyBook = [...this.books.values()][0] ?? null;
     const clAge = cl ? nowMs - cl.receivedTsMs : null;
     const bnAge = bn ? nowMs - bn.receivedTsMs : null;
-    const bookAge = anyBook?.ageMs(nowMs) ?? null;
+    // CLOB health is the WORST of the active (or next) market's UP/DOWN books.
+    // Never "the first book ever inserted": that entry goes permanently stale
+    // as soon as the first window rotates and would pin the lamp red forever.
+    const target = this.activeMarket(nowMs) ?? this.nextMarket(nowMs);
+    const bookAges = target
+      ? [this.books.get(target.ref.upTokenId)?.ageMs(nowMs), this.books.get(target.ref.downTokenId)?.ageMs(nowMs)]
+          .filter((a): a is number => a !== null && a !== undefined)
+      : [];
+    const bookAge = bookAges.length > 0 ? Math.max(...bookAges) : null;
     const candleAge = this.candlesUpdatedAtMs === 0 ? null : nowMs - this.candlesUpdatedAtMs;
     return {
       chainlink: { ageMs: clAge, healthy: clAge !== null && clAge <= this.cfg.feeds.chainlink.max_age_ms },
@@ -1445,6 +1511,7 @@ export class Engine {
       live: this.live.status(nowMs),
       bankroll: {
         bankroll6: bank.bankroll,
+        sessionStart6: this.accounting.sessionStartBankroll,
         sessionPeak6: bank.sessionPeak,
         dailyPeak6: bank.dailyPeak,
         consecutiveLosses: bank.consecutiveLosses,
@@ -1627,7 +1694,7 @@ function customLimitsFromConfig(cfg: AppConfig) {
     minExpectedValuePerCostPpm: ppm(cfg.strategy.min_expected_value_per_cost),
     maxSpread: prob(cfg.execution.max_spread),
     maxPriceImpact: prob(cfg.execution.max_price_impact),
-    liveAllowed: false, // live is disabled in this release regardless of profile
+    liveAllowed: false, // custom profiles can never arm live; only built-in profiles may
   };
 }
 

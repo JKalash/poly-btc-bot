@@ -63,6 +63,25 @@ describe("LiveController — disarmed and unconfigured by default", () => {
     lc.markOpen("m2"); lc.markClosed("m2", true);
     expect(lc.consecutiveLosses).toBe(0);
   });
+
+  it("unknown outcome (no recorded fill) is never counted as a loss", () => {
+    const lc = new LiveController(db);
+    lc.markOpen("m1"); lc.markClosed("m1", false);
+    expect(lc.consecutiveLosses).toBe(1);
+    lc.markOpen("m2"); lc.markClosed("m2", null); // no fill recorded -> unknown
+    expect(lc.hasOpenPosition("m2")).toBe(false);
+    expect(lc.consecutiveLosses).toBe(1); // unchanged: not a win, not a loss
+  });
+
+  it("settle() with no recorded fill returns null and leaves the loss counter alone", async () => {
+    const lc = new LiveController(db);
+    lc.markOpen("m-nofill");
+    const net = await lc.settle("m-nofill", "UP", Date.now());
+    expect(net).toBeNull();
+    expect(lc.hasOpenPosition("m-nofill")).toBe(false);
+    expect(lc.consecutiveLosses).toBe(0);
+    expect(lc.openExposure6()).toBe(0n);
+  });
 });
 
 describe("Engine — live stays unavailable without config; paper path unaffected", () => {

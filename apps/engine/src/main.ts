@@ -1,7 +1,9 @@
-import { makeDb } from "@b5p/db";
+import type { AppConfig } from "@b5p/config";
+import { configVersions, makeDb } from "@b5p/db";
 import {
   BinanceKlinesPoller, ClobMarketWs, GammaClient, RtdsClient, tsToMs,
 } from "@b5p/polymarket";
+import { eq } from "drizzle-orm";
 import { makeBus } from "./bus";
 import { Engine } from "./engine";
 import { logger } from "./log";
@@ -23,13 +25,24 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
   const modeEnv = process.env.ENGINE_MODE;
   const gamma = new GammaClient();
 
-  // config decides default mode; env may force observe (read-only) only
-  const engine = new Engine(db, bus, modeEnv === "observe" ? "observe" : "paper");
-  await engine.start(Date.now());
-  const cfgMode = engine.cfg.app.mode;
-  if (cfgMode === "observe" && engine.mode !== "observe") {
-    logger.info("config requests observe mode; engine runs read-only decision logic without orders");
+  // The validated config's app.mode decides the engine mode (observe | paper |
+  // shadow); ENGINE_MODE env overrides it. `live` is NOT a bootable mode —
+  // live trading is entered at runtime through the arming flow — so a config
+  // requesting `live` boots as paper with a warning.
+  const cfgRows = await db.db.select().from(configVersions).where(eq(configVersions.active, true));
+  const cfgRow = cfgRows.sort((a, b) => b.version - a.version)[0];
+  const cfgMode = (cfgRow?.config as AppConfig | undefined)?.app.mode ?? "paper";
+  const requested = modeEnv ?? cfgMode;
+  const mode: "observe" | "paper" | "shadow" =
+    requested === "observe" ? "observe" : requested === "shadow" ? "shadow" : "paper";
+  if (requested === "live") {
+    logger.warn("app.mode 'live' is not bootable; starting in paper. Live trading requires the runtime arming flow.");
   }
+  if (modeEnv && modeEnv !== cfgMode) {
+    logger.info("ENGINE_MODE env overrides config app.mode", { env: modeEnv, config: cfgMode });
+  }
+  const engine = new Engine(db, bus, mode);
+  await engine.start(Date.now());
 
   // --- feeds
   const rtds = new RtdsClient({

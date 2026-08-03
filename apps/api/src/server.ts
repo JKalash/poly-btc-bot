@@ -1390,7 +1390,11 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
       active: true,
       createdAtMs: Date.now(),
     });
-    bus.publish(CHANNELS.control, { type: "config_reload" });
+    try {
+      await bus.publishReliable(CHANNELS.control, { type: "config_reload" });
+    } catch (e) {
+      return reply.code(502).send({ error: `config saved but reload signal not delivered: ${String(e)}. The engine will pick it up on restart.` });
+    }
     await db.db.insert(auditEvents).values({
       category: "config", action: "update", actor: "operator", correlationId: null,
       data: { changed }, createdAtMs: Date.now(),
@@ -1405,13 +1409,22 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     const body = z.object({ reason: z.string().default("operator emergency stop") }).safeParse(req.body ?? {});
     const reason = body.success ? body.data.reason : "operator emergency stop";
     await db.db.insert(killSwitchEvents).values({ id: newId(), scope: "api", reason, actor: "operator", createdAtMs: Date.now() });
-    bus.publish(CHANNELS.control, { type: "kill", reason, actor: "operator" });
+    try {
+      await bus.publishReliable(CHANNELS.control, { type: "kill", reason, actor: "operator" });
+    } catch (e) {
+      // The kill MUST NOT be silently lost: tell the operator delivery failed.
+      return reply.code(502).send({ error: `kill command could NOT be delivered to the engine (control bus unavailable: ${String(e)}). Stop the engine process directly.` });
+    }
     return { ok: true, note: "Emergency stop signaled. New orders disabled; resting order cancellation attempted; positions require manual review." };
   });
 
   app.post("/api/resume", async (req, reply) => {
     if (!(await guard(req, reply))) return;
-    bus.publish(CHANNELS.control, { type: "resume", actor: "operator" });
+    try {
+      await bus.publishReliable(CHANNELS.control, { type: "resume", actor: "operator" });
+    } catch (e) {
+      return reply.code(502).send({ error: `resume command not delivered: ${String(e)}` });
+    }
     await db.db.insert(auditEvents).values({ category: "engine", action: "resume_requested", actor: "operator", correlationId: null, data: null, createdAtMs: Date.now() });
     return { ok: true };
   });
@@ -1432,11 +1445,15 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     // re-authenticate for this sensitive control
     const ok = await auth.reverify(body.data.password);
     if (!ok) return reply.code(401).send({ error: "re-authentication failed" });
-    bus.publish(CHANNELS.control, {
-      type: "arm", actor: "operator",
-      acknowledgement: body.data.acknowledgement,
-      ttlMinutes: body.data.ttlMinutes,
-    });
+    try {
+      await bus.publishReliable(CHANNELS.control, {
+        type: "arm", actor: "operator",
+        acknowledgement: body.data.acknowledgement,
+        ttlMinutes: body.data.ttlMinutes,
+      });
+    } catch (e) {
+      return reply.code(502).send({ error: `arm request not delivered: ${String(e)}` });
+    }
     await db.db.insert(auditEvents).values({ category: "live", action: "arm_requested", actor: "operator", correlationId: null, data: { ttlMinutes: body.data.ttlMinutes }, createdAtMs: Date.now() });
     return { ok: true, note: "Arm request sent. Watch /api/state (live.state) and health events for the result — the engine runs wallet reconciliation before arming." };
   });
@@ -1444,7 +1461,11 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   app.post("/api/disarm", async (req, reply) => {
     if (!(await guard(req, reply))) return;
     const body = z.object({ reason: z.string().default("operator manual disarm") }).safeParse(req.body ?? {});
-    bus.publish(CHANNELS.control, { type: "disarm", actor: "operator", reason: body.success ? body.data.reason : "operator" });
+    try {
+      await bus.publishReliable(CHANNELS.control, { type: "disarm", actor: "operator", reason: body.success ? body.data.reason : "operator" });
+    } catch (e) {
+      return reply.code(502).send({ error: `disarm command not delivered: ${String(e)}` });
+    }
     await db.db.insert(auditEvents).values({ category: "live", action: "disarm_requested", actor: "operator", correlationId: null, data: null, createdAtMs: Date.now() });
     return { ok: true };
   });

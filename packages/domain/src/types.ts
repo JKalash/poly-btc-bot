@@ -152,6 +152,8 @@ export interface DecisionSnapshotData {
     attributions: Record<string, number>;
     calibrated: boolean;
     calibrationRequired: boolean;
+    /** Candle provenance behind indicator-driven estimates (absent pre-provenance snapshots). */
+    candleSource?: string | null;
   } | null;
   marketProbability: string | null;
   effectiveBreakEven: string | null;

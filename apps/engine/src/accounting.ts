@@ -30,6 +30,8 @@ interface OpenPosition {
 export class Accounting {
   bankroll: Usdc6 = 0n;
   startingBankroll: Usdc6 = 0n;
+  /** Bankroll at session start (reconcile time) — baseline for session P&L. */
+  sessionStartBankroll: Usdc6 = 0n;
   sessionPeak: Usdc6 = 0n;
   dailyPeak: Usdc6 = 0n;
   consecutiveLosses = 0;
@@ -56,7 +58,7 @@ export class Accounting {
         side: r.outcomeSide as OutcomeSide,
         shares6: r.shares6,
         cost6: r.cost6,
-        fees6: 0n,
+        fees6: r.fees6,
         stake6: r.stake6,
         exitPolicy: r.exitPolicy,
         openedAtMs: r.openedAtMs,
@@ -66,6 +68,7 @@ export class Accounting {
     const latest = snaps.sort((a, b) => b.tsMs - a.tsMs)[0];
     this.startingBankroll = usdc(cfg.risk.starting_paper_bankroll_usdc);
     this.bankroll = latest ? latest.bankroll6 : this.startingBankroll;
+    this.sessionStartBankroll = this.bankroll;
     this.sessionPeak = this.bankroll;
     this.dailyPeak = this.bankroll;
     this.dailyPeakDay = utcDay(nowMs);
@@ -153,6 +156,7 @@ export class Accounting {
         shares6: 0n,
         avgPrice6: 0n,
         cost6: 0n,
+        fees6: 0n,
         stake6: 0n,
         exitPolicy: pos.exitPolicy,
         status: "OPEN",
@@ -165,8 +169,17 @@ export class Accounting {
     pos.stake6 += cost6 + args.fee6; // max loss = cash out the door for a buy
     const avg = pos.shares6 > 0n ? mulDiv(pos.cost6, 1_000_000n, pos.shares6, "half-even") : 0n;
     await this.db.db.update(positionsTable)
-      .set({ shares6: pos.shares6, cost6: pos.cost6, stake6: pos.stake6, avgPrice6: avg })
+      .set({ shares6: pos.shares6, cost6: pos.cost6, fees6: pos.fees6, stake6: pos.stake6, avgPrice6: avg })
       .where(eq(positionsTable.id, pos.id));
+    // Snapshot on every fill, not just resolution: a restart between fill and
+    // resolution must restore the post-fill bankroll alongside the OPEN
+    // position, or the position's cost is resurrected into the books.
+    await this.db.db.insert(bankrollSnapshots).values({
+      mode: this.mode,
+      bankroll6: this.bankroll,
+      basis: "paper_fill",
+      tsMs: args.nowMs,
+    });
   }
 
   /** Resolve a position: winner pays 1 per share. Returns net pnl. */
@@ -204,7 +217,7 @@ export class Accounting {
       tsMs: nowMs,
     });
     await this.db.db.update(tradingSessions)
-      .set({ peakBankroll6: this.sessionPeak, realized6: this.bankroll - this.startingBankroll, consecutiveLosses: this.consecutiveLosses })
+      .set({ peakBankroll6: this.sessionPeak, realized6: this.bankroll - this.sessionStartBankroll, consecutiveLosses: this.consecutiveLosses })
       .where(eq(tradingSessions.id, this.sessionId));
     return net6;
   }
