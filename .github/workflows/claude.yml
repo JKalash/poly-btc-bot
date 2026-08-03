@@ -6,9 +6,10 @@
 #
 # Setup (one-time):
 #   1. Install the Claude GitHub App on this repo: https://github.com/apps/claude
-#   2. Add the ANTHROPIC_API_KEY repo secret (Settings → Secrets → Actions).
-#      (Pro/Max subscribers can instead run `claude setup-token` locally and
-#      add it as CLAUDE_CODE_OAUTH_TOKEN, then swap the input below.)
+#   2. Run `claude setup-token` locally (Pro/Max subscription auth) and add the
+#      token as the CLAUDE_CODE_OAUTH_TOKEN repo secret (Settings → Secrets →
+#      Actions). To use API-key billing instead, add ANTHROPIC_API_KEY and
+#      swap the input below to `anthropic_api_key`.
 #
 # Note: like all issue_comment-triggered workflows, this runs the version of
 # this file on the default branch.
@@ -44,4 +45,4 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
