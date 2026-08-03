@@ -70,6 +70,7 @@ servers are marked with a confidence note.
 | 038 | API WebSocket relay has no backpressure handling |
 | 039 | Non-constant-time comparisons for session HMAC and CSRF token |
 | 040 | Concurrent first-boot migration race in split-process mode |
+| 047 | Unhealthy feed lamps never generate health events |
 | 044 | `TickBuffer` never dedups; RTDS backfill collapses `medianGapMs` to 0 (reproduced) |
 | 045 | `aggregateCloses` bucket phase jitter makes EMA/RSI non-reproducible |
 | 046 | Order prices round-trip through floats, contradicting the fixed-point invariant (currently exact) |
