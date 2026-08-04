@@ -12,10 +12,10 @@ export function timingSafeStringEqual(actual: string, expected: string): boolean
 
 /**
  * Single-operator auth. scrypt password hashing, HMAC-signed opaque session
- * tokens (in-memory store — sessions end on API restart, acceptable for a
- * single-operator local tool and documented), double-submit CSRF token,
- * simple login rate limiting. Secrets never reach the browser beyond the
- * HTTP-only session cookie.
+ * tokens, double-submit CSRF token, simple login rate limiting. Short
+ * sessions are kept in memory and end on API restart. Remembered sessions are
+ * self-contained signed cookies so they can honor the 30-day browser cookie.
+ * Secrets never reach the browser beyond the HTTP-only session cookie.
  */
 
 export interface SessionInfo {
@@ -27,6 +27,14 @@ export interface SessionInfo {
 
 const SESSION_TTL_MS = 12 * 3600 * 1000;
 export const REMEMBERED_SESSION_TTL_SECONDS = 30 * 24 * 3600;
+
+interface PersistentSessionPayload {
+  u: string;
+  c: string;
+  iat: number;
+  exp: number;
+  r: true;
+}
 
 export class AuthService {
   private sessions = new Map<string, SessionInfo>();
@@ -93,13 +101,26 @@ export class AuthService {
   async login(username: string, password: string, remember = false): Promise<{ token: string; csrfToken: string } | null> {
     if (username !== this.username) return null;
     if (!(await AuthService.verifyPassword(password, this.passwordHash))) return null;
+    const csrfToken = randomBytes(16).toString("hex");
+    const now = Date.now();
+    if (remember) {
+      const payload: PersistentSessionPayload = {
+        u: username,
+        c: csrfToken,
+        iat: now,
+        exp: now + REMEMBERED_SESSION_TTL_SECONDS * 1000,
+        r: true,
+      };
+      const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+      return { token: `v1.${encoded}.${this.sign(encoded)}`, csrfToken };
+    }
+
     const raw = randomBytes(32).toString("hex");
     const token = `${raw}.${this.sign(raw)}`;
-    const csrfToken = randomBytes(16).toString("hex");
     this.sessions.set(raw, {
       username,
-      createdAtMs: Date.now(),
-      expiresAtMs: Date.now() + (remember ? REMEMBERED_SESSION_TTL_SECONDS * 1000 : SESSION_TTL_MS),
+      createdAtMs: now,
+      expiresAtMs: now + SESSION_TTL_MS,
       csrfToken,
     });
     return { token, csrfToken };
@@ -107,6 +128,8 @@ export class AuthService {
 
   validate(token: string | undefined): SessionInfo | null {
     if (!token) return null;
+    const remembered = this.validatePersistent(token);
+    if (remembered) return remembered;
     const [raw, sig] = token.split(".");
     if (!raw || !sig || !timingSafeStringEqual(sig, this.sign(raw))) return null;
     const s = this.sessions.get(raw);
@@ -126,6 +149,35 @@ export class AuthService {
 
   private sign(raw: string): string {
     return createHmac("sha256", this.secret).update(raw).digest("hex").slice(0, 32);
+  }
+
+  private validatePersistent(token: string): SessionInfo | null {
+    const [version, encoded, sig] = token.split(".");
+    if (version !== "v1" || !encoded || !sig || !timingSafeStringEqual(sig, this.sign(encoded))) return null;
+    let payload: PersistentSessionPayload;
+    try {
+      payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as PersistentSessionPayload;
+    } catch {
+      return null;
+    }
+    if (
+      payload.r !== true ||
+      payload.u !== this.username ||
+      typeof payload.c !== "string" ||
+      typeof payload.iat !== "number" ||
+      typeof payload.exp !== "number" ||
+      !Number.isFinite(payload.iat) ||
+      !Number.isFinite(payload.exp) ||
+      Date.now() > payload.exp
+    ) {
+      return null;
+    }
+    return {
+      username: payload.u,
+      csrfToken: payload.c,
+      createdAtMs: payload.iat,
+      expiresAtMs: payload.exp,
+    };
   }
 
   // one-time WebSocket tickets (cookie can't cross the dev proxy boundary for WS)

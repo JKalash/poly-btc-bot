@@ -15,15 +15,18 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (t) headers["x-csrf-token"] = t;
   }
   const res = await fetch(path, { ...init, headers, credentials: "same-origin" });
+  const body = await res.json().catch(() => ({}));
   if (res.status === 401) {
+    if (path === "/api/auth/login") {
+      throw new Error((body as { error?: string }).error ?? "invalid credentials");
+    }
     if (typeof window !== "undefined" && !location.pathname.startsWith("/login")) {
       location.href = "/login";
     }
     throw new Error("unauthenticated");
   }
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
     throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`);
   }
-  return (await res.json()) as T;
+  return body as T;
 }

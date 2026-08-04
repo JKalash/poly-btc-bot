@@ -114,6 +114,7 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   app.post("/api/auth/logout", async (req, reply) => {
     auth.logout(req.cookies[SESSION_COOKIE]);
     reply.clearCookie(SESSION_COOKIE, { path: "/" });
+    reply.clearCookie(CSRF_COOKIE, { path: "/" });
     return { ok: true };
   });
 

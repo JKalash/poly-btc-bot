@@ -67,7 +67,7 @@ if (pw.devDefault) {
   logger.warn("api: OPERATOR_PASSWORD_HASH not set — using dev default operator/operator. Set real credentials in .env for anything beyond local experimentation.");
 }
 if (auth.devFallback) {
-  logger.warn("api: SESSION_SECRET not set — sessions will not survive an API restart.");
+  logger.warn("api: SESSION_SECRET not set — remembered sessions will not survive an API restart.");
 }
 
 const bus = await makeApiBus();

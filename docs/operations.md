@@ -45,7 +45,8 @@
 ## Credentials
 
 - Password: `pnpm --filter @b5p/api hash-password -- 'new-password'` → put output in
-  `OPERATOR_PASSWORD_HASH` in `.env`, restart. Sessions are memory-only and die with the API.
+  `OPERATOR_PASSWORD_HASH` in `.env`, restart. Normal sessions are memory-only and die with the API;
+  remembered 30-day sessions survive restarts only when `SESSION_SECRET` is stable.
 - "Forget credentials": remove the two variables from `.env`; nothing else stores them.
 
 ## Database
