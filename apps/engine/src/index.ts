@@ -82,6 +82,7 @@ export {
 export * from "./pair-parallel-dispatch";
 export * from "./pair-recovery-coordinator";
 export * from "./pair-halt-watchdog";
+export * from "./pair-lifecycle-adapter";
 export * from "./pair-observability";
 export * from "./pair-subsystem";
 export {

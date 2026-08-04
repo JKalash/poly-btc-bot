@@ -81,7 +81,7 @@ describe("BPAIR-080 pair subsystem startup composition", () => {
 
     expect(subsystem.capability).toMatchObject({
       observerConfigured: true, paperSchedulingConfigured: false, paperSchedulingAllowed: false,
-      liveExecutionAvailable: false, facadeConstructed: false, unwiredReasons: [], configVersion: 7,
+      liveExecutionAvailable: false, facadeConstructed: true, unwiredReasons: [], configVersion: 7,
     });
     expect(subsystem.configuredAuthority.liveExecutionAvailable).toBe(false);
     expect(subsystem.authority.liveExecutionAvailable).toBe(false);
@@ -106,8 +106,8 @@ describe("BPAIR-080 pair subsystem startup composition", () => {
 
     expect(subsystem.startup.paperSchedulingAllowed).toBe(true);
     expect(subsystem.capability).toMatchObject({
-      paperSchedulingConfigured: true, paperSchedulingAllowed: false, facadeConstructed: false,
-      unwiredReasons: ["PAIR_FACADE_PORTS_UNWIRED", "PAIR_EFFECT_LEGALITY_UNWIRED"],
+      paperSchedulingConfigured: true, paperSchedulingAllowed: false, facadeConstructed: true,
+      unwiredReasons: ["PAIR_LIFECYCLE_ATOMICITY_UNAVAILABLE", "PAIR_EFFECT_LEGALITY_UNWIRED"],
     });
     expect(subsystem.authority.paperSchedulingEnabled).toBe(false);
     expect(subsystem.healthSnapshot()).toMatchObject({

@@ -31,10 +31,11 @@ import {
   type PairTokenTermsSource,
 } from "./pair-token-terms";
 import { DbPaperPairOperationStore, PaperPairVenue } from "./paper-pair-venue";
+import { createAtomicityBlockedPairExecutionDependencies } from "./pair-lifecycle-adapter";
 
 export type PairSubsystemUnwiredReason =
-  | "PAIR_FACADE_PORTS_UNWIRED"
-  | "PAIR_EFFECT_LEGALITY_UNWIRED";
+  | "PAIR_EFFECT_LEGALITY_UNWIRED"
+  | "PAIR_LIFECYCLE_ATOMICITY_UNAVAILABLE";
 
 export interface PairSubsystemHealthSources {
   readonly captureQueueDepth?: () => number;
@@ -208,7 +209,7 @@ export async function createPairSubsystem(options: CreatePairSubsystemOptions): 
 
   const unwiredReasons: PairSubsystemUnwiredReason[] = [];
   if (configuredAuthority.paperSchedulingEnabled && options.facadeDependencies === undefined) {
-    unwiredReasons.push("PAIR_FACADE_PORTS_UNWIRED");
+    unwiredReasons.push("PAIR_LIFECYCLE_ATOMICITY_UNAVAILABLE");
   }
   if (configuredAuthority.paperSchedulingEnabled && options.isEffectLegal === undefined) {
     unwiredReasons.push("PAIR_EFFECT_LEGALITY_UNWIRED");
@@ -245,10 +246,6 @@ export async function createPairSubsystem(options: CreatePairSubsystemOptions): 
     venue,
     options.isEffectLegal ?? (async () => false),
   );
-  const facade = options.facadeDependencies === undefined
-    ? null
-    : createPairExecution(options.facadeDependencies, authority);
-
   const groupReads = Object.freeze({
     async getGroup(groupId: PairGroupId): Promise<PairGroupView | null> {
       const row = await groups.getGroup(groupId);
@@ -278,6 +275,12 @@ export async function createPairSubsystem(options: CreatePairSubsystemOptions): 
       };
     },
   });
+  const facadeDependencies = options.facadeDependencies ?? createAtomicityBlockedPairExecutionDependencies({
+    db: options.db,
+    groups,
+    reconciliation,
+  });
+  const facade = createPairExecution(facadeDependencies, authority);
 
   let rows = await options.db.db.select().from(schema.pairOrderGroups);
   const unknownStates = new Set(["OUTCOME_UNKNOWN", "RECOVERY_OUTCOME_UNKNOWN", "MERGE_OUTCOME_UNKNOWN"]);

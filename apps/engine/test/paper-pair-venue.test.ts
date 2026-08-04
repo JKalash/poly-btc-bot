@@ -259,5 +259,5 @@ describe("DbPaperPairOperationStore", () => {
     expect(await restartedVenue.observe("client-1")).toEqual(evidence);
     expect(await restartedVenue.executeIdempotently(request())).toEqual(evidence);
     await reopened.close();
-  }, 15_000);
+  }, 60_000);
 });

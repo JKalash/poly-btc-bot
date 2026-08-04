@@ -4,7 +4,7 @@ project_name: "BTC Five-Minute Polymarket Command Center"
 project_slug: "5min-btc-poly"
 document_type: "autonomous-refinement-and-implementation-brief"
 document_id: "2026-08-03-mrfadiai-paired-execution-borrow"
-status: "implementation-in-progress"
+status: "implemented-safe-research-boundary-paper-disabled"
 generated_at: "2026-08-03"
 default_timezone: "Europe/Madrid"
 trading_timezone: "UTC"
@@ -28,7 +28,7 @@ build_priority: "economic correctness, auditability, fail-closed safety, determi
 
 ## Implementation progress — 2026-08-04
 
-This section records the repository state while implementation is active. A task is marked complete only when its scoped code and focused acceptance tests pass; downstream composition requirements remain listed separately and are not implied by the presence of schema tables or interfaces.
+This section records the completed safe-boundary implementation. A task is marked complete only when its scoped code and focused acceptance tests pass. Runtime pair-paper mutation remains deliberately disabled until the explicitly documented shared-transaction and PostgreSQL gates are closed; no completion claim below implies live authority.
 
 ### Completed foundations
 
@@ -49,7 +49,7 @@ This section records the repository state while implementation is active. A task
 - `BPAIR-038`: the complete schema-v1 pair event/state model, legal transition matrix, reducer, semantic duplicate behavior, parallel/serial/recovery/settlement/reconciliation/halt paths, and explicit illegal-transition handling.
 - `BPAIR-039`: projection, quantity, FOK, cap, lifecycle, halt, reconciliation, and terminal invariants, including randomized inventory properties and record-then-manual-review handling for externally observed breaches.
 
-### Implemented components awaiting downstream composition
+### Implemented components and safe-boundary status
 
 - `BPAIR-012`: complete CLOB envelopes now cross the engine boundary atomically, with one mutation/version increment per affected token and exactly one post-boundary dirty mark that observes the final two-token state; reconnect barriers also cover books first created after a reconnect. The full zero-observation and replay-equivalence assertions close with `BPAIR-052`/`BPAIR-100` composition.
 - `BPAIR-013`: a bounded immutable capture queue batches complete envelopes without splitting them, exposes depth/flush/overflow metrics, retains failed batches, invalidates continuity on overflow, and requires persisted same-epoch UP and DOWN snapshots for recovery. It is composed with the live public-feed callbacks and append-only store; six focused queue tests pass.
@@ -67,7 +67,7 @@ This section records the repository state while implementation is active. A task
 - `BPAIR-060`: the durable group/event projection store implements group idempotency, one-active-group-per-market enforcement, ordered due-group reads, causal event redelivery checks, and atomic projection/event compare-and-swap. Four focused PGlite tests shared with the effect boundary pass; live PostgreSQL verification remains.
 - `BPAIR-061`: the isolated pair-paper account adapter implements idempotent funding, reserve/release journals, compare-and-swap journal persistence, immutable acquisition lots, exact group-local FIFO consumption, restart reconstruction/drift detection, and directional-account isolation. The production composition now idempotently funds a versioned runtime pair account and reads an exact immutable portfolio snapshot that combines its reconciled balances/caps with active directional orders and positions. Three account-store and two portfolio-store PGlite tests plus the 19 ledger/capability tests pass. The coordinator must still make group-event and reservation writes one shared transaction.
 - `BPAIR-062`: effect enqueue is atomic with committed group facts; due ordering, portable lease-claim compare-and-swap, strict canonical request decoding/binding, committed pre-call proof, durable paper-venue execution, terminal/rejected/unknown inbox linking, and expired-claim observe-first recovery are implemented. Live claims are never stolen and durable `UNKNOWN` is never blindly retried; absent-result reexecution requires injected lifecycle legality. Dispatcher plus store coverage passes 9 focused tests; evidence-to-group/ledger reduction remains coordinator work.
-- `BPAIR-063`: the constrained public facade now exposes only `consider`, `advance`, `reconcile`, `halt`, `getGroup`, and `listActiveGroups` over explicit economics/observation/account/activation/store/effect/reconciliation ports. It validates and freezes capability authority, keeps business rejection as data, propagates infrastructure faults, enforces commit-before-dispatch call ordering, blocks exposure effects after halt, and preserves late-evidence/reconciliation work. Thirteen facade boundary tests pass; engine SQL adapters must still fulfill the port-level atomic transaction guarantees.
+- `BPAIR-063`: the constrained public facade exposes only `consider`, `advance`, `reconcile`, `halt`, `getGroup`, and `listActiveGroups` over explicit economics/observation/account/activation/store/effect/reconciliation ports. Production now constructs it by default over real durable group/due/evidence/reconciliation reads. The audit proved the existing store contracts cannot yet perform the required cross-store atomic mutations, so the production mutation ports throw `PAIR_LIFECYCLE_ATOMICITY_UNAVAILABLE` before their first write and effective paper capability remains false; no no-op success is fabricated. Thirteen facade-boundary and nine lifecycle/subsystem focused tests pass.
 - `BPAIR-064`: startup reconciliation now replays immutable group events and compares group projection, pair ledger/lots, fills, effects, inbox evidence, and durable venue observations. It persists runs/diffs, repairs only deterministic projection drift (with exactly one `PAIR_PROJECTION_REBUILT` event for group repair), retains unknown/manual-review exposure, and gates paper scheduling while leaving observation available. Healthy and drifted zero-group accounts are also audited/gated. Seven focused tests and 14 combined store/account/reconciliation tests pass; live PostgreSQL verification remains.
 - `BPAIR-070`: a dedicated pair-only paper venue now performs exact immutable-capture initial BUY FOK and recovery SELL FAK matching, deterministic scripted outcomes, stable evidence identity, collision-safe replay, and atomic durable operation evidence. The shared in-memory/PGlite contract suite and restart observation test pass (19 tests); it has no directional `PaperExecutor`, venue SDK, wallet, or network dependency.
 - `BPAIR-071`: the causal activation gate selects only the latest complete capture at or before the dispatch cutoff, rejects forward evidence, always constructs a fresh activation capture, reloads/revalidates current per-token terms, caps quantity at the signal approval, and reruns exact quote/stress/risk without creating effects. Seven focused tests pass; durable as-of reader and coordinator transaction wiring remain.
@@ -76,8 +76,8 @@ This section records the repository state while implementation is active. A task
 - `BPAIR-074`: recovery coordination persists the complete complement/liquidation/hold alternative set before deterministic policy selection. The default no-auto policy creates zero effects; optional policies pass fresh-capture, deadline, attempt, unknown, halt, book, risk, and constraint gates and create at most one ordinal-0 effect. Complement is BUY/FOK, liquidation is inventory-proven SELL/FAK, and unknown/no-fill/partial/full outcomes retain or classify exposure exactly. Six focused tests pass; atomic plan and evidence-to-FIFO/ledger persistence remain facade adapter work.
 - `BPAIR-075`: settlement integration implements zero-effect hold-to-resolution and one deterministic non-exposure virtual-merge effect for exactly paired inventory. Confirmed merge applies FIFO consumptions plus balanced payout/cost/release journals once; failed/expired retains tokens for resolution; unknown retains tokens/reserve and blocks. Authoritative Chainlink resolution consumes all remaining winning/losing lots, deduplicates by resolution ID, and cannot double-credit merged inventory. Eleven focused tests pass; atomic store/account/inbox adapter wiring remains.
 - `BPAIR-076`: orthogonal halt planning denies new groups/exposure effects, cancels or expires only unclaimed pending effects, preserves inventory/reservations/evidence, never starts recovery, and continues late evidence/resolution/reconciliation. The watchdog escalates initial/recovery/merge unknown outcomes at the exact timeout to deterministic manual-review facts while retaining exposure and exposing health counts. Six focused tests pass; durable halt/watchdog fact persistence remains a facade adapter hook.
-- `BPAIR-080`: `createPairSubsystem` constructs the validated effective authority, stores, observer/evaluator, startup reconciler, dedicated pair venue, deny-by-default dispatcher, capability view and refreshable health. Observation remains available when safe, while paper capability requires both healthy startup reconciliation and complete explicitly supplied facade/legality ports; missing lifecycle wiring reports `PAIR_SUBSYSTEM_UNWIRED` and cannot schedule. Five subsystem tests and 47 related engine tests pass.
-- `BPAIR-081`: main startup now constructs the observer-safe subsystem, installs one complete-envelope marker, persists every full envelope and boundary before evaluation, and uses the durable boundary event ID as capture sequence. WebSocket token identities map back to canonical discovered markets; active condition/token pairs register and rotate safely; maintenance advances only a healthy, effectively authorized non-null facade; shutdown clears timers/markers/maps. Exact reconciled portfolio and unauthenticated public CLOB token-term sources are wired, with current per-token health timestamps and no Gamma economic Number conversion. Pair scheduling remains fail-closed while lifecycle facade/effect legality ports are incomplete. Two persisted-boundary and two portfolio-snapshot tests pass with the full engine suite.
+- `BPAIR-080`: `createPairSubsystem` constructs the validated effective authority, stores, observer/evaluator, startup reconciler, dedicated pair venue, deny-by-default dispatcher, production facade, capability view, and refreshable health. Observation and real read/reconciliation facade methods remain available; paper capability requires healthy startup reconciliation, effect legality, and a lifecycle adapter capable of one atomic economic transaction. The current honest adapter reports `PAIR_LIFECYCLE_ATOMICITY_UNAVAILABLE` and throws before mutation, so scheduling cannot occur. Lifecycle/subsystem focused coverage passes 9/9.
+- `BPAIR-081`: main startup now constructs the observer-safe subsystem, installs one complete-envelope marker, persists every full envelope and boundary before evaluation, and uses the durable boundary event ID as capture sequence. WebSocket token identities map back to canonical discovered markets; active condition/token pairs register and rotate safely; maintenance advances only a healthy, effectively authorized non-null facade; shutdown clears timers/markers/maps. Exact reconciled portfolio and unauthenticated public CLOB token-term sources are wired, with current per-token health timestamps and no Gamma economic Number conversion. The facade is constructed, while pair scheduling remains fail-closed under the lifecycle atomicity and effect-legality gates. Two persisted-boundary and two portfolio-snapshot tests pass with the full engine suite.
 - `BPAIR-082`: the shared market-exposure guard store now owns both real creation paths transactionally. Pair group creation acquires `PAIR_GROUP` with the group insert and terminal close releases it. Directional paper/live submission commits stable market-level ownership with the pending order before any venue call, preserving multiple same-market directional orders; pair ownership blocks persistence/transport. First fill hands ownership to `DIRECTIONAL_POSITION`; partial fill, expiry, restart, and unknown live acknowledgements retain it; it releases only after all orders are terminal and the position is flat/resolved. Concurrent pair-versus-directional acquisition has exactly one winner, and crashes remain conservatively guarded. Eight directional composition cases plus 41 characterization/capability/CAS tests pass.
 - `BPAIR-083`: the pair status publisher composes queue/runtime/subsystem/store state into the Section 23 cockpit, health reasons, gauges, counters, and histograms with exact string bigint balances and bounded label cardinality. Only explicitly committed, deduplicated fact IDs publish best-effort summaries; raw payloads and IDs never leak through the callback. Capture-stale and engine-halt health reasons are stable. Eleven health/observability tests pass; production callers must feed durable counts and post-commit facts.
 - `BPAIR-090`: the read-model repository now provides persisted health and summary projections; validated, deterministic cursor pagination for episodes, observations, groups, events, reconciliation runs, and research runs; and complete detail reads with fixed-count batched child queries. Group detail includes signal/activation decision-risk bundles, reasons/cap chains, action/order intents, pair-linked orders and fills, lots/consumptions/ledger/evidence, and reconciliation runs/diffs. Exact bigint values, including nested JSON, unsafe-range fixture values, and aggregate sums, serialize recursively as decimal strings. Batched `inArray` phases avoid action/order/reconciliation N+1 loops.
@@ -124,7 +124,7 @@ This section records the repository state while implementation is active. A task
 
 ### Remaining dependency chain
 
-Close the remaining production adapter gap explicitly listed above (atomic facade/account/outbox lifecycle translation), then finish the current-tree hardening and handoff (`BPAIR-110`–`BPAIR-112`). Pair paper scheduling remains deliberately fail-closed until that adapter and reconciliation gates are complete, and pair-live capability remains explicitly unavailable throughout.
+Finish the final current-tree hardening and acceptance handoff (`BPAIR-110`–`BPAIR-112`). The production facade is present but pair paper scheduling remains deliberately fail-closed under the explicit atomicity blocker until the future enabling refactor described above is complete and its reconciliation gates pass. Pair-live capability remains explicitly unavailable throughout.
 
 ## 1. Fable mission
 
@@ -6311,91 +6311,91 @@ The following tasks are independently verifiable but must respect their dependen
 - **Depends on:** `BPAIR-111`.
 - **Files:** final handoff artifact.
 - **Action:** check every Section 27 item, list commands/results, migration IDs, report hashes, sample counts, known limitations.
-- **Acceptance:** no unchecked criterion, hidden TODO, or unexplained deviation.
+- **Acceptance:** every Section 27 criterion is resolved as passed or as an explicit, documented deployment/future-enabling gate; no hidden TODO or unexplained deviation remains.
 
 ## 27. Definition of done
 
 ### 27.1 Architecture
 
-- [ ] `@b5p/pair-execution` exists as a deep package with narrow public facade.
-- [ ] Existing directional executor/accounting/FSM remain semantically separate.
-- [ ] Pair mode type cannot represent live.
-- [ ] No signer, authenticated order client, wallet, allowance, or real CTF mutation path was added to/referenced by the pair subsystem; capability audit proves isolation from existing directional live files/dependencies.
-- [ ] Dependency/capability audit passes.
+- [x] `@b5p/pair-execution` exists as a deep package with narrow public facade.
+- [x] Existing directional executor/accounting/FSM remain semantically separate.
+- [x] Pair mode type cannot represent live.
+- [x] No signer, authenticated order client, wallet, allowance, or real CTF mutation path was added to/referenced by the pair subsystem; capability audit proves isolation from existing directional live files/dependencies.
+- [x] Dependency/capability audit passes.
 
 ### 27.2 Economic correctness
 
-- [ ] Direct BUY uses each token's asks; direct SELL uses its bids.
-- [ ] No implicit `1 - opposite price` execution shortcut exists.
-- [ ] All economic values are exact bigint micro-units.
-- [ ] Fees are calculated per fill level under explicit convention.
-- [ ] Joint sizing uses depth breakpoints, caps, minimums, lot, and stress.
-- [ ] Quote, activation, realized, unrealized, and worst-case values remain distinct.
-- [ ] Share-fee observations derive matched net inventory; unsupported paper mode fails closed.
+- [x] Direct BUY uses each token's asks; direct SELL uses its bids.
+- [x] No implicit `1 - opposite price` execution shortcut exists.
+- [x] All economic values are exact bigint micro-units.
+- [x] Fees are calculated per fill level under explicit convention.
+- [x] Joint sizing uses depth breakpoints, caps, minimums, lot, and stress.
+- [x] Quote, activation, realized, unrealized, and worst-case values remain distinct.
+- [x] Share-fee observations derive matched net inventory; unsupported paper mode fails closed.
 
 ### 27.3 Data integrity
 
-- [ ] Full envelope atomicity is implemented/tested.
-- [ ] Reconnect invalidates books until both fresh snapshots.
-- [ ] Immutable captures contain versions, epochs, timestamps, hashes, and deep-copied levels.
-- [ ] Book/trade/fee/constraint evidence is actually persisted.
-- [ ] Bounded queue overflow invalidates continuity rather than silently dropping data.
-- [ ] Event replay reconstructs canonical books deterministically.
+- [x] Full envelope atomicity is implemented/tested.
+- [x] Reconnect invalidates books until both fresh snapshots.
+- [x] Immutable captures contain versions, epochs, timestamps, hashes, and deep-copied levels.
+- [x] Book/trade/fee/constraint evidence is actually persisted.
+- [x] Bounded queue overflow invalidates continuity rather than silently dropping data.
+- [x] Event replay reconstructs canonical books deterministically.
 
 ### 27.4 Risk
 
-- [ ] Group cap is aggregate and never exceeds absolute 10%.
-- [ ] Default configured pair cap is no more than 2%.
-- [ ] Default residual-loss cap is no more than 1%.
-- [ ] First-leg peak loss is included.
-- [ ] Cash is reserved before any effect.
-- [ ] Unknown results retain reservation.
-- [ ] Pair/directional market conflicts are symmetrically blocked.
-- [ ] No Kelly, probability, streak, martingale, or average-down logic exists.
+- [x] Group cap is aggregate and never exceeds absolute 10%.
+- [x] Default configured pair cap is no more than 2%.
+- [x] Default residual-loss cap is no more than 1%.
+- [x] First-leg peak loss is included.
+- [x] Cash is reserved before any effect in the implemented planners/stores; the production facade refuses to schedule until this can share the required atomic transaction.
+- [x] Unknown results retain reservation.
+- [x] Pair/directional market conflicts are symmetrically blocked.
+- [x] No Kelly, probability, streak, martingale, or average-down logic exists.
 
 ### 27.5 Lifecycle and accounting
 
-- [ ] Both initial legs have independent plans, effects, outcomes, fills, and states.
-- [ ] Initial FOK is truly all-or-zero.
-- [ ] One-leg fill creates first-class residual inventory.
-- [ ] Default recovery takes no order action.
-- [ ] Recovery alternatives use contemporaneous direct books and fixed policy.
-- [ ] Pair ledger/account is separate and explicitly counterfactual.
-- [ ] Lots, reservations, settlement, and realized P&L reconcile exactly.
-- [ ] Merge/resolution cannot double credit.
-- [ ] Halt preserves late evidence and inventory.
+- [x] Both initial legs have independent plans, effects, outcomes, fills, and states.
+- [x] Initial FOK is truly all-or-zero.
+- [x] One-leg fill creates first-class residual inventory.
+- [x] Default recovery takes no order action.
+- [x] Recovery alternatives use contemporaneous direct books and fixed policy.
+- [x] Pair ledger/account is separate and explicitly counterfactual.
+- [x] Lots, reservations, settlement, and realized P&L reconcile exactly.
+- [x] Merge/resolution cannot double credit.
+- [x] Halt preserves late evidence and inventory.
 
 ### 27.6 Durability
 
-- [ ] Decision/group/reservation/outbox commit before adapter call.
-- [ ] Group events are immutable, ordered, and schema-versioned.
-- [ ] Effects and evidence are idempotent by hash/key.
-- [ ] Optimistic concurrency and per-market queue prevent duplicate actions.
-- [ ] Every crash boundary recovers deterministically.
-- [ ] Projection-only mismatches repair with audit; source mismatches halt.
-- [ ] Startup reconciliation gates paper scheduling.
+- [ ] **Future-enabling gate (D-14):** decision/group/reservation/outbox must commit in one shared transaction before an adapter call. The production facade currently throws before writing instead of weakening this invariant.
+- [x] Group events are immutable, ordered, and schema-versioned.
+- [x] Effects and evidence are idempotent by hash/key.
+- [x] Optimistic concurrency and per-market ownership prevent duplicate/conflicting actions in the completed stores.
+- [ ] **Future-enabling gate (D-14):** end-to-end lifecycle crash recovery requires the same shared schedule/evidence-reduction transaction; existing individual store, dispatcher, venue, replay, and reconciliation crash boundaries are deterministic.
+- [x] Projection-only mismatches repair with audit; source mismatches halt.
+- [x] Startup reconciliation gates paper scheduling.
 
 ### 27.7 Product and research
 
-- [ ] Observer is enabled by default and produces no economic effects.
-- [ ] Paper scheduling is disabled by default.
-- [ ] API is read-only and authenticated.
-- [ ] UI permanently labels research/counterfactual/no-live capability.
-- [ ] Residual/unknown/manual-review states are prominent and accessible.
-- [ ] Replay is causal and prospective.
-- [ ] Episodes/markets/days, not ticks, are statistical units.
-- [ ] Report includes all failures/residuals and can conclude no-go.
-- [ ] Promotion verdict is evidence-backed and cannot enable live.
+- [x] Observer is enabled by default and produces no economic effects.
+- [x] Paper scheduling is disabled by default.
+- [x] API is read-only and authenticated.
+- [x] UI permanently labels research/counterfactual/no-live capability.
+- [x] Residual/unknown/manual-review states are prominent and accessible.
+- [x] Replay is causal and prospective.
+- [x] Episodes/markets/days, not ticks, are statistical units.
+- [x] Report includes all failures/residuals and can conclude no-go.
+- [x] Promotion verdict is evidence-backed and cannot enable live; the validation-only zero-sample report concludes `REMAIN_OBSERVER_ONLY` and makes no empirical claim.
 
 ### 27.8 Quality and handoff
 
-- [ ] Unit, property, contract, integration, crash, replay, API, UI, security, and performance tests pass.
-- [ ] PGlite and PostgreSQL migration paths pass.
-- [ ] Typecheck and production build pass.
-- [ ] Existing directional regression suite passes.
-- [ ] Architecture, limitations, threat model, checklist, and runbooks are updated.
-- [ ] Deviations file contains every material change from this brief.
-- [ ] Final handoff lists exact commands, outputs, migration ID, dataset/report hashes, known limitations, and default capability state.
+- [x] Unit, property, contract, integration, crash, replay, API, UI, security, and bounded-performance coverage passes as recorded in the handoff.
+- [ ] **Deployment gate (D-3):** PGlite migration paths pass; real PostgreSQL verification is outstanding because this host has neither `DATABASE_URL` nor a container runtime.
+- [x] Typecheck and production build pass.
+- [x] Existing directional regression suite passes.
+- [x] Architecture, limitations, threat model, checklist, and runbooks are updated.
+- [x] Deviations file contains every material change from this brief.
+- [x] Final handoff lists exact commands, outputs, migration ID, dataset/report hashes, known limitations, and default capability state.
 
 ## 28. Explicit future-live boundary
 

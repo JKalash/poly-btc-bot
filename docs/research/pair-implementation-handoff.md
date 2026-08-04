@@ -13,7 +13,7 @@
 ## Source and implementation versions
 
 - Original implementation baseline: `4d955b0` (see `pair-implementation-baseline.md` and deviation D-2).
-- Resumed branch base/current committed revision: `b317144` plus the uncommitted worktree listed below.
+- Resumed branch base: `b317144`; latest externally created committed checkpoint observed during the run: `066c95c`, plus the final uncommitted lifecycle-adapter worktree.
 - Borrowing provenance: `MrFadiAi/Polymarket-bot` revision `82647014e0c355a5684e09666d8a0a522234640d` (MIT), used as engineering input rather than copied execution authority.
 - Pair strategy: `complete_set_pair_v0_RESEARCH_ONLY`.
 - Pair event/schema version: `1`.
@@ -80,7 +80,7 @@ No empirical promotion claim is made. A real study still requires at least 300 a
 
 ## Known limitations and gates
 
-- Runtime paper scheduling remains disabled until the production facade/account/group/outbox lifecycle translation is demonstrably atomic and startup/effect legality gates are healthy. No placeholder or no-op port is accepted.
+- The production facade exists and exposes real durable reads/reconciliation, but runtime paper scheduling remains disabled by `PAIR_LIFECYCLE_ATOMICITY_UNAVAILABLE`. The current store APIs cannot share one transaction across group/event/guard, account reservation/journal, and outbox facts; schedule plans also omit account CAS and complete approved decision/risk facts. Evidence reduction needs one transaction spanning inbox/effect, event/projection, order/fill, lot/ledger, and account projection. Mutation ports throw before writing; no placeholder or no-op success is accepted.
 - Public token terms are exact and unauthenticated, but network availability, payload identity, supported fee authority, and freshness continue to fail closed.
 - Unknown venue outcomes, residual inventory, and reconciliation mismatches retain cash/inventory ownership and surface manual review; they are never converted into fills or profit.
 - The validated report is synthetic and cannot satisfy any empirical promotion gate.
