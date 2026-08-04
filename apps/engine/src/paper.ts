@@ -73,6 +73,12 @@ export interface PaperExecHooks {
   onQueueChanged?(o: PaperOrderRecord, consumed6: Shares6, tsMs: number): void;
   /** Order reached a terminal status (MATCHED / CANCELED / REJECTED / EXPIRED). */
   onFinished?(o: PaperOrderRecord, status: PaperOrderRecord["status"], reason: string, nowMs: number): void;
+  /**
+   * A risk invariant was breached at fill time (e.g. a fill would exceed the
+   * approved stake cap). The executor already fails closed locally; this hook
+   * lets the engine escalate (spec: risk-limit breach at fill time -> halt).
+   */
+  onInvariantBreach?(o: PaperOrderRecord, detail: string, nowMs: number): void;
 }
 
 export class PaperExecutor {
@@ -280,6 +286,7 @@ export class PaperExecutor {
     // invariant: total stake spent never exceeds the approved cap
     if (o.spent6 + cost + fee6 > o.stakeCap6) {
       logger.error("fill would exceed approved stake; truncating", { orderId: o.id });
+      try { this.hooks?.onInvariantBreach?.(o, `fill would exceed approved stake cap (spent ${o.spent6} + cost ${cost} + fee ${fee6} > cap ${o.stakeCap6})`, tsMs); } catch { /* hooks never affect execution */ }
       return;
     }
     o.filled6 += shares6;

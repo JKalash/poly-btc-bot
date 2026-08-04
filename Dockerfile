@@ -21,7 +21,12 @@ RUN pnpm install --frozen-lockfile
 
 COPY . .
 
-# production Next.js build (api/engine run TS via tsx and need no build)
+# production Next.js build (api/engine run TS via tsx and need no build).
+# API_PROXY_TARGET must be supplied at BUILD time: Next.js evaluates
+# rewrites() once during `next build` and freezes the destination into the
+# routes manifest — a runtime env var on the built image has no effect.
+ARG API_PROXY_TARGET=http://127.0.0.1:8787
+ENV API_PROXY_TARGET=${API_PROXY_TARGET}
 RUN pnpm --filter @b5p/web build
 
 EXPOSE 3000 8787
