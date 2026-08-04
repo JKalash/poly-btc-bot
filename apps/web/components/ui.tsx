@@ -34,6 +34,15 @@ const STATE_TONE: Record<string, string> = {
   OBSERVE: "bg-panel2 text-ink2 border-hairline",
   HALTED: "bg-critical/15 text-critical border-critical/50",
   DEGRADED: "bg-serious/15 text-serious border-serious/50",
+  HEALTHY: "bg-good/15 text-good border-good/50",
+  MISMATCH: "bg-critical/15 text-critical border-critical/50",
+  MANUAL_REVIEW: "bg-critical/15 text-critical border-critical/50",
+  OUTCOME_UNKNOWN: "bg-critical/15 text-critical border-critical/50",
+  RECOVERY_OUTCOME_UNKNOWN: "bg-critical/15 text-critical border-critical/50",
+  MERGE_OUTCOME_UNKNOWN: "bg-critical/15 text-critical border-critical/50",
+  RESIDUAL: "bg-warning/15 text-warning border-warning/50",
+  RECOVERY_PENDING: "bg-warning/15 text-warning border-warning/50",
+  PENDING: "bg-warning/15 text-warning border-warning/50",
   LIVE_ARMED: "bg-critical/15 text-critical border-critical/50",
   OFFLINE: "bg-panel2 text-muted border-hairline",
 };
@@ -69,7 +78,7 @@ export function Meter({ value, max = 1, className = "" }: { value: number; max?:
   );
 }
 
-export function Th({ children }: { children: ReactNode }) { return <th className="th">{children}</th>; }
+export function Th({ children }: { children: ReactNode }) { return <th scope="col" className="th">{children}</th>; }
 export function Td({ children, className = "" }: { children: ReactNode; className?: string }) { return <td className={`td ${className}`}>{children}</td>; }
 
 export function Empty({ text }: { text: string }) {

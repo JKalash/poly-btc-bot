@@ -65,6 +65,13 @@ packages/config  zod schema, validation, versioned config with diffs
 packages/db      drizzle schema + migrations; Postgres or embedded PGlite
 ```
 
+The repository also contains an isolated UP+DOWN paired-opportunity observer and counterfactual
+paper research stack. It captures complete public-book envelopes, quotes both legs with exact
+fixed-point arithmetic, records residual and reconciliation evidence, supports deterministic
+replay, and exposes read-only `/api/pairs/*` and `/pairs` views. Pair live execution does not
+exist, and production pair paper scheduling remains fail-closed until every exact-data,
+accounting, lifecycle, and startup gate is healthy.
+
 ## Non-negotiables (enforced in code, covered by tests)
 
 - Paper mode by default; **live trading disarmed by default** — real orders require a configured
@@ -73,6 +80,7 @@ packages/db      drizzle schema + migrations; Postgres or embedded PGlite
 - Absolute per-market risk cap **10%**; no martingale, no averaging down, no all-in preset, no auto re-arm.
 - Decimal/fixed-point arithmetic for all money (`bigint` micro-units); floats only for display/statistics.
 - Every order decision persisted as an immutable snapshot **before** any order exists.
+- Pair research is structurally no-live: no key/signing dependency and no API or dashboard mutation.
 - Post-only maker orders that would cross are rejected safely, never converted to takers.
 - Stale Chainlink/book data, unknown price-to-beat, unknown fee schedule, clock drift → fail closed.
 - Chainlink is authoritative (rules verified per market); Binance is diagnostic/confirmation only.

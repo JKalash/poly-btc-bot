@@ -8,6 +8,9 @@ describe("config schema", () => {
     expect(DEFAULT_CONFIG.strategy.allow_taker).toBe(false);
     expect(DEFAULT_CONFIG.live.enabled).toBe(false);
     expect(DEFAULT_CONFIG.risk.no_martingale).toBe(true);
+    expect(DEFAULT_CONFIG.pair.observer_enabled).toBe(true);
+    expect(DEFAULT_CONFIG.pair.paper_execution_enabled).toBe(false);
+    expect(DEFAULT_CONFIG.pair.live_execution_enabled).toBe(false);
   });
 
   it("refuses risk above the absolute 10% safety cap", () => {
@@ -24,6 +27,46 @@ describe("config schema", () => {
 
   it("refuses martingale-style flags", () => {
     expect(validateConfig({ risk: { no_martingale: false } }).ok).toBe(false);
+  });
+
+  it("validates pair policy with exact decimal comparisons", () => {
+    expect(validateConfig({ pair: { maximum_cash_fraction: "0.100001" } }).ok).toBe(false);
+    expect(validateConfig({ pair: { maximum_cash_fraction: "0.1" } }).ok).toBe(true);
+    expect(validateConfig({ pair: {
+      maximum_cash_fraction: "0.02",
+      maximum_residual_loss_fraction: "0.020001",
+    } }).ok).toBe(false);
+    expect(validateConfig({ pair: {
+      maximum_aggregate_reserved_fraction: "0.02",
+      maximum_aggregate_residual_loss_fraction: "0.020001",
+    } }).ok).toBe(false);
+  });
+
+  it("fails closed for unsafe pair scheduling and policy combinations", () => {
+    expect(validateConfig({ pair: { paper_execution_enabled: true, observer_enabled: false } }).ok).toBe(false);
+    expect(validateConfig({ pair: { live_execution_enabled: true } }).ok).toBe(false);
+    expect(validateConfig({ pair: { settlement_policy: "PAPER_VIRTUAL_MERGE" } }).ok).toBe(false);
+    expect(validateConfig({ pair: {
+      recovery_policy: "PAPER_COMPLETE_MISSING_LEG",
+      maximum_recovery_attempts: 1,
+      recovery_reserve_usdc: "1",
+    } }).ok).toBe(false);
+    expect(validateConfig({ pair: {
+      paper_execution_enabled: true,
+      recovery_policy: "PAPER_COMPLETE_MISSING_LEG",
+      maximum_recovery_attempts: 1,
+      recovery_reserve_usdc: "1",
+    } }).ok).toBe(true);
+  });
+
+  it("rejects invalid pair timing, lot, recovery, and depth relationships", () => {
+    expect(validateConfig({ pair: { observer_flush_interval_ms: 501 } }).ok).toBe(false);
+    expect(validateConfig({ pair: { activation_quote_ttl_ms: 501 } }).ok).toBe(false);
+    expect(validateConfig({ pair: { pair_share_lot: "0" } }).ok).toBe(false);
+    expect(validateConfig({ pair: { pair_share_lot: "1", maximum_pair_shares: "0.5" } }).ok).toBe(false);
+    expect(validateConfig({ pair: { maximum_recovery_attempts: 1 } }).ok).toBe(false);
+    expect(validateConfig({ pair: { depth_stress_fractions: ["0.50", "0.75", "0.25"] } }).ok).toBe(false);
+    expect(validateConfig({ pair: { depth_stress_fractions: ["1", "0.5", "0.000001"] } }).ok).toBe(true);
   });
 
   it("diffs configs by dot path", () => {

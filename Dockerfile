@@ -14,6 +14,7 @@ COPY packages/db/package.json packages/db/package.json
 COPY packages/domain/package.json packages/domain/package.json
 COPY packages/evidence/package.json packages/evidence/package.json
 COPY packages/experiments/package.json packages/experiments/package.json
+COPY packages/pair-execution/package.json packages/pair-execution/package.json
 COPY packages/polymarket/package.json packages/polymarket/package.json
 COPY packages/risk/package.json packages/risk/package.json
 COPY packages/strategy/package.json packages/strategy/package.json

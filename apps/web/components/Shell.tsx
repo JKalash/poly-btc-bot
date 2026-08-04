@@ -19,6 +19,7 @@ const NAV: Array<[string, string]> = [
   ["/inventory", "Inventory Lab"],
   ["/execution", "Execution Lab"],
   ["/strategy", "Strategy Comparison"],
+  ["/pairs", "Pair Research"],
   ["/timing-lab", "Timing Lab"],
   ["/risk", "Risk Center"],
   ["/config", "Configuration"],

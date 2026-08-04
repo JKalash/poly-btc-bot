@@ -11,6 +11,12 @@ import { z } from "zod";
 
 const fraction = z.string().regex(/^\d+(\.\d{1,6})?$/, "decimal fraction with <=6 places");
 
+/** Parse a validated decimal fraction to exact millionths without using Number. */
+function fractionMillionths(value: string): bigint {
+  const [whole, decimal = ""] = value.split(".");
+  return BigInt(whole!) * 1_000_000n + BigInt(decimal.padEnd(6, "0"));
+}
+
 export const AppConfigSchema = z.object({
   app: z.object({
     timezone_display: z.string().default("Europe/Madrid"),
@@ -138,6 +144,72 @@ export const AppConfigSchema = z.object({
      *  - gist_degen:     entire simulated bankroll every trade (ruin demo)
      */
     sizing_simulation: z.enum(["profile", "fixed_stake", "gist_safe", "gist_aggressive", "gist_degen"]).default("profile"),
+  }).default({}),
+
+  /** Complete-set pair observer and prospective paper execution (§19). */
+  pair: z.object({
+    observer_enabled: z.boolean().default(true),
+    paper_execution_enabled: z.boolean().default(false),
+    live_execution_enabled: z.literal(false).default(false),
+    strategy_version: z.literal("complete_set_pair_v0_RESEARCH_ONLY").default("complete_set_pair_v0_RESEARCH_ONLY"),
+    route: z.literal("DIRECT_BUY_BOTH").default("DIRECT_BUY_BOTH"),
+
+    maximum_book_age_ms: z.number().int().positive().default(500),
+    maximum_source_skew_ms: z.number().int().nonnegative().default(100),
+    maximum_receive_skew_ms: z.number().int().nonnegative().default(100),
+    maximum_future_timestamp_ms: z.number().int().nonnegative().default(250),
+    maximum_fee_snapshot_age_ms: z.number().int().positive().default(300_000),
+    maximum_constraint_snapshot_age_ms: z.number().int().positive().default(300_000),
+
+    activation_latency_ms: z.number().int().nonnegative().default(350),
+    dispatch_model: z.enum(["PARALLEL", "UP_THEN_DOWN", "DOWN_THEN_UP"]).default("PARALLEL"),
+    inter_leg_delay_ms: z.number().int().nonnegative().default(50),
+    activation_quote_ttl_ms: z.number().int().positive().default(250),
+
+    maximum_cash_fraction: fraction.default("0.02"),
+    maximum_residual_loss_fraction: fraction.default("0.01"),
+    maximum_aggregate_reserved_fraction: fraction.default("0.02"),
+    maximum_aggregate_residual_loss_fraction: fraction.default("0.01"),
+    maximum_active_pair_groups: z.literal(1).default(1),
+    maximum_pair_daily_loss_fraction: fraction.default("0.02"),
+    maximum_pair_session_drawdown_fraction: fraction.default("0.02"),
+
+    minimum_net_pnl_usdc: fraction.default("0.01"),
+    minimum_net_return: fraction.default("0.001"),
+    operational_risk_haircut_usdc: fraction.default("0.01"),
+    prefilter_band_usdc_per_share: fraction.default("0.005"),
+    require_one_tick_stress_positive: z.boolean().default(true),
+    require_two_tick_stress_positive: z.boolean().default(false),
+    depth_stress_fractions: z.tuple([fraction, fraction, fraction]).default(["0.75", "0.50", "0.25"]),
+
+    pair_share_lot: fraction.default("0.01"),
+    maximum_pair_shares: fraction.optional(),
+    entry_cutoff_seconds: z.number().int().nonnegative().default(30),
+
+    settlement_policy: z.enum(["HOLD_TO_RESOLUTION", "PAPER_VIRTUAL_MERGE"]).default("HOLD_TO_RESOLUTION"),
+    modeled_settlement_delay_ms: z.number().int().nonnegative().default(0),
+    modeled_settlement_cost_usdc: fraction.default("0"),
+    settlement_cash_reserve_usdc: fraction.default("0"),
+
+    recovery_policy: z.enum([
+      "NO_AUTO_RECOVERY",
+      "PAPER_COMPLETE_MISSING_LEG",
+      "PAPER_LIQUIDATE_FILLED_LEG",
+      "PAPER_MINIMIZE_WORST_LOSS",
+    ]).default("NO_AUTO_RECOVERY"),
+    maximum_recovery_attempts: z.union([z.literal(0), z.literal(1)]).default(0),
+    recovery_deadline_ms: z.number().int().positive().default(1_500),
+    recovery_reserve_usdc: fraction.default("0"),
+
+    episode_cooloff_ms: z.number().int().nonnegative().default(1_000),
+    negative_control_sample_ppm: z.number().int().min(0).max(1_000_000).default(1_000),
+    observer_flush_interval_ms: z.number().int().min(10).default(50),
+    capture_queue_capacity: z.number().int().positive().default(10_000),
+    market_event_batch_size: z.number().int().positive().default(500),
+    checkpoint_interval_ms: z.number().int().positive().default(1_000),
+    reconcile_interval_ms: z.number().int().positive().default(5_000),
+    unknown_result_timeout_ms: z.number().int().positive().default(5_000),
+    paper_account_model: z.literal("COUNTERFACTUAL_ISOLATED").default("COUNTERFACTUAL_ISOLATED"),
   }).default({}),
 
   live: z.object({
@@ -301,6 +373,58 @@ export function validateConfig(raw: unknown): { ok: true; config: AppConfig } | 
   }
   if (Number(cfg.risk.base_risk_fraction) > Number(cfg.risk.max_risk_fraction)) {
     issues.push({ path: "risk.base_risk_fraction", message: "base risk exceeds max risk fraction" });
+  }
+  const absoluteCap = fractionMillionths(ABSOLUTE_MAX_RISK_FRACTION);
+  const pair = cfg.pair;
+  const pairFraction = (field: keyof typeof pair): bigint => fractionMillionths(pair[field] as string);
+  const pairCapFields = [
+    "maximum_cash_fraction",
+    "maximum_aggregate_reserved_fraction",
+    "maximum_pair_daily_loss_fraction",
+    "maximum_pair_session_drawdown_fraction",
+  ] as const;
+  for (const field of pairCapFields) {
+    if (pairFraction(field) > absoluteCap) {
+      issues.push({ path: `pair.${field}`, message: `exceeds the absolute safety cap ${ABSOLUTE_MAX_RISK_FRACTION}` });
+    }
+  }
+  if (pairFraction("maximum_residual_loss_fraction") > pairFraction("maximum_cash_fraction")) {
+    issues.push({ path: "pair.maximum_residual_loss_fraction", message: "residual loss fraction exceeds pair cash fraction" });
+  }
+  if (pairFraction("maximum_aggregate_residual_loss_fraction") > pairFraction("maximum_aggregate_reserved_fraction")) {
+    issues.push({ path: "pair.maximum_aggregate_residual_loss_fraction", message: "aggregate residual loss fraction exceeds aggregate reserved fraction" });
+  }
+  if (pairFraction("pair_share_lot") <= 0n) {
+    issues.push({ path: "pair.pair_share_lot", message: "pair share lot must be positive" });
+  }
+  if (pair.maximum_pair_shares !== undefined && fractionMillionths(pair.maximum_pair_shares) < pairFraction("pair_share_lot")) {
+    issues.push({ path: "pair.maximum_pair_shares", message: "maximum pair shares must be at least one pair share lot" });
+  }
+  if (pair.observer_flush_interval_ms > pair.maximum_book_age_ms) {
+    issues.push({ path: "pair.observer_flush_interval_ms", message: "observer flush interval exceeds maximum book age" });
+  }
+  if (pair.activation_quote_ttl_ms > pair.maximum_book_age_ms) {
+    issues.push({ path: "pair.activation_quote_ttl_ms", message: "activation quote TTL exceeds maximum book age" });
+  }
+  if (pair.paper_execution_enabled && !pair.observer_enabled) {
+    issues.push({ path: "pair.paper_execution_enabled", message: "paper scheduling requires the observer" });
+  }
+  const automaticRecovery = pair.recovery_policy !== "NO_AUTO_RECOVERY";
+  if (automaticRecovery && !pair.paper_execution_enabled) {
+    issues.push({ path: "pair.recovery_policy", message: "automatic recovery requires paper scheduling" });
+  }
+  if ((!automaticRecovery && pair.maximum_recovery_attempts !== 0) || (automaticRecovery && pair.maximum_recovery_attempts !== 1)) {
+    issues.push({ path: "pair.maximum_recovery_attempts", message: automaticRecovery ? "automatic recovery requires exactly one attempt" : "no-auto-recovery requires zero attempts" });
+  }
+  if (automaticRecovery && pairFraction("recovery_reserve_usdc") === 0n) {
+    issues.push({ path: "pair.recovery_reserve_usdc", message: "automatic recovery requires a non-zero cash reserve" });
+  }
+  if (pair.settlement_policy === "PAPER_VIRTUAL_MERGE" && !pair.paper_execution_enabled) {
+    issues.push({ path: "pair.settlement_policy", message: "virtual merge requires paper scheduling" });
+  }
+  const depthStress = pair.depth_stress_fractions.map(fractionMillionths);
+  if (!(depthStress[0]! <= 1_000_000n && depthStress[0]! > depthStress[1]! && depthStress[1]! > depthStress[2]! && depthStress[2]! > 0n)) {
+    issues.push({ path: "pair.depth_stress_fractions", message: "depth stress fractions must be strictly descending and within (0, 1]" });
   }
   if (cfg.strategy.candidate_seconds_remaining_min >= cfg.strategy.candidate_seconds_remaining_max) {
     issues.push({ path: "strategy.candidate_seconds_remaining_min", message: "candidate window min must be < max" });

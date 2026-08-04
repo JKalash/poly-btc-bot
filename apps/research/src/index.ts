@@ -10,3 +10,11 @@ export {
 } from "./wallet-research";
 export { persistWalletResearchSnapshot } from "./wallet-research-persist";
 export type { ReproExperiment, ReproRunResult, ClaimComparison, PreregisteredDefinition } from "./repro/types";
+export * from "./pair-dataset-manifest";
+export * from "./pair-replay-clock";
+export * from "./pair-market-replay";
+export * from "./pair-research-scenario";
+export * from "./pair-scenario-runner";
+export * from "./pair-episode-statistics";
+export * from "./pair-research-report";
+export * from "./pair-report-artifacts";

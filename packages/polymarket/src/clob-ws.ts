@@ -62,12 +62,33 @@ const TickSizeMsg = z.object({
   timestamp: z.union([z.string(), z.number()]).optional(),
 });
 
+/**
+ * Per-message provenance the transport knows but the payload does not carry
+ * (spec §10.5). Everything else on the retention list is already surfaced in
+ * the parsed message itself: raw kind = which callback fired; market/token
+ * ids, exchange timestamp, and exchange hashes (book `hash`, per-change
+ * `price_changes[].hash`) are message fields; the envelope boundary is the
+ * whole `price_change` message; `receivedTsMs` is the local receive time.
+ * The market channel supplies NO message/event id and NO source sequence —
+ * none is invented here.
+ */
+export interface ClobMessageMeta {
+  /** Epoch of the connection that delivered this message (fresh per (re)connect). */
+  connectionEpoch: string;
+}
+
 export interface ClobWsCallbacks {
-  onBook: (msg: z.infer<typeof BookMsg>, receivedTsMs: number) => void;
-  onPriceChange: (msg: z.infer<typeof PriceChangeMsg>, receivedTsMs: number) => void;
-  onLastTrade: (msg: z.infer<typeof LastTradeMsg>, receivedTsMs: number) => void;
-  onTickSizeChange?: (msg: z.infer<typeof TickSizeMsg>, receivedTsMs: number) => void;
+  onBook: (msg: z.infer<typeof BookMsg>, receivedTsMs: number, meta: ClobMessageMeta) => void;
+  onPriceChange: (msg: z.infer<typeof PriceChangeMsg>, receivedTsMs: number, meta: ClobMessageMeta) => void;
+  onLastTrade: (msg: z.infer<typeof LastTradeMsg>, receivedTsMs: number, meta: ClobMessageMeta) => void;
+  onTickSizeChange?: (msg: z.infer<typeof TickSizeMsg>, receivedTsMs: number, meta: ClobMessageMeta) => void;
   onStatus?: (status: WsStatus, detail?: string) => void;
+  /**
+   * Reconnect/reset surface (§12.3): fired once per (re)connect with the new
+   * connection epoch, BEFORE resubscribe and before any message of the new
+   * connection — invalidate books here. `prevEpoch` is null on first connect.
+   */
+  onEpochChange?: (epoch: string, prevEpoch: string | null) => void;
 }
 
 export const CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -82,6 +103,7 @@ export class ClobMarketWs {
       name: "clob-market",
       pingIntervalMs: 5000,
       onStatus: (s, d) => cb.onStatus?.(s, d),
+      onEpochChange: (epoch, prev) => cb.onEpochChange?.(epoch, prev),
       onOpen: (send) => {
         if (this.assetIds.length > 0) {
           send(JSON.stringify({ assets_ids: this.assetIds, type: "market" }));
@@ -95,6 +117,8 @@ export class ClobMarketWs {
   stop(): void { this.ws.stop(); }
   ageMs(now?: number): number | null { return this.ws.ageMs(now); }
   get reconnectCount(): number { return this.ws.reconnectCount; }
+  /** Epoch of the current connection; null until the first successful open. */
+  get connectionEpoch(): string | null { return this.ws.connectionEpoch; }
 
   /**
    * Replace the subscription set. Genuinely reconnect-based: the documented
@@ -116,31 +140,34 @@ export class ClobMarketWs {
   private handle(data: string, receivedTsMs: number): void {
     let json: unknown;
     try { json = JSON.parse(data); } catch { return; }
+    // A message can only arrive on an open connection, so an epoch exists;
+    // "" is an unreachable fail-closed fallback (matches no real epoch).
+    const meta: ClobMessageMeta = { connectionEpoch: this.ws.connectionEpoch ?? "" };
     const items = Array.isArray(json) ? json : [json];
-    for (const item of items) this.dispatch(item, receivedTsMs);
+    for (const item of items) this.dispatch(item, receivedTsMs, meta);
   }
 
-  private dispatch(item: unknown, receivedTsMs: number): void {
+  private dispatch(item: unknown, receivedTsMs: number, meta: ClobMessageMeta): void {
     if (typeof item !== "object" || item === null) return;
     const et = (item as { event_type?: string }).event_type;
     if (et === "last_trade_price") {
       const m = LastTradeMsg.safeParse(item);
-      if (m.success) this.cb.onLastTrade(m.data, receivedTsMs);
+      if (m.success) this.cb.onLastTrade(m.data, receivedTsMs, meta);
       return;
     }
     if (et === "tick_size_change") {
       const m = TickSizeMsg.safeParse(item);
-      if (m.success) this.cb.onTickSizeChange?.(m.data, receivedTsMs);
+      if (m.success) this.cb.onTickSizeChange?.(m.data, receivedTsMs, meta);
       return;
     }
     if (et === "price_change" || "price_changes" in item) {
       const m = PriceChangeMsg.safeParse(item);
-      if (m.success) this.cb.onPriceChange(m.data, receivedTsMs);
+      if (m.success) this.cb.onPriceChange(m.data, receivedTsMs, meta);
       return;
     }
     if (et === "book" || ("bids" in item && "asks" in item && "asset_id" in item)) {
       const m = BookMsg.safeParse(item);
-      if (m.success) this.cb.onBook(m.data, receivedTsMs);
+      if (m.success) this.cb.onBook(m.data, receivedTsMs, meta);
       return;
     }
   }

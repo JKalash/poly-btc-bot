@@ -2,6 +2,20 @@
 
 ## Not implemented (stubs / documented seams)
 
+- **Pair paper scheduling is intentionally disabled in the production composition root.** The
+  observer, exact economics, durable evidence stores, paper venue, lifecycle planners,
+  reconciliation, replay, and read-only projections exist, but production still refuses pair
+  scheduling while the audited atomic facade/account/outbox lifecycle adapters remain incomplete.
+  Exact public CLOB token terms and the reconciled isolated portfolio are wired; malformed, stale,
+  or unsupported term authority still fails closed and is never replaced with approximate Gamma
+  numbers or fabricated balances.
+- **Pair live execution does not exist.** The pair package has no signer, wallet, authenticated
+  venue dependency, live capability flag, or dashboard control. This is independent of the
+  repository's separately armed directional live path.
+- **Pair PostgreSQL verification remains required.** Pair store integration tests currently use
+  PGlite. The migration and transaction suite must also pass against the supported PostgreSQL
+  deployment before pair paper scheduling can be considered.
+
 - **Live trading** — a real signing path EXISTS (`LiveClobAdapter` +
   `LiveController`), disarmed by default and gated by env config plus a typed operator
   acknowledgement with a bounded TTL (`docs/live-trading.md`). `DisabledLiveAdapter` is a legacy
@@ -10,7 +24,7 @@
   live ledger separate from paper accounting.
 - **Shadow wallet reads** — shadow mode produces would-submit intents and snapshots, but reads no
   real wallet balances (requires authenticated CLOB API; deferred with the live adapter).
-- **Backtest/replay UI** — `backtest_runs` table and recorded tick/book/trade data exist and the
+- **Directional backtest/replay UI** — `backtest_runs` table and recorded tick/book/trade data exist and the
   paper engine is deterministic-steppable (see engine tests, which drive `step(nowMs)` manually),
   but there is no dashboard page to launch replays yet. Replays run today only as code.
 - **Calibrated models** — `calibrated_logistic` refuses to estimate (no artifact). Building the

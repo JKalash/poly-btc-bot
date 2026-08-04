@@ -1,0 +1,29 @@
+{
+  "name": "@b5p/pair-execution",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./internal/ledger": "./src/ledger.ts",
+    "./internal/reconciliation": "./src/reconciliation-internal.ts",
+    "./internal/serial-dispatch": "./src/serial-dispatch.ts",
+    "./internal/settlement-integration": "./src/settlement-integration.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@b5p/domain": "workspace:*",
+    "@b5p/strategy": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "5.7.3",
+    "vitest": "2.1.8",
+    "fast-check": "3.23.2"
+  }
+}

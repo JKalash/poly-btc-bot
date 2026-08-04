@@ -43,6 +43,13 @@
       "when": 1785762705830,
       "tag": "0005_bitter_agent_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785773569077,
+      "tag": "0006_furry_nemesis",
+      "breakpoints": true
     }
   ]
 }

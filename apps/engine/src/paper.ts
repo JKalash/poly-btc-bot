@@ -1,5 +1,5 @@
 import type { AppConfig } from "@b5p/config";
-import { orderFills, orders as ordersTable, type DbHandle } from "@b5p/db";
+import { orderFills, orders as ordersTable, type Db, type DbHandle } from "@b5p/db";
 import { newId } from "@b5p/domain/ids";
 import {
   breakEvenTakerUsdcCollected, mulDiv, takerFeeUsdc,
@@ -8,6 +8,7 @@ import {
 import type { BookState } from "@b5p/strategy";
 import { eq } from "drizzle-orm";
 import { logger } from "./log";
+import { DirectionalExposureCoordinator } from "./directional-exposure-guard";
 
 /**
  * Paper execution simulator.
@@ -83,6 +84,7 @@ export interface PaperExecHooks {
 
 export class PaperExecutor {
   private orders = new Map<string, PaperOrderRecord>();
+  private readonly exposure: DirectionalExposureCoordinator;
   /** Optional timeline observation hooks; never affect execution. */
   hooks: PaperExecHooks | null = null;
 
@@ -92,7 +94,10 @@ export class PaperExecutor {
     private readonly feeCollection: () => "usdc" | "shares",
     private readonly onFill: (f: FillEvent) => Promise<void>,
     private readonly books: (tokenId: string) => BookState | null,
-  ) {}
+    private readonly persistFill?: (f: FillEvent, executor: Db) => Promise<void>,
+  ) {
+    this.exposure = new DirectionalExposureCoordinator(db);
+  }
 
   restingOrders(): PaperOrderRecord[] {
     return [...this.orders.values()].filter((o) => o.status === "LIVE" || o.status === "PARTIAL" || o.status === "PENDING");
@@ -154,28 +159,31 @@ export class PaperExecutor {
       exitPolicy: args.exitPolicy,
       createdAtMs: args.nowMs,
     };
-    this.orders.set(rec.id, rec);
-    await this.db.db.insert(ordersTable).values({
-      id: rec.id,
-      intentId: rec.intentId,
-      decisionId: rec.decisionId,
-      marketId: rec.marketId,
-      tokenId: rec.tokenId,
-      outcomeSide: rec.outcomeSide,
-      orderSide: "BUY",
-      style: rec.style,
-      timeInForce: rec.style === "maker_post_only" ? "GTD" : "FAK",
-      postOnly: rec.style === "maker_post_only",
-      price6: rec.price6,
-      shares6: rec.shares6,
-      filledShares6: 0n,
-      stake6: rec.stakeCap6,
-      mode: "paper",
-      status: rec.status,
-      expireAtMs: rec.expireAtMs,
-      createdAtMs: rec.createdAtMs,
-      updatedAtMs: rec.createdAtMs,
+    await this.exposure.transaction(async (guard, executor) => {
+      await this.exposure.claimOrder(guard, rec.marketId, rec.createdAtMs);
+      await executor.insert(ordersTable).values({
+        id: rec.id,
+        intentId: rec.intentId,
+        decisionId: rec.decisionId,
+        marketId: rec.marketId,
+        tokenId: rec.tokenId,
+        outcomeSide: rec.outcomeSide,
+        orderSide: "BUY",
+        style: rec.style,
+        timeInForce: rec.style === "maker_post_only" ? "GTD" : "FAK",
+        postOnly: rec.style === "maker_post_only",
+        price6: rec.price6,
+        shares6: rec.shares6,
+        filledShares6: 0n,
+        stake6: rec.stakeCap6,
+        mode: "paper",
+        status: rec.status,
+        expireAtMs: rec.expireAtMs,
+        createdAtMs: rec.createdAtMs,
+        updatedAtMs: rec.createdAtMs,
+      });
     });
+    this.orders.set(rec.id, rec);
     return rec;
   }
 
@@ -289,20 +297,27 @@ export class PaperExecutor {
       try { this.hooks?.onInvariantBreach?.(o, `fill would exceed approved stake cap (spent ${o.spent6} + cost ${cost} + fee ${fee6} > cap ${o.stakeCap6})`, tsMs); } catch { /* hooks never affect execution */ }
       return;
     }
+    const previousFilled6 = o.filled6;
+    const previousSpent6 = o.spent6;
     o.filled6 += shares6;
     o.spent6 += cost + fee6;
     const fillId = newId();
-    await this.db.db.insert(orderFills).values({
-      id: fillId,
-      orderId: o.id,
-      price6,
-      shares6,
-      feeUsdc6: fee6,
-      maker,
-      tsMs,
-    });
-    await this.db.db.update(ordersTable).set({ filledShares6: o.filled6, updatedAtMs: tsMs }).where(eq(ordersTable.id, o.id));
-    await this.onFill({ order: o, shares6, price6, fee6, maker, tsMs, fillId });
+    const fill = { order: o, shares6, price6, fee6, maker, tsMs, fillId } satisfies FillEvent;
+    try {
+      await this.exposure.transaction(async (guard, executor) => {
+        await executor.insert(orderFills).values({
+          id: fillId, orderId: o.id, price6, shares6, feeUsdc6: fee6, maker, tsMs,
+        });
+        await executor.update(ordersTable).set({ filledShares6: o.filled6, updatedAtMs: tsMs }).where(eq(ordersTable.id, o.id));
+        await this.persistFill?.(fill, executor);
+        await this.exposure.reconcile(guard, executor, o.marketId, tsMs);
+      });
+    } catch (error) {
+      o.filled6 = previousFilled6;
+      o.spent6 = previousSpent6;
+      throw error;
+    }
+    await this.onFill(fill);
   }
 
   async cancel(orderId: string, reason: string, nowMs: number): Promise<boolean> {
@@ -325,10 +340,19 @@ export class PaperExecutor {
   }
 
   private async finish(o: PaperOrderRecord, status: PaperOrderRecord["status"], reason: string, nowMs: number): Promise<void> {
+    const previousStatus = o.status;
     o.status = status;
-    await this.db.db.update(ordersTable)
-      .set({ status, statusReason: reason, updatedAtMs: nowMs, filledShares6: o.filled6 })
-      .where(eq(ordersTable.id, o.id));
+    try {
+      await this.exposure.transaction(async (guard, executor) => {
+        await executor.update(ordersTable)
+          .set({ status, statusReason: reason, updatedAtMs: nowMs, filledShares6: o.filled6 })
+          .where(eq(ordersTable.id, o.id));
+        await this.exposure.reconcile(guard, executor, o.marketId, nowMs);
+      });
+    } catch (error) {
+      o.status = previousStatus;
+      throw error;
+    }
     this.safeHook((h) => h.onFinished?.(o, status, reason, nowMs));
   }
 
@@ -339,23 +363,31 @@ export class PaperExecutor {
   }
 
   private async persistStatus(o: PaperOrderRecord, nowMs: number): Promise<void> {
-    await this.db.db.update(ordersTable)
-      .set({ status: o.status, updatedAtMs: nowMs, filledShares6: o.filled6 })
-      .where(eq(ordersTable.id, o.id));
+    await this.exposure.transaction(async (guard, executor) => {
+      await executor.update(ordersTable)
+        .set({ status: o.status, updatedAtMs: nowMs, filledShares6: o.filled6 })
+        .where(eq(ordersTable.id, o.id));
+      await this.exposure.reconcile(guard, executor, o.marketId, nowMs);
+    });
   }
 
   /** Restart reconciliation: resting paper orders from a previous process are canceled conservatively. */
   async reconcileOrphans(nowMs: number): Promise<number> {
     const rows = await this.db.db.select().from(ordersTable).where(eq(ordersTable.mode, "paper"));
     let n = 0;
-    for (const r of rows) {
-      if (r.status === "LIVE" || r.status === "PARTIAL" || r.status === "PENDING") {
-        await this.db.db.update(ordersTable)
-          .set({ status: "CANCELED", statusReason: "engine restart: conservative orphan cancellation", updatedAtMs: nowMs })
-          .where(eq(ordersTable.id, r.id));
-        n++;
+    await this.exposure.transaction(async (guard, executor) => {
+      const affected = new Set<string>();
+      for (const r of rows) {
+        if (r.status === "LIVE" || r.status === "PARTIAL" || r.status === "PENDING") {
+          await executor.update(ordersTable)
+            .set({ status: "CANCELED", statusReason: "engine restart: conservative orphan cancellation", updatedAtMs: nowMs })
+            .where(eq(ordersTable.id, r.id));
+          affected.add(r.marketId);
+          n++;
+        }
       }
-    }
+      for (const marketId of affected) await this.exposure.reconcile(guard, executor, marketId, nowMs);
+    });
     return n;
   }
 }
