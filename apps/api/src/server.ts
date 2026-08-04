@@ -1508,9 +1508,9 @@ export async function makeApiBus(): Promise<Bus> {
   return process.env.REDIS_URL ? makeBus() : getLocalBus();
 }
 
-function clampLimit(v: string | undefined, dflt: number): number {
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? Math.min(500, Math.floor(n)) : dflt;
+export function clampLimit(v: string | undefined, dflt: number): number {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n > 0 ? Math.min(500, n) : dflt;
 }
 
 function jsonSafe<T>(v: T): T {
