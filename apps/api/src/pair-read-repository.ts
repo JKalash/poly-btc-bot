@@ -17,6 +17,24 @@ const RECOVERY_POLICIES = [
 const RECONCILIATION_STATUSES = ["NOT_STARTED", "PENDING", "HEALTHY", "MISMATCH"] as const;
 const EPISODE_STATES = ["OPEN", "CLOSED"] as const;
 const RESEARCH_STATUSES = ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED"] as const;
+const REJECTION_CODES = [
+  "PAIR_FEATURE_DISABLED", "PAPER_EXECUTION_DISABLED", "MODE_UNSUPPORTED", "MARKET_NOT_ACCEPTING_ORDERS",
+  "RULES_UNVERIFIED", "RESOLUTION_SOURCE_UNSUPPORTED", "NEG_RISK_UNSUPPORTED", "MARKET_STRUCTURE_UNSUPPORTED",
+  "VOID_POLICY_UNVERIFIED", "ENTRY_CUTOFF_REACHED", "UP_BOOK_MISSING", "DOWN_BOOK_MISSING", "UP_BOOK_STALE",
+  "DOWN_BOOK_STALE", "BOOK_SOURCE_TIMESTAMP_MISSING", "BOOK_SOURCE_TIMESTAMP_TOO_FAR_FUTURE", "BOOK_SOURCE_STALE",
+  "BOOK_RECEIVE_TIMESTAMP_TOO_FAR_FUTURE", "BOOK_RECEIVE_STALE", "BOOK_SOURCE_SKEW", "BOOK_RECEIVE_SKEW",
+  "BOOK_INVALID_AFTER_RECONNECT", "BOOK_GAP_SUSPECTED", "BOOK_CONTINUITY_UNVERIFIED", "BOOK_EMPTY_ASKS",
+  "CAPTURE_HASH_INVALID", "TERMS_TRANSPORT_FAILURE", "FEE_SNAPSHOT_MISSING", "FEE_SNAPSHOT_MALFORMED",
+  "FEE_SNAPSHOT_TOKEN_MISMATCH", "FEE_SNAPSHOT_STALE", "FEE_CONVENTION_UNKNOWN", "CONSTRAINT_SNAPSHOT_MISSING",
+  "CONSTRAINT_SNAPSHOT_MALFORMED", "CONSTRAINT_SNAPSHOT_TOKEN_MISMATCH", "CONSTRAINT_SNAPSHOT_STALE",
+  "UNSUPPORTED_PAPER_FEE_COLLECTION", "UNSUPPORTED_SELL_FEE_COLLECTION", "TICK_SIZE_INVALID", "MINIMUM_ORDER_NOT_MET",
+  "NO_EXECUTABLE_SIZE", "INSUFFICIENT_UP_DEPTH", "INSUFFICIENT_DOWN_DEPTH", "GROSS_EDGE_NON_POSITIVE",
+  "NET_PNL_BELOW_MINIMUM", "NET_RETURN_BELOW_MINIMUM", "ONE_TICK_STRESS_FAILED", "TWO_TICK_STRESS_FAILED",
+  "AGGREGATE_CASH_CAP_EXCEEDED", "RESIDUAL_LOSS_CAP_EXCEEDED", "AVAILABLE_CASH_INSUFFICIENT",
+  "PORTFOLIO_UNRECONCILED", "DIRECTIONAL_ORDER_CONFLICT", "DIRECTIONAL_POSITION_CONFLICT", "ACTIVE_PAIR_CONFLICT",
+  "DUPLICATE_OBSERVATION", "ACTIVATION_DATA_UNAVAILABLE", "ACTIVATION_QUOTE_FAILED", "ACTIVATION_FEE_CHANGED",
+  "ACTIVATION_CONSTRAINT_CHANGED", "ENGINE_HALTED",
+] as const;
 
 export class PairReadModelValidationError extends Error {
   readonly code = "PAIR_READ_FILTER_INVALID" as const;
@@ -240,7 +258,7 @@ export class PairReadModelRepository {
       this.handle.db.select({ state: schema.pairOrderGroups.state, reconciliationStatus: schema.pairOrderGroups.reconciliationStatus, value: count() })
         .from(schema.pairOrderGroups).groupBy(schema.pairOrderGroups.state, schema.pairOrderGroups.reconciliationStatus),
       this.handle.db.select({ value: count() }).from(schema.pairEffectOutbox)
-        .where(inArray(schema.pairEffectOutbox.state, ["PENDING", "CLAIMED", "UNKNOWN"])),
+      .where(inArray(schema.pairEffectOutbox.state, ["PENDING", "CLAIMED", "UNKNOWN", "OUTCOME_UNKNOWN"])),
       this.handle.db.select({ last: sql<number | null>`max(${schema.pairReconciliations.completedAtMs})` }).from(schema.pairReconciliations),
     ]);
     const groupMismatchCount = groups.filter((row) => row.reconciliationStatus === "MISMATCH").reduce((sum, row) => sum + row.value, 0);
@@ -258,7 +276,7 @@ export class PairReadModelRepository {
       manualReviewGroupCount,
       pendingEffectCount,
       lastReconciledAtMs: reconciled[0]?.last ?? null,
-      runtime: this.options.runtimeHealth?.() ?? null,
+      runtime: (this.options.runtimeHealth === undefined ? null : exact(this.options.runtimeHealth())) as Readonly<Record<string, unknown>> | null,
     };
   }
 
@@ -347,6 +365,9 @@ export class PairReadModelRepository {
 
   async listObservations(query: Readonly<Record<string, unknown>> = {}): Promise<PairPage<ExactReadRow>> {
     const q = normalizeQuery(query, ["market_id", "primary_rejection_code", "from_ms", "to_ms", "minimum_net_pnl6", "limit", "cursor"]);
+    if (q.primaryRejectionCode !== null && !REJECTION_CODES.includes(q.primaryRejectionCode as never)) {
+      throw new PairReadModelValidationError("primary_rejection_code is unsupported");
+    }
     const where = and(
       q.marketId === null ? undefined : eq(schema.pairOpportunityObservations.marketId, q.marketId),
       q.primaryRejectionCode === null ? undefined : eq(schema.pairOpportunityObservations.primaryRejectionCode, q.primaryRejectionCode),
@@ -371,7 +392,7 @@ export class PairReadModelRepository {
   }
 
   async listGroups(query: Readonly<Record<string, unknown>> = {}): Promise<PairPage<ExactReadRow>> {
-    const q = normalizeQuery(query, ["market_id", "state", "dispatch_model", "recovery_policy", "from_ms", "to_ms", "has_residual", "reconciliation_status", "limit", "cursor"]);
+    const q = normalizeQuery(query, ["market_id", "state", "dispatch_model", "recovery_policy", "from_ms", "to_ms", "minimum_net_pnl6", "has_residual", "reconciliation_status", "limit", "cursor"]);
     if (q.state !== null && !GROUP_STATES.includes(q.state as never)) throw new PairReadModelValidationError("state is not a supported group state");
     if (q.dispatchModel !== null && !DISPATCH_MODELS.includes(q.dispatchModel as never)) throw new PairReadModelValidationError("dispatch_model is unsupported");
     if (q.recoveryPolicy !== null && !RECOVERY_POLICIES.includes(q.recoveryPolicy as never)) throw new PairReadModelValidationError("recovery_policy is unsupported");
@@ -383,6 +404,7 @@ export class PairReadModelRepository {
       q.recoveryPolicy === null ? undefined : eq(schema.pairOrderGroups.recoveryPolicy, q.recoveryPolicy),
       q.reconciliationStatus === null ? undefined : eq(schema.pairOrderGroups.reconciliationStatus, q.reconciliationStatus),
       q.hasResidual === null ? undefined : q.hasResidual ? gt(schema.pairOrderGroups.residualShares6, 0n) : eq(schema.pairOrderGroups.residualShares6, 0n),
+      q.minimumNetPnl6 === null ? undefined : gte(schema.pairOrderGroups.signalNetPnl6, q.minimumNetPnl6),
       q.fromMs === null ? undefined : gte(schema.pairOrderGroups.createdAtMs, q.fromMs),
       q.toMs === null ? undefined : lte(schema.pairOrderGroups.createdAtMs, q.toMs),
       cursorCondition(schema.pairOrderGroups.createdAtMs, schema.pairOrderGroups.id, q.cursor),

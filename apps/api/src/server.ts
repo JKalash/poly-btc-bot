@@ -23,12 +23,18 @@ import { desc, eq, inArray, sql } from "drizzle-orm";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { AuthService } from "./auth";
+import { PairReadModelRepository, type PairReadCapability } from "./pair-read-repository";
+import { registerPairReadRoutes, type PairReadRouteRepository } from "./pair-routes";
 
 export interface ApiDeps {
   db: DbHandle;
   bus: Bus;
   auth: AuthService;
   requireAuth: boolean;
+  pairReadRepository?: PairReadRouteRepository;
+  pairReadCapability?: PairReadCapability;
+  pairRuntimeHealth?: () => Readonly<Record<string, unknown>>;
+  pairReadNowMs?: () => number;
 }
 
 const SESSION_COOKIE = "b5p_session";
@@ -66,6 +72,17 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     }
     return true;
   };
+
+  const pairReadRepository = deps.pairReadRepository ?? new PairReadModelRepository(db, {
+    capability: deps.pairReadCapability ?? {
+      observerEnabled: true,
+      paperExecutionEnabled: false,
+      liveExecutionAvailable: false,
+      strategyVersion: "complete_set_pair_v0_RESEARCH_ONLY",
+    },
+    runtimeHealth: deps.pairRuntimeHealth,
+  });
+  registerPairReadRoutes(app, { repository: pairReadRepository, guard, nowMs: deps.pairReadNowMs });
 
   // ---------- auth ----------
 
