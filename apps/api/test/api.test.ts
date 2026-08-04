@@ -56,9 +56,39 @@ describe("auth", () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it("rejects session signatures with the wrong value or length", async () => {
+    const [name, token] = cookie.split("=");
+    const [raw, signature] = token!.split(".");
+    const wrongValue = signature!.endsWith("0")
+      ? `${signature!.slice(0, -1)}1`
+      : `${signature!.slice(0, -1)}0`;
+
+    for (const invalidSignature of [wrongValue, `${signature}00`]) {
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/state",
+        headers: { cookie: `${name}=${raw}.${invalidSignature}` },
+      });
+      expect(res.statusCode).toBe(401);
+    }
+  });
+
   it("mutations without CSRF token are refused", async () => {
     const res = await app.inject({ method: "POST", url: "/api/kill", headers: { cookie }, payload: {} });
     expect(res.statusCode).toBe(403);
+  });
+
+  it("rejects CSRF tokens with the wrong value or length", async () => {
+    const wrongValue = csrf.endsWith("0") ? `${csrf.slice(0, -1)}1` : `${csrf.slice(0, -1)}0`;
+    for (const invalidToken of [wrongValue, `${csrf}00`]) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/kill",
+        headers: { cookie, "x-csrf-token": invalidToken },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(403);
+    }
   });
 });
 

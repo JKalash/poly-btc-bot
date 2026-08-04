@@ -22,7 +22,7 @@ import { backfillResolvedMarkets, runTimingStats } from "@b5p/research";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import { AuthService } from "./auth";
+import { AuthService, timingSafeStringEqual } from "./auth";
 
 export interface ApiDeps {
   db: DbHandle;
@@ -59,7 +59,7 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     }
     if (req.method !== "GET" && req.method !== "HEAD") {
       const header = req.headers["x-csrf-token"];
-      if (!header || header !== s.csrfToken) {
+      if (typeof header !== "string" || !timingSafeStringEqual(header, s.csrfToken)) {
         await reply.code(403).send({ error: "csrf token missing or invalid" });
         return false;
       }
