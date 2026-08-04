@@ -97,6 +97,8 @@ export function useCockpit(): { state: CockpitState | null; live: boolean } {
   useEffect(() => {
     let stopped = false;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryDelayMs = 1_000;
 
     const poll = () => {
       // OFFLINE fallback / partial payloads fail the shape guard and leave
@@ -104,9 +106,19 @@ export function useCockpit(): { state: CockpitState | null; live: boolean } {
       api<unknown>("/api/state").then((s) => { if (!stopped && isCockpitState(s)) setState(s); }).catch(() => undefined);
     };
 
+    const scheduleReconnect = () => {
+      if (stopped || retryTimer) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void connect();
+      }, retryDelayMs);
+      retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
+    };
+
     const connect = async () => {
       try {
         const { ticket } = await api<{ ticket: string }>("/api/ws-ticket");
+        if (stopped) return;
         const proto = location.protocol === "https:" ? "wss" : "ws";
         // Same-origin by default: the dashboard proxies /api/* to the API
         // service (next.config rewrites), so the socket follows
@@ -120,13 +132,34 @@ export function useCockpit(): { state: CockpitState | null; live: boolean } {
         ws.onmessage = (ev) => {
           try {
             const msg = JSON.parse(ev.data as string) as { channel: string; payload: unknown };
-            if (msg.channel === "cockpit" && !stopped && isCockpitState(msg.payload)) { setState(msg.payload); setLive(true); }
+            if (msg.channel === "cockpit" && !stopped && isCockpitState(msg.payload)) {
+              retryDelayMs = 1_000;
+              setState(msg.payload);
+              setLive(true);
+            }
           } catch { /* ignore */ }
         };
-        ws.onclose = () => { setLive(false); };
-        ws.onerror = () => { setLive(false); };
+        ws.onclose = () => {
+          if (wsRef.current === ws) wsRef.current = null;
+          if (!stopped) {
+            setLive(false);
+            scheduleReconnect();
+          }
+        };
+        // scheduleReconnect is idempotent, so error + close cannot create two
+        // timers even on browsers that report both events.
+        ws.onerror = () => {
+          if (!stopped) {
+            setLive(false);
+            scheduleReconnect();
+          }
+          ws.close();
+        };
       } catch {
-        setLive(false);
+        if (!stopped) {
+          setLive(false);
+          scheduleReconnect();
+        }
       }
     };
 
@@ -136,7 +169,9 @@ export function useCockpit(): { state: CockpitState | null; live: boolean } {
     return () => {
       stopped = true;
       if (pollTimer) clearInterval(pollTimer);
+      if (retryTimer) clearTimeout(retryTimer);
       wsRef.current?.close();
+      wsRef.current = null;
     };
   }, []);
 
