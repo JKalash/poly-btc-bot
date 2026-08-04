@@ -29,9 +29,9 @@
  * - no on-chain transaction may be built, signed, or broadcast, and no
  *   authenticated CLOB submission may be added (spec §3, rules 1–5).
  *
- * NOTE: the barrel is intentionally minimal for now — exports are appended by
- * contracts work (BPAIR-031). Internal modules (reducer, ledger, transitions,
- * mutation helpers) must never be exported through this barrel (spec §10.1).
+ * The barrel exposes contracts and pure construction/economics helpers only.
+ * Internal reducers, ledger mutation, transitions, and adapter helpers must
+ * never be exported through it (spec §10.1).
  */
 
 /**
@@ -42,3 +42,73 @@
 export const PAIR_EXECUTION_CAPABILITY = {
   modes: ["observe", "paper"],
 } as const;
+
+export * from "./contracts";
+export { createPairExecution, PairExecutionConfigurationError } from "./create-pair-execution";
+export * from "./serialization";
+export * from "./hashes";
+export * from "./ids";
+export * from "./capture";
+
+// Pure, unauthenticated economics surface. Stateful reducers, ledger mutation,
+// and adapter internals must never be exported from this package barrel.
+export {
+  composePairQuote,
+  finalizePairQuote,
+  quoteDirectBuy,
+  quoteDirectSell,
+  type ComposePairQuoteInput,
+  type ComposePairQuoteResult,
+  type FinalizePairQuoteInput,
+  type DirectBuyQuoteRequest,
+  type DirectLegQuote,
+  type DirectSellQuoteRequest,
+  type PairLevelFill,
+  type QuoteBookReference,
+  type QuoteFeeSnapshot,
+  type QuoteOk,
+  type QuoteOrderSide,
+  type QuoteReject,
+  type QuoteRejectReason,
+  type QuoteResult,
+  type QuoteTimeInForce,
+  type PairQuoteLegInput,
+} from "./quote";
+
+export {
+  PAIR_SIZE_OBJECTIVE_VERSION,
+  buildCandidateFrontier,
+  lotBoundedQuantity,
+  pairSizeObjectiveV1,
+  selectBestPairCandidate,
+  type CandidateFrontierInput,
+  type CandidateFrontierResult,
+  type PairSizeCandidate,
+} from "./sizing";
+
+export {
+  quoteDepthStress,
+  quoteDepthStressGrid,
+  quoteTickStress,
+  type PairStressLegInput,
+  type PairStressQuoteInput,
+} from "./stress";
+
+export {
+  aggregatePairRisk,
+  evaluatePairRisk,
+  type AggregatePairRiskState,
+  type AggregatePairRiskStateInput,
+  type EvaluatePairRiskInput,
+} from "./risk";
+
+export {
+  calculateRecoveryAlternatives,
+  selectRecoveryAction,
+  type RecoveryAlternative,
+  type RecoveryAlternativeKind,
+  type RecoveryAlternativesInput,
+  type RecoveryBookInput,
+  type RecoverySelection,
+  type RecoverySelectionInput,
+} from "./recovery";

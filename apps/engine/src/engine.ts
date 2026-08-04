@@ -31,7 +31,9 @@ import {
 import {
   BookState, MODELS, STRATEGY_PRESETS, TickBuffer, computeFeatures, computeIndicators,
   configureCalibratedModel, presetAllowsMode,
-  type Candle, type CandleSource, type ExtendedMoveFadePriorRun, type FeatureSet, type PresetContext, type StrategyDecision,
+  type BookEnvelopeChange, type BookEnvelopeMeta, type BookSourceMeta,
+  type Candle, type CandleSource, type EnvelopeApplyOutcome, type ExtendedMoveFadePriorRun,
+  type FeatureSet, type PresetContext, type StrategyDecision,
 } from "@b5p/strategy";
 import { eq, gte } from "drizzle-orm";
 import { Accounting } from "./accounting";
@@ -40,6 +42,28 @@ import { LiveController, minArmUsdc, type ArmRequest } from "./live";
 import { logger } from "./log";
 import { PaperExecutor, type FillEvent, type PaperOrderRecord } from "./paper";
 import { ENGINE_VERSION, buildDecisionSnapshot } from "./snapshot";
+
+/** One change inside a price-change envelope, keyed by token (spec §12.2). */
+export interface PriceChangeEnvelopeChange {
+  assetId: string;
+  price: string;
+  size: string;
+  side: "BUY" | "SELL";
+  /** Per-change exchange hash when the feed supplies one (provenance only). */
+  hash?: string;
+}
+
+/** A complete CLOB `price_change` message delivered as one atomic unit (§12.2). */
+export interface PriceChangeEnvelopeInput {
+  /** Stable normalized-envelope identity; distinct from any source event id. */
+  envelopeId: string;
+  marketId: string;
+  sourceTsMs: number;
+  receivedTsMs: number;
+  changes: readonly PriceChangeEnvelopeChange[];
+  /** Envelope-level provenance (connection epoch, source event id/sequence when supplied). */
+  meta?: Omit<BookEnvelopeMeta, "marketId" | "exchangeHash">;
+}
 
 interface MarketRuntime {
   ref: MarketRef;
@@ -91,6 +115,10 @@ export class Engine {
   private lastLivePollMs = 0;
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
+  /** Latest CLOB epoch, so books first seen after a reset inherit its barrier. */
+  private clobConnectionEpoch: string | null = null;
+  /** Optional observer hook; called once only after a complete accepted envelope. */
+  private pairEnvelopeDirtyMarker: ((marketId: string, envelopeId: string) => void) | null = null;
 
   // --- execution-quality instrumentation (plan items 1b/1c) ---
   readonly execPersistence: ExecutionPersistence;
@@ -414,16 +442,84 @@ export class Engine {
 
   bookFor(tokenId: string): BookState {
     let b = this.books.get(tokenId);
-    if (!b) { b = new BookState(tokenId); this.books.set(tokenId, b); }
+    if (!b) {
+      b = new BookState(tokenId);
+      if (this.clobConnectionEpoch !== null) b.invalidateForReconnect(this.clobConnectionEpoch);
+      this.books.set(tokenId, b);
+    }
     return b;
   }
 
-  onBookSnapshot(tokenId: string, bids: Array<{ price: string; size: string }>, asks: Array<{ price: string; size: string }>, sourceTsMs: number, receivedTsMs: number): void {
-    this.bookFor(tokenId).applySnapshot(bids, asks, sourceTsMs, receivedTsMs);
+  onBookSnapshot(tokenId: string, bids: Array<{ price: string; size: string }>, asks: Array<{ price: string; size: string }>, sourceTsMs: number, receivedTsMs: number, meta?: BookSourceMeta): void {
+    this.bookFor(tokenId).applySnapshot(bids, asks, sourceTsMs, receivedTsMs, meta);
   }
 
   onPriceChange(tokenId: string, price: string, size: string, side: "BUY" | "SELL", sourceTsMs: number, receivedTsMs: number): void {
     this.bookFor(tokenId).applyLevelUpdate(price, size, side, sourceTsMs, receivedTsMs);
+  }
+
+  setPairEnvelopeDirtyMarker(marker: ((marketId: string, envelopeId: string) => void) | null): void {
+    this.pairEnvelopeDirtyMarker = marker;
+  }
+
+  /**
+   * Atomic price-change envelope boundary (spec §12.2, BPAIR-012).
+   *
+   * One CLOB `price_change` message is applied as ONE unit: changes are
+   * grouped per token (preserving envelope order) and each affected book
+   * receives a single `applyEnvelope` call, so bookVersion increments exactly
+   * once per affected token and no torn intermediate state is observable.
+   * Pair dirty-marking/persistence of the envelope boundary is a later
+   * composition concern (BPAIR-013/014); this method is the single entry
+   * point those stages will hook.
+   *
+   * Provenance is forwarded honestly: the feed's connection epoch, the
+   * market id, and the per-change exchange hash (the market channel supplies
+   * no message id and no sequence — none is invented here, §12.5).
+   */
+  onPriceChangeEnvelope(envelope: PriceChangeEnvelopeInput): Map<string, EnvelopeApplyOutcome> {
+    const byToken = new Map<string, { changes: BookEnvelopeChange[]; exchangeHash: string | null }>();
+    for (const c of envelope.changes) {
+      let g = byToken.get(c.assetId);
+      if (!g) { g = { changes: [], exchangeHash: null }; byToken.set(c.assetId, g); }
+      g.changes.push({ price: c.price, size: c.size, side: c.side });
+      if (c.hash !== undefined) g.exchangeHash = c.hash;
+    }
+    const outcomes = new Map<string, EnvelopeApplyOutcome>();
+    for (const [tokenId, g] of byToken) {
+      const meta: BookEnvelopeMeta = {
+        ...envelope.meta,
+        marketId: envelope.marketId,
+        exchangeHash: g.exchangeHash,
+      };
+      outcomes.set(tokenId, this.bookFor(tokenId).applyEnvelope(g.changes, envelope.sourceTsMs, envelope.receivedTsMs, meta));
+    }
+    if ([...outcomes.values()].some((outcome) => outcome === "APPLIED" || outcome === "APPLIED_WHILE_INVALID")) {
+      this.pairEnvelopeDirtyMarker?.(envelope.marketId, envelope.envelopeId);
+    }
+    return outcomes;
+  }
+
+  /**
+   * Reconnect barrier wiring (spec §12.3, BPAIR-012): called by the feed
+   * layer once per (re)connect with the NEW connection epoch, before any
+   * message of the new connection is delivered. Every known book is marked
+   * INVALID_AFTER_RECONNECT; old levels are retained for diagnostics only.
+   * Only fresh full snapshots stamped with this new epoch restore validity.
+   */
+  onConnectionEpochChange(epoch: string, prevEpoch: string | null): void {
+    this.clobConnectionEpoch = epoch;
+    for (const book of this.books.values()) book.invalidateForReconnect(epoch);
+    logger.info("clob connection epoch changed; all books invalidated until fresh snapshots", {
+      epoch, prevEpoch, booksInvalidated: this.books.size,
+    });
+  }
+
+  /** Queue overflow/reset isolation: fail only the affected market's books closed. */
+  invalidatePairBooksForMarket(marketId: string, epoch: string): void {
+    for (const book of this.books.values()) {
+      if (book.marketId === marketId) book.invalidateForReconnect(epoch);
+    }
   }
 
   async onTrade(tokenId: string, price: string, size: string, sourceTsMs: number): Promise<void> {

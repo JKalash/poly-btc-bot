@@ -206,6 +206,7 @@ export class BookState {
    * BEFORE any level is touched; every rejection leaves levels unchanged.
    */
   applyEnvelope(changes: readonly BookEnvelopeChange[], sourceTsMs: number, receivedTsMs: number, meta?: BookEnvelopeMeta): EnvelopeApplyOutcome {
+    if (meta?.marketId !== undefined) this.marketId = meta.marketId;
     // 1. Epoch check: a delta stamped with a different epoch than the book's
     //    current epoch means a reset was missed — invalidate, do not apply.
     const epoch = meta?.connectionEpoch;
