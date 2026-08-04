@@ -6,6 +6,7 @@ import {
   PairResearchReportError,
   buildPairResearchReport,
   renderPairResearchReportMarkdown,
+  validatePairReportRunId,
   type PairResearchReportInput,
   type PairResearchReportModel,
 } from "./pair-research-report";
@@ -74,13 +75,18 @@ export async function writePairResearchReportArtifacts(input: {
   readonly report: PairResearchReportModel;
 }): Promise<PairReportArtifactResult> {
   const repositoryRoot = await realpath(input.repositoryRoot);
-  const directory = path.join(repositoryRoot, "artifacts", "research", "pairs", input.report.runId);
-  await mkdir(directory, { recursive: true });
-  const directoryStat = await lstat(directory);
-  const directoryReal = await realpath(directory);
-  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()
-    || (directoryReal !== repositoryRoot && !directoryReal.startsWith(`${repositoryRoot}${path.sep}`))) {
-    throw new PairResearchReportError("report output directory is unsafe or escapes repository root");
+  const runId = validatePairReportRunId(input.report.runId);
+  let directory = repositoryRoot;
+  for (const segment of ["artifacts", "research", "pairs", runId]) {
+    directory = path.join(directory, segment);
+    try { await mkdir(directory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const directoryStat = await lstat(directory);
+    const directoryReal = await realpath(directory);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()
+      || (directoryReal !== repositoryRoot && !directoryReal.startsWith(`${repositoryRoot}${path.sep}`))) {
+      throw new PairResearchReportError("report output directory is unsafe or escapes repository root");
+    }
   }
   const reportJson = encoder.encode(canonicalPairDatasetJson(input.report));
   const reportMarkdown = encoder.encode(renderPairResearchReportMarkdown(input.report));

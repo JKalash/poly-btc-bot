@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import { DEFAULT_CONFIG } from "@b5p/config";
 import {
   decisionSnapshots, makeDb, marketExposureGuards, orderIntents, orders,
@@ -103,6 +104,32 @@ describe("paper directional ownership composition", () => {
     const restarted = new Accounting(db, "paper");
     await restarted.reconcile(DEFAULT_CONFIG, NOW + 100);
     expect(await guard()).toMatchObject({ ownerKind: "DIRECTIONAL_POSITION", ownerState: "OPEN", releasedAtMs: null });
+  });
+
+  it("does not let an older resolved position release a later unreconciled fill", async () => {
+    const accounting = new Accounting(db, "paper");
+    await accounting.reconcile(DEFAULT_CONFIG, NOW - 1);
+    const px = paper(accounting);
+    await px.submit({ ...submitArgs(await seedIntent("market", "old-cycle")), style: "taker_fak", price6: 550_000n });
+    await px.step(NOW + DEFAULT_CONFIG.paper.simulated_latency_ms);
+    await accounting.onResolution("market", "UP", NOW + 1_000);
+
+    const later = await px.submit({
+      ...submitArgs(await seedIntent("market", "new-cycle")),
+      style: "taker_fak",
+      price6: 550_000n,
+      nowMs: NOW + 2_000,
+    });
+    await db.db.update(orders).set({
+      status: "MATCHED",
+      filledShares6: later.shares6,
+      updatedAtMs: NOW + 2_100,
+    }).where(eq(orders.id, later.id));
+    await new Accounting(db, "paper").reconcile(DEFAULT_CONFIG, NOW + 3_000);
+    expect(await guard()).toMatchObject({
+      ownerState: "FILL_RECONCILIATION_REQUIRED",
+      releasedAtMs: null,
+    });
   });
 });
 

@@ -72,8 +72,17 @@ export class DirectionalExposureCoordinator {
     ]);
     const activeOrders = orders.filter((row) => (ACTIVE_ORDER_STATES as readonly string[]).includes(row.status));
     const filledOrders = orders.filter((row) => row.filledShares6 > 0n || row.status === "MATCHED");
+    const latestResolutionMs = resolvedPositions.reduce(
+      (latest, row) => Math.max(latest, row.resolvedAtMs ?? -1),
+      -1,
+    );
+    // A historical RESOLVED position only closes fills from that lifecycle.
+    // If a later fill/order update exists, retain ownership until its own
+    // position is durably OPEN or RESOLVED. This is deliberately conservative
+    // for legacy MATCHED rows whose fill evidence may be incomplete.
+    const hasUnresolvedFill = filledOrders.some((row) => row.updatedAtMs > latestResolutionMs);
     let current = await guard.get(marketId);
-    const needsOwner = openPositions.length > 0 || activeOrders.length > 0 || (filledOrders.length > 0 && resolvedPositions.length === 0);
+    const needsOwner = openPositions.length > 0 || activeOrders.length > 0 || hasUnresolvedFill;
     if (current?.releasedAtMs === null && (current.ownerKind === "PAIR_GROUP" || current.ownerId !== ownerId)) {
       if (needsOwner) conflict(marketId, current);
       return;
@@ -97,7 +106,7 @@ export class DirectionalExposureCoordinator {
       await this.updateIfNeeded(guard, current, "DIRECTIONAL_ORDER", "ACTIVE", nowMs);
       return;
     }
-    if (filledOrders.length > 0 && resolvedPositions.length === 0) {
+    if (hasUnresolvedFill) {
       await this.updateIfNeeded(guard, current, current.ownerKind === "DIRECTIONAL_POSITION" ? "DIRECTIONAL_POSITION" : "DIRECTIONAL_ORDER", "FILL_RECONCILIATION_REQUIRED", nowMs);
       return;
     }

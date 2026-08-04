@@ -26,6 +26,8 @@ economic values are emitted as decimal strings, and unknown records return bound
 stack traces. All simulated effects use deterministic idempotency keys, a durable outbox/inbox,
 observe-before-retry recovery, immutable event evidence, and startup reconciliation. Unknown
 outcomes and reconciliation mismatches retain exposure and require review; they never become a
-synthetic fill or profit. A shared database CAS guard prevents simultaneous directional and pair
-ownership of one market once both owning mutation paths are composed with it; production pair
-scheduling remains disabled until that composition is complete.
+synthetic fill or profit. A shared database CAS guard is composed into pair group creation and the
+real directional paper/live order-position lifecycle, preventing simultaneous directional and
+pair ownership of one market. Unknown external acknowledgements retain conservative ownership
+until reconciliation. Production pair scheduling remains disabled while the final atomic
+facade/account/outbox lifecycle adapter is incomplete.

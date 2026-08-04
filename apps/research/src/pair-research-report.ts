@@ -1,4 +1,4 @@
-import { canonicalPairDatasetJson, pairDatasetContentHash, verifyPairDatasetManifest, type PairDatasetManifest } from "./pair-dataset-manifest";
+import { canonicalPairDatasetJson, pairDatasetContentHash, pairDatasetObjectHash, verifyPairDatasetManifest, type PairDatasetManifest } from "./pair-dataset-manifest";
 import type { PairMarketReplayResult } from "./pair-market-replay";
 import { verifyPairResearchScenarioMatrix, type PairResearchScenario, type PairResearchScenarioMatrix } from "./pair-research-scenario";
 import type { PairScenarioMatrixRunResult, PairScenarioRunRecord } from "./pair-scenario-runner";
@@ -98,7 +98,8 @@ export interface PairResearchReportModel {
       readonly command: string; readonly datasetHash: string; readonly replayOutputHash: string;
       readonly scenarioMatrixHash: string; readonly scenarioRunOutputHash: string;
       readonly statisticsHashes: readonly string[]; readonly codeCommit: string; readonly baseConfigHash: string;
-      readonly observerOperationalHash: string; readonly algorithmVersions: readonly string[];
+      readonly observerOperationalHash: string; readonly provenanceHash: string;
+      readonly algorithmVersions: readonly string[]; readonly algorithmSetHash: string;
     }>;
   }>;
 }
@@ -271,7 +272,7 @@ export async function buildPairResearchReport(input: PairResearchReportInput): P
   const threshold6 = unsigned(input.promotionEvidence.operationalCostThreshold6, "operationalCostThreshold6");
   const gates: PairPromotionGate[] = [
     { gate: "GATE_01_SAMPLE_SUFFICIENCY", passed: baselineStats.promotionSufficiency.status === "SUFFICIENT", evidence: `${baselineStats.promotionSufficiency.actualUtcDays} UTC days; ${baselineStats.promotionSufficiency.actualActivationCandidates} activation candidates` },
-    { gate: "GATE_02_DATA_INTEGRITY", passed: reconciliationMismatches === 0n && unexplainedIntegrityMismatchCount === 0n, evidence: `${reconciliationMismatches} reconciliation mismatches; ${unexplainedIntegrityMismatchCount} unexplained integrity mismatches` },
+    { gate: "GATE_02_DATA_INTEGRITY", passed: reconciliationMismatches === 0n && unexplainedIntegrityMismatchCount === 0n && feeSnapshotHashes.length > 0 && constraintSnapshotHashes.length > 0, evidence: `${reconciliationMismatches} reconciliation mismatches; ${unexplainedIntegrityMismatchCount} unexplained integrity mismatches; ${feeSnapshotHashes.length} fee and ${constraintSnapshotHashes.length} constraint snapshots` },
     { gate: "GATE_03_POSITIVE_TOTAL_NET_PNL", passed: BigInt(baselineSummary.conservativeTotalPnl6) > 0n, evidence: `${baselineSummary.conservativeTotalPnl6} conservative pnl6` },
     { gate: "GATE_04_POSITIVE_CLUSTERED_LOWER_BOUND", passed: positiveFixed(baselineSummary.primaryLower95), evidence: baselineSummary.primaryLower95 ?? "INSUFFICIENT_SAMPLE" },
     { gate: "GATE_05_BOTH_SERIAL_ORDERS_POSITIVE", passed: serialUp.length > 0 && serialDown.length > 0 && [...serialUp, ...serialDown].every(({ conservativeTotalPnl6 }) => BigInt(conservativeTotalPnl6) > 0n), evidence: `${serialUp.length} UP-first and ${serialDown.length} DOWN-first comparisons` },
@@ -282,7 +283,6 @@ export async function buildPairResearchReport(input: PairResearchReportInput): P
     { gate: "GATE_10_HUMAN_REVIEW", passed: input.promotionEvidence.humanReviewCompleted === true, evidence: input.promotionEvidence.humanReviewCompleted ? "completed" : "not completed" },
   ].map((gate) => Object.freeze(gate));
   const verdict: PairPromotionVerdict = gates.every(({ passed }) => passed) ? "PAPER_ELIGIBLE" : "REMAIN_OBSERVER_ONLY";
-  const scenarioHashes = new Map(matrix.scenarios.map((scenario) => [scenario.designCellId, scenario.scenarioHash]));
   const algorithmVersions = [...new Set(input.statistics.flatMap((stats) => [
     stats.statisticsVersion,
     stats.pnl.primaryUtcDayBootstrap95.metadata.algorithmVersion,
@@ -315,10 +315,10 @@ export async function buildPairResearchReport(input: PairResearchReportInput): P
       replayOutputHash: input.replay.outputHash, scenarioMatrixHash: matrix.matrixHash,
       scenarioRunOutputHash: input.scenarioRun.outputHash, statisticsHashes: Object.freeze(input.statistics.map(({ outputHash }) => outputHash).sort()),
       codeCommit: provenance.codeCommit, baseConfigHash: provenance.baseConfigHash, observerOperationalHash: provenance.observerOperationalHash,
-      algorithmVersions: Object.freeze(algorithmVersions),
+      provenanceHash: pairDatasetObjectHash(provenance),
+      algorithmVersions: Object.freeze(algorithmVersions), algorithmSetHash: pairDatasetObjectHash(algorithmVersions),
     }),
   });
-  void scenarioHashes;
   return Object.freeze({ reportVersion: PAIR_RESEARCH_REPORT_VERSION, runId, generatedFromDeterministicInputs: true, liveCapability: false, verdict, sections });
 }
 
@@ -378,7 +378,7 @@ export function renderPairResearchReportMarkdown(report: PairResearchReportModel
     `- Maximum drawdown6: ${s.pnlDrawdown.baselineMaximumDrawdown6}`,
     `- Peak capital at risk6: ${s.pnlDrawdown.baselinePeakCapitalAtRisk6}`);
   lines.push("", "## 10. Data-quality exclusions", "", "| Code | Count | Detail |", "|---|---:|---|");
-  if (s.dataQualityExclusions.length === 0) lines.push("| NONE | 0 | None declared | ");
+  if (s.dataQualityExclusions.length === 0) lines.push("| NONE | 0 | None declared |");
   else for (const item of s.dataQualityExclusions) lines.push(`| ${markdown(item.code)} | ${item.count} | ${markdown(item.detail)} |`);
   lines.push("", "## 11. Sensitivity and limitations", "",
     `- Primary UTC-day interval: ${s.sensitivityLimitations.primaryIntervalStatus}`,
@@ -392,7 +392,9 @@ export function renderPairResearchReportMarkdown(report: PairResearchReportModel
     `- Scenario run hash: \`${s.reproduction.scenarioRunOutputHash}\``,
     `- Statistics hashes: ${s.reproduction.statisticsHashes.map((v) => `\`${v}\``).join(", ")}`,
     `- Config hashes: \`${s.reproduction.baseConfigHash}\` / \`${s.reproduction.observerOperationalHash}\``,
+    `- Provenance hash: \`${s.reproduction.provenanceHash}\``,
     `- Algorithms: ${s.reproduction.algorithmVersions.map((v) => `\`${markdown(v)}\``).join(", ")}`,
+    `- Algorithm-set hash: \`${s.reproduction.algorithmSetHash}\``,
     "",
     "Reproduce:",
     "",

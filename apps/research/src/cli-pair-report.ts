@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildPairDatasetManifest, canonicalPairDatasetJson, pairDatasetObjectHash } from "./pair-dataset-manifest";
 import { loadPairReplayDataset, replayPairMarketDataset } from "./pair-market-replay";
 import { computePairEpisodeStatistics, PAIR_FUNNEL_METRICS } from "./pair-episode-statistics";
@@ -66,13 +66,16 @@ export async function generateSyntheticZeroOpportunityReport(repositoryRoot: str
       },
       dataQualityExclusions: [{ code: "SYNTHETIC_VALIDATION_ONLY", count: "0", detail: "No empirical markets, days, episodes, or opportunities are present." }],
       limitations: ["Synthetic validation-only artifact; it is not empirical evidence and cannot promote paper scheduling."],
-      reproductionCommand: "pnpm --filter @b5p/research report:pairs:zero -- .",
+      reproductionCommand: "pnpm --filter @b5p/research report:pairs:zero",
     },
   });
 }
 
 export async function runPairReportCli(argv = process.argv.slice(2)): Promise<PairReportArtifactResult> {
-  if (argv[0] === "--zero-validation") return generateSyntheticZeroOpportunityReport(argv[1] ?? process.cwd());
+  if (argv[0] === "--zero-validation") {
+    const defaultRepositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../");
+    return generateSyntheticZeroOpportunityReport(argv[1] ?? defaultRepositoryRoot);
+  }
   if (argv.length !== 1) throw new Error("usage: pair-report <bundle.json> OR pair-report --zero-validation [repository-root]");
   const bundlePath = path.resolve(argv[0]!);
   const bundle = JSON.parse(await readFile(bundlePath, "utf8")) as PairReportBundle;
