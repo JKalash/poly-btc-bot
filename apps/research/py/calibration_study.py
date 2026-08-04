@@ -74,7 +74,8 @@ def build_slice_features(t, srem):
     mid60 = lag_mid(60)
     first = t.sort_values("t").groupby("condition_id").head(1).set_index("condition_id")["mid"]
 
-    hist = t[t["srem"] >= srem]
+    # np.diff is order-sensitive, so do not rely on parquet/input row order.
+    hist = t[t["srem"] >= srem].sort_values(["condition_id", "t"])
     vol60 = (hist[hist["srem"] <= srem + 60].groupby("condition_id")["mid"]
              .apply(lambda s: float(np.std(np.diff(s))) if len(s) > 2 else np.nan))
     flips = (hist[hist["srem"] <= srem + 60].groupby("condition_id")["bu"]
@@ -179,7 +180,9 @@ def calibration_by_price(oos_or_slice, price_col="p_mid"):
 def minute_of_hour(m):
     rows = []
     total_up, total_n = int(m["y"].sum()), len(m)
-    for minute, g in m.groupby("closing_minute"):
+    groups = m.groupby("closing_minute")
+    bonferroni_tests = groups.ngroups
+    for minute, g in groups:
         k, n = int(g["y"].sum()), len(g)
         rest_k, rest_n = total_up - k, total_n - n
         p1, p2 = k / n, rest_k / rest_n
@@ -190,7 +193,8 @@ def minute_of_hour(m):
         wlo, whi = wilson(k, n)
         rows.append({"minute": int(minute), "n": n, "up_rate": p1,
                      "wilson_lo": wlo, "wilson_hi": whi,
-                     "p_raw": praw, "p_bonferroni": min(1.0, praw * 12)})
+                     "p_raw": praw,
+                     "p_bonferroni": min(1.0, praw * bonferroni_tests)})
     return sorted(rows, key=lambda r: r["minute"])
 
 def executor_validation(t, join_srem=90, cutoff_srem=45):
