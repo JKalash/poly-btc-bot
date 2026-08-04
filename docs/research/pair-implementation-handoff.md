@@ -13,7 +13,7 @@
 ## Source and implementation versions
 
 - Original implementation baseline: `4d955b0` (see `pair-implementation-baseline.md` and deviation D-2).
-- Resumed branch base: `b317144`; latest externally created committed checkpoint observed during the run: `066c95c`, plus the final uncommitted lifecycle-adapter worktree.
+- Resumed branch base: `b317144`; settled implementation revision: `71a92ed` on `pair-execution`.
 - Borrowing provenance: `MrFadiAi/Polymarket-bot` revision `82647014e0c355a5684e09666d8a0a522234640d` (MIT), used as engineering input rather than copied execution authority.
 - Pair strategy: `complete_set_pair_v0_RESEARCH_ONLY`.
 - Pair event/schema version: `1`.
@@ -39,21 +39,22 @@
 
 ## Architecture deviations
 
-The append-only deviation ledger is `docs/research/pair-implementation-deviations.md`. It records migration numbering/tooling, local revision drift, internal ledger/planner subpaths, zero-group reconciliation storage, extra settlement-routing events, the deterministic scenario-helper boundary, and stable market-level directional guard ownership. Each entry states its rationale, preserved invariant, and tests.
+The append-only deviation ledger is `docs/research/pair-implementation-deviations.md`. It records migration numbering/tooling, local revision drift, internal ledger/planner subpaths, zero-group reconciliation storage, extra settlement-routing events, the deterministic scenario-helper boundary, stable market-level directional guard ownership, and the fail-closed production lifecycle atomicity boundary. Each entry states its rationale, preserved invariant, and tests.
 
 ## Verification commands and exact results
 
-- `pnpm -r test`: 949 tests passed in the first full current-worktree snapshot (76.62 seconds). A final affected-tree rerun follows the lifecycle-adapter audit.
-- `pnpm -r typecheck`: 13/13 workspace projects passed (54.55 seconds); affected engine/research/API/web typechecks were rerun after their final edits.
-- `pnpm build`: passed (66.65 seconds), including static `/pairs` and dynamic `/pairs/groups/[id]` pages.
+- `pnpm -r test`: 92/92 test files and 981/981 tests passed on the settled tree (160.20 seconds). Package totals: config 8, domain 117, DB 18, evidence 51, experiments 31, risk 91, strategy 105, Polymarket 23, pair execution 171, research 72, engine 228, and API 66.
+- `pnpm -r typecheck`: 13/13 workspace projects passed (294.71 seconds).
+- `pnpm build`: passed (80.51 seconds), including static `/pairs` and dynamic `/pairs/groups/[id]` pages.
 - `pnpm --filter @b5p/db test`: migration suite 13/13 passed on PGlite (5.44 seconds), covering fresh `0000` through `0006`, populated `0005` to `0006`, and idempotency.
 - `pnpm --filter @b5p/pair-execution test`: 171/171 passed at the pair-package checkpoint.
 - `pnpm --filter @b5p/api test`: 66/66 passed; pair route/repository focused coverage is 26/26.
 - `pnpm --filter @b5p/research test`: 72/72 passed across 11 files; report-focused coverage is 11/11.
-- Pair web Playwright fixtures: overview 4/4 and detail 8/8 passed; production web build passed.
+- Pair web Playwright fixtures: overview 4/4 and detail 8/8 passed, 12/12 total (7.49 seconds); production web build passed.
 - Directional exposure plus legacy characterization/capability/CAS suites: 49/49 passed.
 - Pair capability audit: passes with a non-vacuous engine pair-file scan and negative control.
-- `git diff --check` and pair-source TODO/whitespace scans: clean at each completed lane.
+- Capability/API static audit: 47/47 focused checks passed; pair API remains GET-only and pair live remains unavailable.
+- `git diff --check`, pair-source TODO/whitespace scans, forbidden pair mutation-route scan, and live-capability scan are clean.
 
 PostgreSQL integration was not runnable on this machine: `DATABASE_URL` is unset and Docker is not installed. This is recorded as deviation D-3 and remains a deployment gate; PGlite evidence is not mislabeled as live PostgreSQL evidence.
 
