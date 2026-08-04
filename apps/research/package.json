@@ -16,6 +16,8 @@
     "seed:calibration": "tsx src/cli-seed-calibration.ts",
     "repro": "tsx src/cli-repro.ts",
     "wallet-research": "tsx src/cli-wallet-research.ts",
+    "report:pairs": "tsx src/cli-pair-report.ts",
+    "report:pairs:zero": "tsx src/cli-pair-report.ts --zero-validation",
     "build": "tsc --noEmit",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",

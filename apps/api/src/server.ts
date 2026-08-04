@@ -22,7 +22,7 @@ import { backfillResolvedMarkets, runTimingStats } from "@b5p/research";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import { AuthService } from "./auth";
+import { AuthService, REMEMBERED_SESSION_TTL_SECONDS } from "./auth";
 import { PairReadModelRepository, type PairReadCapability } from "./pair-read-repository";
 import { registerPairReadRoutes, type PairReadRouteRepository } from "./pair-routes";
 
@@ -87,19 +87,25 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   // ---------- auth ----------
 
   app.post("/api/auth/login", async (req, reply) => {
-    const body = z.object({ username: z.string(), password: z.string() }).safeParse(req.body);
+    const body = z.object({
+      username: z.string(),
+      password: z.string(),
+      remember: z.boolean().optional().default(false),
+    }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "bad request" });
     if (auth.rateLimited(req.ip)) return reply.code(429).send({ error: "too many attempts; wait a minute" });
-    const result = await auth.login(body.data.username, body.data.password);
+    const result = await auth.login(body.data.username, body.data.password, body.data.remember);
     if (!result) {
       await db.db.insert(auditEvents).values({ category: "auth", action: "login_failed", actor: body.data.username, correlationId: null, data: null, createdAtMs: Date.now() });
       return reply.code(401).send({ error: "invalid credentials" });
     }
     reply.setCookie(SESSION_COOKIE, result.token, {
       httpOnly: true, sameSite: "lax", secure: false, path: "/",
+      ...(body.data.remember ? { maxAge: REMEMBERED_SESSION_TTL_SECONDS } : {}),
     });
     reply.setCookie(CSRF_COOKIE, result.csrfToken, {
       httpOnly: false, sameSite: "lax", secure: false, path: "/",
+      ...(body.data.remember ? { maxAge: REMEMBERED_SESSION_TTL_SECONDS } : {}),
     });
     await db.db.insert(auditEvents).values({ category: "auth", action: "login", actor: body.data.username, correlationId: null, data: null, createdAtMs: Date.now() });
     return { ok: true, csrfToken: result.csrfToken };

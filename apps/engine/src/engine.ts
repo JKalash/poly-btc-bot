@@ -154,23 +154,23 @@ export class Engine {
       () => this.cfg.paper.fee_collection_convention,
       async (fill) => {
         const rt = this.markets.get(fill.order.marketId);
-        await this.accounting.onFill({
-          marketId: fill.order.marketId,
-          decisionId: fill.order.decisionId,
-          side: fill.order.outcomeSide,
-          shares6: fill.shares6,
-          price6: fill.price6,
-          fee6: fill.fee6,
-          stake6: fill.order.stakeCap6,
-          exitPolicy: fill.order.exitPolicy,
-          nowMs: fill.tsMs,
-        });
         if (rt) this.transitionMarket(rt, fill.order.filled6 >= fill.order.shares6 ? "FILLED" : "PARTIAL");
         await this.audit("order", "fill", { orderId: fill.order.id, shares: fill.shares6, price: fill.price6, maker: fill.maker });
         this.emitEvent({ type: "fill", orderId: fill.order.id, marketId: fill.order.marketId });
         this.observePaperFill(fill);
       },
       (tokenId) => this.books.get(tokenId) ?? null,
+      async (fill, executor) => this.accounting.onFill({
+        marketId: fill.order.marketId,
+        decisionId: fill.order.decisionId,
+        side: fill.order.outcomeSide,
+        shares6: fill.shares6,
+        price6: fill.price6,
+        fee6: fill.fee6,
+        stake6: fill.order.stakeCap6,
+        exitPolicy: fill.order.exitPolicy,
+        nowMs: fill.tsMs,
+      }, executor),
     );
 
     this.execPersistence = new ExecutionPersistence(db);
@@ -278,6 +278,7 @@ export class Engine {
     const orphans = await this.paper.reconcileOrphans(nowMs);
     if (orphans > 0) await this.health("warning", "reconcile", `${orphans} orphaned resting order(s) canceled on restart`);
     await this.accounting.reconcile(this.cfg, nowMs);
+    await this.live.reconcileExposureGuards(nowMs);
     // Reload recent idempotency keys so the duplicate-order gate survives the
     // restart scenarios it exists for (keys are content-derived and also
     // unique-constrained on order_intents as a fail-closed backstop).

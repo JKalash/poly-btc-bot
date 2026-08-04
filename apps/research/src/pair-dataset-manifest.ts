@@ -9,6 +9,14 @@ export type PairDatasetArtifactRole =
   | "CONSTRAINT_SNAPSHOTS"
   | "RESOLUTIONS";
 
+const PAIR_DATASET_ARTIFACT_ROLES = new Set<PairDatasetArtifactRole>([
+  "MARKET_EVENTS",
+  "BOOK_CHECKPOINTS",
+  "FEE_SNAPSHOTS",
+  "CONSTRAINT_SNAPSHOTS",
+  "RESOLUTIONS",
+]);
+
 export interface PairDatasetArtifactEntry {
   readonly path: string;
   readonly role: PairDatasetArtifactRole;
@@ -152,6 +160,9 @@ export async function verifyPairDatasetManifest(
   if (manifest.datasetManifestVersion !== 1 || manifest.clockModelVersion !== "pair_replay_clock_v1" || manifest.tieRuleVersion !== "pair_replay_tie_v1") {
     throw new PairDatasetManifestError("unsupported dataset manifest or clock/tie version");
   }
+  if (typeof manifest.datasetId !== "string" || manifest.datasetId.trim().length === 0) {
+    throw new PairDatasetManifestError("datasetId must be non-empty");
+  }
   const expectedOrder = [...manifest.artifacts].sort((a, b) => a.path.localeCompare(b.path) || a.role.localeCompare(b.role));
   if (expectedOrder.some((entry, index) => entry !== manifest.artifacts[index])) {
     throw new PairDatasetManifestError("manifest artifacts must be canonically ordered");
@@ -162,7 +173,11 @@ export async function verifyPairDatasetManifest(
     throw new PairDatasetHashMismatchError("dataset manifest hash mismatch");
   }
   const contents = new Map<string, Uint8Array>();
+  const seenPaths = new Set<string>();
   for (const entry of manifest.artifacts) {
+    if (!PAIR_DATASET_ARTIFACT_ROLES.has(entry.role)) throw new PairDatasetManifestError(`invalid artifact role: ${entry.path}`);
+    if (seenPaths.has(entry.path)) throw new PairDatasetManifestError(`duplicate artifact path: ${entry.path}`);
+    seenPaths.add(entry.path);
     if (!/^[0-9a-f]{64}$/.test(entry.sha256) || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0) {
       throw new PairDatasetManifestError(`invalid artifact metadata: ${entry.path}`);
     }

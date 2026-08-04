@@ -16,6 +16,20 @@
 3. Fix the cause, then press **“Manual review done — re-arm engine”** on Audit & Health (or
    `POST /api/resume`). There is deliberately no auto re-arm.
 
+## Pair observer and counterfactual account
+
+- Open `/pairs` for the read-only pair research cockpit. Every pair page is labeled
+  `RESEARCH / COUNTERFACTUAL PAPER ONLY`; there is no pair execution control.
+- `PAIR_TERMS_STALE` means exact per-token fee or constraint evidence is unavailable/stale.
+  Observation capture continues where safe, but scheduling stays disabled. Do not substitute
+  displayed floating-point Gamma values.
+- `PAIR_SUBSYSTEM_UNWIRED` means audited lifecycle/effect ports are incomplete. This is the safe
+  production default during the observer study.
+- `PAIR_RECONCILIATION_MISMATCH`, unknown outcomes, residual inventory, or manual-review counts
+  require evidence review. Never edit group state, fills, P&L, or ledger rows through the database.
+- Replay/report runs operate in an isolated research account/namespace and must preserve their
+  dataset manifest, hashes, code revision, scenario hash, and reproduction command.
+
 ## Emergency stop
 
 - Button on every page (header) or `Ctrl+Shift+K`. Requires confirmation.

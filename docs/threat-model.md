@@ -16,3 +16,16 @@ assumptions a future live adapter must not break.
 | Operator self-harm (tilt) | Aggressive settings | Consecutive-loss stops with no auto re-arm, session/daily stops, cooling-off support, ruin math displayed before activation |
 | Credential theft from disk | Password hash only | scrypt (N=16384) hash in `.env`; no plaintext storage; sessions die on restart |
 | Future: key theft | N/A now | Live checklist requires dedicated low-balance hot wallet + OS keychain/libsodium storage; keys must never enter the browser or logs |
+
+## Pair subsystem boundary
+
+The pair subsystem is counterfactual research/paper code with a structural no-live boundary.
+Its public package and API contain no credential, private-key, signing, authenticated CLOB, or
+on-chain transaction capability. Pair API routes are authenticated `GET` routes only, exact
+economic values are emitted as decimal strings, and unknown records return bounded errors without
+stack traces. All simulated effects use deterministic idempotency keys, a durable outbox/inbox,
+observe-before-retry recovery, immutable event evidence, and startup reconciliation. Unknown
+outcomes and reconciliation mismatches retain exposure and require review; they never become a
+synthetic fill or profit. A shared database CAS guard prevents simultaneous directional and pair
+ownership of one market once both owning mutation paths are composed with it; production pair
+scheduling remains disabled until that composition is complete.

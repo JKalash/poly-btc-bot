@@ -59,8 +59,11 @@ export class PairReplayClock {
     if (input.scheduledDueMs < this.currentMs) throw new PairReplayClockError("timer cannot be scheduled in the virtual past");
     if (!Number.isSafeInteger(input.actionSequence) || input.actionSequence < 0) throw new PairReplayClockError("actionSequence must be non-negative");
     if (input.timerId.length === 0 || input.groupId.length === 0) throw new PairReplayClockError("timerId and groupId must be non-empty");
-    const priority = input.priority ?? PAIR_REPLAY_TIMER_PRIORITIES[input.kind];
+    const canonicalPriority = PAIR_REPLAY_TIMER_PRIORITIES[input.kind];
+    if (canonicalPriority === undefined) throw new PairReplayClockError(`unsupported timer kind: ${input.kind}`);
+    const priority = input.priority ?? canonicalPriority;
     if (!Number.isSafeInteger(priority) || priority < 0) throw new PairReplayClockError("timer priority must be non-negative");
+    if (priority !== canonicalPriority) throw new PairReplayClockError(`timer priority does not match kind: ${input.kind}`);
     const timer = Object.freeze({ ...input, priority });
     const prior = this.timers.get(timer.timerId);
     if (prior !== undefined) {

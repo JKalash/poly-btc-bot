@@ -1,6 +1,6 @@
 import type { AppConfig } from "@b5p/config";
 import {
-  bankrollSnapshots, pnlRecords, positions as positionsTable, tradingSessions, type DbHandle,
+  bankrollSnapshots, marketExposureGuards, pnlRecords, positions as positionsTable, tradingSessions, type Db, type DbHandle,
 } from "@b5p/db";
 import { newId } from "@b5p/domain/ids";
 import {
@@ -8,6 +8,7 @@ import {
 } from "@b5p/domain";
 import { eq } from "drizzle-orm";
 import { logger } from "./log";
+import { DirectionalExposureCoordinator } from "./directional-exposure-guard";
 
 interface OpenPosition {
   id: string;
@@ -38,12 +39,15 @@ export class Accounting {
   sessionId = "";
   private dailyPeakDay = "";
   private open = new Map<string, OpenPosition>(); // marketId -> position
+  private readonly exposure: DirectionalExposureCoordinator;
   reconciled = false;
 
   constructor(
     private readonly db: DbHandle,
     private readonly mode: Mode,
-  ) {}
+  ) {
+    this.exposure = new DirectionalExposureCoordinator(db);
+  }
 
   /** Reload open positions and bankroll from the database (restart reconciliation). */
   async reconcile(cfg: AppConfig, nowMs: number): Promise<void> {
@@ -81,6 +85,13 @@ export class Accounting {
       peakBankroll6: this.bankroll,
       realized6: 0n,
       consecutiveLosses: 0,
+    });
+    const existingGuards = await this.db.db.select().from(marketExposureGuards);
+    await this.exposure.transaction(async (_guard, executor) => {
+      await this.exposure.reconcileMarkets(executor, [
+        ...this.open.keys(),
+        ...existingGuards.filter((row) => row.releasedAtMs === null && row.ownerKind !== "PAIR_GROUP").map((row) => row.marketId),
+      ], nowMs);
     });
     this.reconciled = true;
     logger.info("accounting reconciled", { mode: this.mode, bankroll: this.bankroll, openPositions: this.open.size });
@@ -129,57 +140,60 @@ export class Accounting {
     stake6: Usdc6;
     exitPolicy: string;
     nowMs: number;
-  }): Promise<void> {
+  }, executor?: Db): Promise<void> {
+    if (executor !== undefined) return this.persistFill(args, executor);
+    await this.exposure.transaction(async (_guard, tx) => this.persistFill(args, tx));
+  }
+
+  private async persistFill(args: {
+    marketId: string;
+    decisionId: string | null;
+    side: OutcomeSide;
+    shares6: bigint;
+    price6: bigint;
+    fee6: Usdc6;
+    stake6: Usdc6;
+    exitPolicy: string;
+    nowMs: number;
+  }, executor: Db): Promise<void> {
     const cost6 = mulDiv(args.shares6, args.price6, 1_000_000n, "ceil");
+    const previousBankroll = this.bankroll;
+    const previous = this.open.get(args.marketId);
+    const previousPosition = previous === undefined ? undefined : { ...previous };
     this.bankroll -= cost6 + args.fee6;
     let pos = this.open.get(args.marketId);
-    if (!pos) {
-      pos = {
-        id: newId(),
-        marketId: args.marketId,
-        decisionId: args.decisionId,
-        side: args.side,
-        shares6: 0n,
-        cost6: 0n,
-        fees6: 0n,
-        stake6: 0n,
-        exitPolicy: args.exitPolicy,
-        openedAtMs: args.nowMs,
-      };
-      this.open.set(args.marketId, pos);
-      await this.db.db.insert(positionsTable).values({
-        id: pos.id,
-        marketId: pos.marketId,
-        decisionId: pos.decisionId,
-        mode: this.mode,
-        outcomeSide: pos.side,
-        shares6: 0n,
-        avgPrice6: 0n,
-        cost6: 0n,
-        fees6: 0n,
-        stake6: 0n,
-        exitPolicy: pos.exitPolicy,
-        status: "OPEN",
-        openedAtMs: pos.openedAtMs,
+    try {
+      if (!pos) {
+        pos = {
+          id: newId(), marketId: args.marketId, decisionId: args.decisionId, side: args.side,
+          shares6: 0n, cost6: 0n, fees6: 0n, stake6: 0n,
+          exitPolicy: args.exitPolicy, openedAtMs: args.nowMs,
+        };
+        this.open.set(args.marketId, pos);
+        await executor.insert(positionsTable).values({
+          id: pos.id, marketId: pos.marketId, decisionId: pos.decisionId, mode: this.mode,
+          outcomeSide: pos.side, shares6: 0n, avgPrice6: 0n, cost6: 0n, fees6: 0n,
+          stake6: 0n, exitPolicy: pos.exitPolicy, status: "OPEN", openedAtMs: pos.openedAtMs,
+        });
+      }
+      pos.shares6 += args.shares6;
+      pos.cost6 += cost6;
+      pos.fees6 += args.fee6;
+      pos.stake6 += cost6 + args.fee6;
+      const avg = pos.shares6 > 0n ? mulDiv(pos.cost6, 1_000_000n, pos.shares6, "half-even") : 0n;
+      await executor.update(positionsTable)
+        .set({ shares6: pos.shares6, cost6: pos.cost6, fees6: pos.fees6, stake6: pos.stake6, avgPrice6: avg })
+        .where(eq(positionsTable.id, pos.id));
+      await executor.insert(bankrollSnapshots).values({
+        mode: this.mode, bankroll6: this.bankroll, basis: "paper_fill", tsMs: args.nowMs,
       });
+      await this.exposure.reconcileMarkets(executor, [args.marketId], args.nowMs);
+    } catch (error) {
+      this.bankroll = previousBankroll;
+      if (previousPosition === undefined) this.open.delete(args.marketId);
+      else this.open.set(args.marketId, previousPosition);
+      throw error;
     }
-    pos.shares6 += args.shares6;
-    pos.cost6 += cost6;
-    pos.fees6 += args.fee6;
-    pos.stake6 += cost6 + args.fee6; // max loss = cash out the door for a buy
-    const avg = pos.shares6 > 0n ? mulDiv(pos.cost6, 1_000_000n, pos.shares6, "half-even") : 0n;
-    await this.db.db.update(positionsTable)
-      .set({ shares6: pos.shares6, cost6: pos.cost6, fees6: pos.fees6, stake6: pos.stake6, avgPrice6: avg })
-      .where(eq(positionsTable.id, pos.id));
-    // Snapshot on every fill, not just resolution: a restart between fill and
-    // resolution must restore the post-fill bankroll alongside the OPEN
-    // position, or the position's cost is resurrected into the books.
-    await this.db.db.insert(bankrollSnapshots).values({
-      mode: this.mode,
-      bankroll6: this.bankroll,
-      basis: "paper_fill",
-      tsMs: args.nowMs,
-    });
   }
 
   /** Resolve a position: winner pays 1 per share. Returns net pnl. */
@@ -195,30 +209,23 @@ export class Accounting {
     else if (net6 > 0n) this.consecutiveLosses = 0;
 
     this.open.delete(marketId);
-    await this.db.db.update(positionsTable)
-      .set({ status: "RESOLVED", outcome, pnl6: net6, resolvedAtMs: nowMs })
-      .where(eq(positionsTable.id, pos.id));
-    await this.db.db.insert(pnlRecords).values({
-      id: newId(),
-      mode: this.mode,
-      marketId,
-      positionId: pos.id,
-      gross6: payout6 - pos.cost6,
-      fees6: pos.fees6,
-      rebates6: 0n,
-      net6,
-      meta: { side: pos.side, outcome, shares6: pos.shares6.toString(), exitPolicy: pos.exitPolicy },
-      createdAtMs: nowMs,
+    await this.exposure.transaction(async (_guard, executor) => {
+      await executor.update(positionsTable)
+        .set({ status: "RESOLVED", outcome, pnl6: net6, resolvedAtMs: nowMs })
+        .where(eq(positionsTable.id, pos.id));
+      await executor.insert(pnlRecords).values({
+        id: newId(), mode: this.mode, marketId, positionId: pos.id,
+        gross6: payout6 - pos.cost6, fees6: pos.fees6, rebates6: 0n, net6,
+        meta: { side: pos.side, outcome, shares6: pos.shares6.toString(), exitPolicy: pos.exitPolicy }, createdAtMs: nowMs,
+      });
+      await executor.insert(bankrollSnapshots).values({
+        mode: this.mode, bankroll6: this.bankroll, basis: "paper_resolution", tsMs: nowMs,
+      });
+      await executor.update(tradingSessions)
+        .set({ peakBankroll6: this.sessionPeak, realized6: this.bankroll - this.sessionStartBankroll, consecutiveLosses: this.consecutiveLosses })
+        .where(eq(tradingSessions.id, this.sessionId));
+      await this.exposure.reconcileMarkets(executor, [marketId], nowMs);
     });
-    await this.db.db.insert(bankrollSnapshots).values({
-      mode: this.mode,
-      bankroll6: this.bankroll,
-      basis: "paper_resolution",
-      tsMs: nowMs,
-    });
-    await this.db.db.update(tradingSessions)
-      .set({ peakBankroll6: this.sessionPeak, realized6: this.bankroll - this.sessionStartBankroll, consecutiveLosses: this.consecutiveLosses })
-      .where(eq(tradingSessions.id, this.sessionId));
     return net6;
   }
 

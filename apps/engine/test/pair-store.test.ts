@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeDb, schema, type DbHandle } from "@b5p/db";
 import { canonicalObjectHash } from "@b5p/pair-execution";
 import { PairStore, PairStoreIdempotencyCollisionError, type PairOrderGroupInsert } from "../src/pair-store";
+import { MarketExposureGuardStore } from "../src/market-exposure-guard-store";
 
 const now = 1_800_000_000_000;
 let handle: DbHandle;
@@ -120,6 +121,19 @@ describe("durable pair store", () => {
     expect(blocked).toMatchObject({ kind: "ACTIVE_MARKET_CONFLICT", active: { id: "group" } });
     await handle.db.update(schema.pairOrderGroups).set({ state: "RECONCILED_FLAT" });
     expect((await store.createGroup(group("group-2", "market"))).kind).toBe("CREATED");
+  });
+
+  it("acquires the shared guard in the group transaction and loses to active directional exposure", async () => {
+    const directional = await new MarketExposureGuardStore(handle).acquire({
+      marketId: "market", ownerKind: "DIRECTIONAL_ORDER", ownerId: "directional-order",
+      ownerState: "PENDING", acquiredAtMs: now,
+    });
+    expect(directional.kind).toBe("ACQUIRED");
+    expect(await store.createGroup(group())).toEqual({
+      kind: "MARKET_EXPOSURE_CONFLICT", code: "MARKET_ACTIVE",
+      ownerKind: "DIRECTIONAL_ORDER", ownerId: "directional-order",
+    });
+    expect(await handle.db.select().from(schema.pairOrderGroups)).toHaveLength(0);
   });
 
   it("commits event, projection, and effect together and rolls all three back on outbox failure", async () => {

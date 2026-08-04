@@ -1,4 +1,4 @@
-import { orderFills, orders as ordersTable, pnlRecords, positions as positionsTable, type DbHandle } from "@b5p/db";
+import { orderFills, orders as ordersTable, pnlRecords, positions as positionsTable, type Db, type DbHandle } from "@b5p/db";
 import { newId } from "@b5p/domain/ids";
 import {
   mulDiv, usdc, type BankrollState, type OutcomeSide, type Prob6, type Shares6, type Usdc6,
@@ -6,6 +6,7 @@ import {
 import { LiveClobAdapter, type LivePreflight, type OrderRequest } from "@b5p/polymarket";
 import { and, eq, inArray } from "drizzle-orm";
 import { logger } from "./log";
+import { DirectionalExposureCoordinator } from "./directional-exposure-guard";
 
 /**
  * Live arming controller. Owns the real-money adapter and the arm state machine.
@@ -69,8 +70,14 @@ export class LiveController {
   /** orderId -> stake reserved by a resting (unfilled) live order. */
   private restingReserve = new Map<string, { marketId: string; stake6: Usdc6 }>();
   disarmReason: string | null = null;
+  private readonly exposure: DirectionalExposureCoordinator;
 
-  constructor(private readonly db: DbHandle) {
+  constructor(private readonly db: DbHandle, adapterOverride?: LiveClobAdapter) {
+    this.exposure = new DirectionalExposureCoordinator(db);
+    if (adapterOverride !== undefined) {
+      this.adapter = adapterOverride;
+      return;
+    }
     const enabled = process.env.LIVE_TRADING_ENABLED === "1";
     const key = process.env.HOT_WALLET_PRIVATE_KEY;
     if (enabled && key) {
@@ -204,7 +211,7 @@ export class LiveController {
     fee6: Usdc6;
     exitPolicy: string;
     nowMs: number;
-  }): Promise<void> {
+  }, executor: Db): Promise<void> {
     const cost6 = mulDiv(args.shares6, args.price6, 1_000_000n, "ceil");
     let pos = this.positions.get(args.marketId);
     if (!pos) {
@@ -221,7 +228,7 @@ export class LiveController {
         openedAtMs: args.nowMs,
       };
       this.positions.set(args.marketId, pos);
-      await this.db.db.insert(positionsTable).values({
+      await executor.insert(positionsTable).values({
         id: pos.positionId,
         marketId: pos.marketId,
         decisionId: pos.decisionId,
@@ -242,7 +249,7 @@ export class LiveController {
     pos.fees6 += args.fee6;
     pos.stake6 += cost6 + args.fee6;
     const avg = pos.shares6 > 0n ? mulDiv(pos.cost6, 1_000_000n, pos.shares6, "half-even") : 0n;
-    await this.db.db.update(positionsTable)
+    await executor.update(positionsTable)
       .set({ shares6: pos.shares6, cost6: pos.cost6, fees6: pos.fees6, stake6: pos.stake6, avgPrice6: avg })
       .where(eq(positionsTable.id, pos.positionId));
   }
@@ -275,37 +282,31 @@ export class LiveController {
       if (total6 > o.filledShares6) {
         const delta6 = total6 - o.filledShares6;
         const price6 = agg?.avgPrice6 ?? o.price6;
-        await this.db.db.insert(orderFills).values({
-          id: newId(),
-          orderId: o.id,
-          price6,
-          shares6: delta6,
-          feeUsdc6: 0n,
-          maker: o.postOnly,
-          tradeRef: o.externalId,
-          tsMs: nowMs,
-        });
         const full = total6 >= o.shares6;
-        await this.db.db.update(ordersTable)
-          .set({ filledShares6: total6, status: full ? "MATCHED" : "PARTIAL", updatedAtMs: nowMs })
-          .where(eq(ordersTable.id, o.id));
-        await this.applyFill({
-          marketId: o.marketId,
-          decisionId: o.decisionId,
-          side: o.outcomeSide as OutcomeSide,
-          shares6: delta6,
-          price6,
-          fee6: 0n,
-          exitPolicy: "hold_to_resolution",
-          nowMs,
+        await this.exposure.transaction(async (guard, executor) => {
+          await executor.insert(orderFills).values({
+            id: newId(), orderId: o.id, price6, shares6: delta6, feeUsdc6: 0n,
+            maker: o.postOnly, tradeRef: o.externalId, tsMs: nowMs,
+          });
+          await executor.update(ordersTable)
+            .set({ filledShares6: total6, status: full ? "MATCHED" : "PARTIAL", updatedAtMs: nowMs })
+            .where(eq(ordersTable.id, o.id));
+          await this.applyFill({
+            marketId: o.marketId, decisionId: o.decisionId, side: o.outcomeSide as OutcomeSide,
+            shares6: delta6, price6, fee6: 0n, exitPolicy: "hold_to_resolution", nowMs,
+          }, executor);
+          await this.exposure.reconcile(guard, executor, o.marketId, nowMs);
         });
         if (full) this.restingReserve.delete(o.id);
         logger.info("live resting fill recorded", { orderId: o.id, shares6: delta6.toString(), price6: price6.toString() });
       } else if (o.expireAtMs !== null && nowMs > o.expireAtMs + 60_000) {
         // GTD expiry passed with no (further) fill visible in trade history
-        await this.db.db.update(ordersTable)
-          .set({ status: "EXPIRED", statusReason: "GTD expiry passed", updatedAtMs: nowMs })
-          .where(eq(ordersTable.id, o.id));
+        await this.exposure.transaction(async (guard, executor) => {
+          await executor.update(ordersTable)
+            .set({ status: "EXPIRED", statusReason: "GTD expiry passed", updatedAtMs: nowMs })
+            .where(eq(ordersTable.id, o.id));
+          await this.exposure.reconcile(guard, executor, o.marketId, nowMs);
+        });
         this.restingReserve.delete(o.id);
       }
     }
@@ -334,24 +335,21 @@ export class LiveController {
     }
     if (!pos || pos.shares6 <= 0n) {
       this.markClosed(marketId, null);
+      await this.exposure.transaction(async (guard, executor) => this.exposure.reconcile(guard, executor, marketId, nowMs));
       return null;
     }
     const payout6: Usdc6 = pos.side === outcome ? pos.shares6 : 0n;
     const net6 = payout6 - pos.cost6 - pos.fees6;
-    await this.db.db.update(positionsTable)
-      .set({ status: "RESOLVED", outcome, pnl6: net6, resolvedAtMs: nowMs })
-      .where(eq(positionsTable.id, pos.positionId));
-    await this.db.db.insert(pnlRecords).values({
-      id: newId(),
-      mode: "live",
-      marketId,
-      positionId: pos.positionId,
-      gross6: payout6 - pos.cost6,
-      fees6: pos.fees6,
-      rebates6: 0n,
-      net6,
-      meta: { side: pos.side, outcome, shares6: pos.shares6.toString(), exitPolicy: pos.exitPolicy },
-      createdAtMs: nowMs,
+    await this.exposure.transaction(async (guard, executor) => {
+      await executor.update(positionsTable)
+        .set({ status: "RESOLVED", outcome, pnl6: net6, resolvedAtMs: nowMs })
+        .where(eq(positionsTable.id, pos.positionId));
+      await executor.insert(pnlRecords).values({
+        id: newId(), mode: "live", marketId, positionId: pos.positionId,
+        gross6: payout6 - pos.cost6, fees6: pos.fees6, rebates6: 0n, net6,
+        meta: { side: pos.side, outcome, shares6: pos.shares6.toString(), exitPolicy: pos.exitPolicy }, createdAtMs: nowMs,
+      });
+      await this.exposure.reconcile(guard, executor, marketId, nowMs);
     });
     this.positions.delete(marketId);
     this.markClosed(marketId, net6 > 0n ? true : net6 < 0n ? false : null);
@@ -398,64 +396,46 @@ export class LiveController {
       ...(args.expireAtMs ? { expireAtMs: args.expireAtMs } : {}),
     };
 
-    await this.db.db.insert(ordersTable).values({
-      id: orderId,
-      intentId: args.intentId,
-      decisionId: args.decisionId,
-      marketId: args.marketId,
-      tokenId: args.tokenId,
-      outcomeSide: args.outcomeSide,
-      orderSide: "BUY",
-      style: args.style === "maker_post_only" ? "maker_post_only" : "taker_fak",
-      timeInForce: req.timeInForce,
-      postOnly: req.postOnly,
-      price6: args.price6,
-      shares6: args.shares6,
-      filledShares6: 0n,
-      stake6: args.stake6,
-      mode: "live",
-      status: "PENDING",
-      ...(args.expireAtMs ? { expireAtMs: args.expireAtMs } : {}),
-      externalId: null,
-      createdAtMs: args.nowMs,
-      updatedAtMs: args.nowMs,
+    // External acknowledgement cannot share a database transaction. Commit the
+    // guard and durable PENDING intent first; a crash/unknown response retains
+    // conservative ownership until reconciliation proves a terminal outcome.
+    await this.exposure.transaction(async (guard, executor) => {
+      await this.exposure.claimOrder(guard, args.marketId, args.nowMs);
+      await executor.insert(ordersTable).values({
+        id: orderId, intentId: args.intentId, decisionId: args.decisionId,
+        marketId: args.marketId, tokenId: args.tokenId, outcomeSide: args.outcomeSide,
+        orderSide: "BUY", style: args.style === "maker_post_only" ? "maker_post_only" : "taker_fak",
+        timeInForce: req.timeInForce, postOnly: req.postOnly, price6: args.price6,
+        shares6: args.shares6, filledShares6: 0n, stake6: args.stake6, mode: "live", status: "PENDING",
+        ...(args.expireAtMs ? { expireAtMs: args.expireAtMs } : {}),
+        externalId: null, createdAtMs: args.nowMs, updatedAtMs: args.nowMs,
+      });
     });
 
     const res = await this.adapter.submit(req);
     const status = res.accepted ? res.status : "REJECTED";
-    await this.db.db.update(ordersTable).set({
-      status,
-      ...(res.externalId ? { externalId: res.externalId } : {}),
-      ...(res.reason ? { statusReason: res.reason } : {}),
-      updatedAtMs: args.nowMs,
-    }).where(eq(ordersTable.id, orderId));
-
-    // A MATCHED taker fill is immediate; record it at the requested price as a
-    // conservative proxy (the fill poller refines from trade history). It goes
-    // through the live position ledger so exposure/resolution/dashboard see it.
-    if (res.accepted && status === "MATCHED") {
-      await this.db.db.insert(orderFills).values({
-        id: newId(),
-        orderId,
-        price6: args.price6,
-        shares6: args.shares6,
-        feeUsdc6: 0n,
-        maker: args.style === "maker_post_only",
-        tradeRef: res.externalId ?? null,
-        tsMs: args.nowMs,
-      });
-      await this.db.db.update(ordersTable).set({ filledShares6: args.shares6 }).where(eq(ordersTable.id, orderId));
-      await this.applyFill({
-        marketId: args.marketId,
-        decisionId: args.decisionId,
-        side: args.outcomeSide,
-        shares6: args.shares6,
-        price6: args.price6,
-        fee6: 0n,
-        exitPolicy: args.exitPolicy ?? "hold_to_resolution",
-        nowMs: args.nowMs,
-      });
-    } else if (res.accepted) {
+    await this.exposure.transaction(async (guard, executor) => {
+      await executor.update(ordersTable).set({
+        status,
+        ...(res.externalId ? { externalId: res.externalId } : {}),
+        ...(res.reason ? { statusReason: res.reason } : {}),
+        updatedAtMs: args.nowMs,
+      }).where(eq(ordersTable.id, orderId));
+      if (res.accepted && status === "MATCHED") {
+        await executor.insert(orderFills).values({
+          id: newId(), orderId, price6: args.price6, shares6: args.shares6, feeUsdc6: 0n,
+          maker: args.style === "maker_post_only", tradeRef: res.externalId ?? null, tsMs: args.nowMs,
+        });
+        await executor.update(ordersTable).set({ filledShares6: args.shares6 }).where(eq(ordersTable.id, orderId));
+        await this.applyFill({
+          marketId: args.marketId, decisionId: args.decisionId, side: args.outcomeSide,
+          shares6: args.shares6, price6: args.price6, fee6: 0n,
+          exitPolicy: args.exitPolicy ?? "hold_to_resolution", nowMs: args.nowMs,
+        }, executor);
+      }
+      await this.exposure.reconcile(guard, executor, args.marketId, args.nowMs);
+    });
+    if (res.accepted && status !== "MATCHED") {
       // resting order: its stake is committed on the exchange — visible to the
       // risk engine as open exposure until it fills, expires or is canceled
       this.restingReserve.set(orderId, { marketId: args.marketId, stake6: args.stake6 });
@@ -467,7 +447,31 @@ export class LiveController {
   async cancelAll(): Promise<number> {
     if (!this.adapter) return 0;
     const r = await this.adapter.cancelAll();
-    return r.ok ? 1 : 0;
+    if (!r.ok) return 0;
+    const rows = await this.db.db.select().from(ordersTable).where(and(
+      eq(ordersTable.mode, "live"), inArray(ordersTable.status, ["PENDING", "LIVE", "DELAYED", "PARTIAL"]),
+    ));
+    await this.exposure.transaction(async (guard, executor) => {
+      for (const row of rows) {
+        await executor.update(ordersTable).set({ status: "CANCELED", statusReason: "live cancel-all acknowledged", updatedAtMs: Date.now() }).where(eq(ordersTable.id, row.id));
+        await this.exposure.reconcile(guard, executor, row.marketId, Date.now());
+        this.restingReserve.delete(row.id);
+      }
+    });
+    return 1;
+  }
+
+  /** Reassert durable ownership after restart; never releases unknown live effects. */
+  async reconcileExposureGuards(nowMs: number): Promise<void> {
+    const [orders, positions] = await Promise.all([
+      this.db.db.select().from(ordersTable).where(eq(ordersTable.mode, "live")),
+      this.db.db.select().from(positionsTable).where(eq(positionsTable.mode, "live")),
+    ]);
+    await this.exposure.transaction(async (_guard, executor) => {
+      await this.exposure.reconcileMarkets(executor, [
+        ...orders.map((row) => row.marketId), ...positions.map((row) => row.marketId),
+      ], nowMs);
+    });
   }
 
   address(): string {

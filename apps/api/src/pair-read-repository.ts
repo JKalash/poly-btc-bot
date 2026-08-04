@@ -421,15 +421,90 @@ export class PairReadModelRepository {
     const groups = await this.handle.db.select().from(schema.pairOrderGroups).where(eq(schema.pairOrderGroups.id, id)).limit(1);
     if (groups[0] === undefined) return null;
     this.trace("groups.children.batch");
-    const [actions, effects, lots, consumptions, ledger, evidence] = await Promise.all([
+    const [actions, effects, lots, consumptions, ledger, evidence, orders, reconciliations] = await Promise.all([
       this.handle.db.select().from(schema.pairActionIntents).where(eq(schema.pairActionIntents.groupId, id)).orderBy(schema.pairActionIntents.actionSequence),
       this.handle.db.select().from(schema.pairEffectOutbox).where(eq(schema.pairEffectOutbox.groupId, id)).orderBy(schema.pairEffectOutbox.actionSequence, schema.pairEffectOutbox.effectOrdinal),
       this.handle.db.select().from(schema.pairInventoryLots).where(eq(schema.pairInventoryLots.groupId, id)).orderBy(schema.pairInventoryLots.acquiredAtMs, schema.pairInventoryLots.id),
       this.handle.db.select().from(schema.pairInventoryConsumptions).where(eq(schema.pairInventoryConsumptions.groupId, id)).orderBy(schema.pairInventoryConsumptions.createdAtMs, schema.pairInventoryConsumptions.id),
       this.handle.db.select().from(schema.pairLedgerEntries).where(eq(schema.pairLedgerEntries.groupId, id)).orderBy(schema.pairLedgerEntries.occurredAtMs, schema.pairLedgerEntries.journalId, schema.pairLedgerEntries.lineNumber),
       this.handle.db.select().from(schema.pairInboxEvidence).where(eq(schema.pairInboxEvidence.groupId, id)).orderBy(schema.pairInboxEvidence.receivedTsMs, schema.pairInboxEvidence.id),
+      this.handle.db.select().from(schema.orders).where(eq(schema.orders.pairGroupId, id)).orderBy(schema.orders.createdAtMs, schema.orders.id),
+      this.handle.db.select().from(schema.pairReconciliations).where(eq(schema.pairReconciliations.groupId, id)).orderBy(schema.pairReconciliations.startedAtMs, schema.pairReconciliations.id),
     ]);
-    return exactRow({ ...groups[0], actions, effects, inventoryLots: lots, inventoryConsumptions: consumptions, ledgerEntries: ledger, evidence });
+    const group = groups[0];
+    const decisionIds = uniqueText([
+      group.signalDecisionId,
+      group.activationDecisionId,
+      ...actions.map((action) => action.decisionId),
+    ]);
+    const riskDecisionIds = uniqueText([
+      group.signalRiskDecisionId,
+      group.activationRiskDecisionId,
+      ...actions.map((action) => action.riskDecisionId),
+    ]);
+    const orderIntentIds = uniqueText(actions.map((action) => action.orderIntentId));
+    const orderIds = orders.map((order) => order.id);
+    const reconciliationIds = reconciliations.map((run) => run.id);
+
+    this.trace("groups.related.batch");
+    const [decisions, riskDecisions, orderIntents, fills, reconciliationDiffs] = await Promise.all([
+      decisionIds.length === 0 ? Promise.resolve([]) : this.handle.db.select().from(schema.decisionSnapshots)
+        .where(inArray(schema.decisionSnapshots.decisionId, decisionIds)).orderBy(schema.decisionSnapshots.createdAtMs, schema.decisionSnapshots.decisionId),
+      riskDecisionIds.length === 0 ? Promise.resolve([]) : this.handle.db.select().from(schema.riskDecisions)
+        .where(inArray(schema.riskDecisions.id, riskDecisionIds)).orderBy(schema.riskDecisions.createdAtMs, schema.riskDecisions.id),
+      orderIntentIds.length === 0 ? Promise.resolve([]) : this.handle.db.select().from(schema.orderIntents)
+        .where(inArray(schema.orderIntents.id, orderIntentIds)).orderBy(schema.orderIntents.createdAtMs, schema.orderIntents.id),
+      orderIds.length === 0 ? Promise.resolve([]) : this.handle.db.select().from(schema.orderFills)
+        .where(inArray(schema.orderFills.orderId, orderIds)).orderBy(schema.orderFills.tsMs, schema.orderFills.id),
+      reconciliationIds.length === 0 ? Promise.resolve([]) : this.handle.db.select().from(schema.pairReconciliationDiffs)
+        .where(inArray(schema.pairReconciliationDiffs.reconciliationId, reconciliationIds))
+        .orderBy(schema.pairReconciliationDiffs.reconciliationId, schema.pairReconciliationDiffs.createdAtMs, schema.pairReconciliationDiffs.id),
+    ]);
+
+    const decisionsById = new Map(decisions.map((row) => [row.decisionId, row]));
+    const risksById = new Map(riskDecisions.map((row) => [row.id, row]));
+    const intentsById = new Map(orderIntents.map((row) => [row.id, row]));
+    const effectsByAction = groupRows(effects, (row) => row.actionIntentId);
+    const ordersByIntent = groupRows(orders, (row) => row.intentId);
+    const fillsByOrder = groupRows(fills, (row) => row.orderId);
+    const diffsByReconciliation = groupRows(reconciliationDiffs, (row) => row.reconciliationId);
+
+    const actionDetails = actions.map((action) => ({
+      ...action,
+      decision: decisionsById.get(action.decisionId) ?? null,
+      riskDecision: risksById.get(action.riskDecisionId) ?? null,
+      orderIntent: action.orderIntentId === null ? null : intentsById.get(action.orderIntentId) ?? null,
+      effects: effectsByAction.get(action.id) ?? [],
+      orders: action.orderIntentId === null ? [] : (ordersByIntent.get(action.orderIntentId) ?? []).map((order) => ({
+        ...order,
+        fills: fillsByOrder.get(order.id) ?? [],
+      })),
+    }));
+    const orderDetails = orders.map((order) => ({ ...order, fills: fillsByOrder.get(order.id) ?? [] }));
+    const reconciliationDetails = reconciliations.map((run) => ({ ...run, diffs: diffsByReconciliation.get(run.id) ?? [] }));
+
+    return exactRow({
+      ...group,
+      signal: {
+        captureId: group.signalCaptureId,
+        decision: decisionsById.get(group.signalDecisionId) ?? null,
+        riskDecision: risksById.get(group.signalRiskDecisionId) ?? null,
+      },
+      activation: {
+        captureId: group.activationCaptureId,
+        secondLegCaptureId: group.secondLegCaptureId,
+        decision: group.activationDecisionId === null ? null : decisionsById.get(group.activationDecisionId) ?? null,
+        riskDecision: group.activationRiskDecisionId === null ? null : risksById.get(group.activationRiskDecisionId) ?? null,
+      },
+      actions: actionDetails,
+      effects,
+      orders: orderDetails,
+      inventoryLots: lots,
+      inventoryConsumptions: consumptions,
+      ledgerEntries: ledger,
+      evidence,
+      reconciliations: reconciliationDetails,
+    });
   }
 
   async listGroupEvents(groupId: string, query: Readonly<Record<string, unknown>> = {}): Promise<PairPage<ExactReadRow>> {
@@ -505,4 +580,14 @@ export class PairReadModelRepository {
 
 function assertReadId(id: string): void {
   if (id.trim().length === 0) throw new PairReadModelValidationError("id must not be empty");
+}
+
+function uniqueText(values: readonly (string | null | undefined)[]): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === "string" && value.length > 0))];
+}
+
+function groupRows<Row>(rows: readonly Row[], key: (row: Row) => string): Map<string, Row[]> {
+  const grouped = new Map<string, Row[]>();
+  for (const row of rows) grouped.set(key(row), [...(grouped.get(key(row)) ?? []), row]);
+  return grouped;
 }

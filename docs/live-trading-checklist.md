@@ -33,3 +33,12 @@ be checked, in order. The spec's validation standards are the gate, not a formal
 - [ ] 2 weeks of shadow mode with zero reconciliation mismatches
 - [ ] Runbook rehearsal: halt, kill, restart, resolution mismatch
 - [ ] Absolute cap review: the 10% per-market cap stays unless this document is amended with reasons
+
+## Pair strategy boundary (permanent for this implementation)
+
+- [x] Pair capability declares `liveExecutionAvailable: false`
+- [x] Pair package imports no wallet, signer, authenticated venue, or live-order adapter
+- [x] Pair API and cockpit are read-only and expose no execution control
+- [x] Directional live arming cannot authorize pair execution
+- [ ] Any future pair-live proposal requires a new specification and independent security review;
+      it cannot be enabled by checking items in this document

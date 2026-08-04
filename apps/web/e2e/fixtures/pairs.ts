@@ -1,0 +1,145 @@
+export const pairSummaryFixture = {
+  capability: {
+    observerEnabled: true,
+    paperExecutionEnabled: true,
+    liveExecutionAvailable: false,
+    strategyVersion: "complete_set_pair_v0_RESEARCH_ONLY",
+  },
+  health: {
+    status: "DEGRADED",
+    paperSchedulingAllowed: false,
+    pairAccountMismatchCount: 0,
+    groupMismatchCount: 1,
+    unknownOutcomeGroupCount: 1,
+    manualReviewGroupCount: 0,
+    pendingEffectCount: 2,
+    lastReconciledAtMs: 1_785_820_000_000,
+    runtime: {
+      sources: {
+        observerEvaluationHealthy: true,
+        feeTermsHealthy: true,
+        constraintTermsHealthy: true,
+      },
+      queue: { depth: 3, capacity: 128 },
+    },
+  },
+  current: {
+    openEpisodes: 2,
+    activeGroups: 2,
+    residualGroups: 1,
+    unknownOutcomeGroups: 1,
+    manualReviewGroups: 0,
+    pairCashAvailable6: "9007199254740993000000",
+    pairCashReserved6: "123456789",
+  },
+  trailing24h: {
+    evaluatedEnvelopes: "9007199254740993",
+    episodes: 41,
+    grossDislocations: "1300",
+    feePositiveObservations: "217",
+    activationSurvivors: 17,
+    paperGroups: 17,
+    pairedGroups: 12,
+    residualGroups: 1,
+    realizedPnl6: "-7654321",
+  },
+} as const;
+
+export const pairEpisodesFixture = {
+  items: [{
+    id: "episode-001",
+    marketId: "btc-updown-5m-001",
+    strategyVersion: "complete_set_pair_v0_RESEARCH_ONLY",
+    state: "CLOSED",
+    firstObservedAtMs: 1_785_819_000_000,
+    lastObservedAtMs: 1_785_819_075_000,
+    closedAtMs: 1_785_819_075_000,
+    closeReason: "NO_LONGER_ELIGIBLE",
+    minimumAskSum6: "987654",
+    maximumSignalNetPnl6: "1234567",
+    maximumActivationNetPnl6: "345678",
+    envelopeCount: "9007199254740993",
+    eligibleEnvelopeCount: "19",
+    scheduledGroupCount: 1,
+  }],
+  nextCursor: null,
+} as const;
+
+export const pairGroupsFixture = {
+  items: [{
+    id: "group-001",
+    marketId: "btc-updown-5m-001",
+    state: "RESIDUAL",
+    dispatchModel: "PARALLEL",
+    recoveryPolicy: "PAPER_MINIMIZE_WORST_LOSS",
+    reservedCash6: "123456789",
+    upHeldShares6: "12500000",
+    downHeldShares6: "11000000",
+    matchedShares6: "11000000",
+    residualSide: "UP",
+    residualShares6: "1500000",
+    currentWorstCaseLoss6: "2250000",
+    signalNetPnl6: "1234567",
+    activationNetPnl6: "345678",
+    realizedPairPnl6: "-7654321",
+    reconciliationStatus: "MISMATCH",
+    createdAtMs: 1_785_819_050_000,
+  }],
+  nextCursor: null,
+} as const;
+
+export const pairResearchRunsFixture = {
+  items: [{
+    id: "research-001",
+    status: "SUCCEEDED",
+    strategyVersion: "complete_set_pair_v0_RESEARCH_ONLY",
+    marketCount: 88,
+    eventCount: "900719925474099312345",
+    episodeCount: 513,
+    summaryJson: {
+      scenarios: [{
+        label: "parallel / 250ms / full depth",
+        scenario: { latencyMs: "250ms", dispatchModel: "PARALLEL", depthMode: "FULL" },
+        sampleCount: "9007199254740993",
+        meanNetPnl6: "345678",
+        confidenceInterval: { low6: "-120000", high6: "811356" },
+      }],
+    },
+    promotionVerdict: "HOLD_RESEARCH_ONLY",
+    startedAtMs: 1_785_800_000_000,
+    completedAtMs: 1_785_810_000_000,
+  }],
+  nextCursor: null,
+} as const;
+
+export const emptyPairSummaryFixture = {
+  ...pairSummaryFixture,
+  health: {
+    ...pairSummaryFixture.health,
+    status: "HEALTHY",
+    paperSchedulingAllowed: true,
+    groupMismatchCount: 0,
+    unknownOutcomeGroupCount: 0,
+    pendingEffectCount: 0,
+  },
+  current: {
+    openEpisodes: 0,
+    activeGroups: 0,
+    residualGroups: 0,
+    unknownOutcomeGroups: 0,
+    manualReviewGroups: 0,
+    pairCashAvailable6: "0",
+    pairCashReserved6: "0",
+  },
+  trailing24h: {
+    evaluatedEnvelopes: "0",
+    episodes: 0,
+    grossDislocations: "0",
+    feePositiveObservations: "0",
+    activationSurvivors: 0,
+    paperGroups: 0,
+    pairedGroups: 0,
+    residualGroups: 0,
+    realizedPnl6: "0",
+  },
+} as const;

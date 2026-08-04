@@ -40,12 +40,13 @@ describe("auth", () => {
   });
 
   it("logs in and sets an http-only session cookie", async () => {
-    const res = await app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "operator", password: "test-password-123" } });
+    const res = await app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "operator", password: "test-password-123", remember: true } });
     expect(res.statusCode).toBe(200);
     const setCookies = res.headers["set-cookie"] as string[] | string;
     const all = Array.isArray(setCookies) ? setCookies : [setCookies];
     const session = all.find((c) => c.startsWith("b5p_session="))!;
     expect(session).toContain("HttpOnly");
+    expect(session).toMatch(/Max-Age=2592000/i);
     cookie = session.split(";")[0]!;
     csrf = (res.json() as { csrfToken: string }).csrfToken;
     expect(csrf.length).toBeGreaterThan(10);

@@ -3,15 +3,20 @@ import {
   MarketDataStore, configVersions, makeDb,
   type MarketDataEventInput, type PersistedMarketDataEvent,
 } from "@b5p/db";
-import { prob, shares } from "@b5p/domain";
+import { prob, shares, usdc } from "@b5p/domain";
+import { canonicalObjectHash } from "@b5p/pair-execution";
 import {
-  BinanceKlinesPoller, ClobMarketWs, GammaClient, RtdsClient, tsToMs,
+  BinanceKlinesPoller, ClobMarketWs, GammaClient,
+  POLYMARKET_CLOB_V2_USDC_TAKER_FEE_CONTRACT, PublicClobTokenTermsSource,
+  RtdsClient, tsToMs,
 } from "@b5p/polymarket";
 import { eq } from "drizzle-orm";
 import { makeBus } from "./bus";
 import { Engine } from "./engine";
 import { logger } from "./log";
 import { PairCaptureQueue, type PairMarketDataRecord } from "./pair-capture-queue";
+import { PairAccountStore } from "./pair-account-store";
+import { PairPortfolioStore } from "./pair-portfolio-store";
 import { createPairSubsystem, type PairSubsystem } from "./pair-subsystem";
 import { ENGINE_VERSION } from "./snapshot";
 
@@ -82,6 +87,29 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
   let captureQueueRef: PairCaptureQueue | null = null;
   const pendingObserverEnvelopes = new Map<string, { readonly marketId: string; readonly envelopeId: string }>();
   const durableEnvelopeSequences = new Map<string, bigint>();
+  const pairAccountSessionKey = `pair-runtime:${ENGINE_VERSION}:config:${engine.configVersion}`;
+  const pairAccountId = `pairacct_${canonicalObjectHash({ pairAccountSessionKey }).slice(0, 32)}`;
+  const pairStartingCash6 = usdc(engine.cfg.risk.starting_paper_bankroll_usdc);
+  const pairAccounts = new PairAccountStore(db);
+  await pairAccounts.createAccount({
+    id: pairAccountId,
+    sessionKey: pairAccountSessionKey,
+    sourceConfigVersion: engine.configVersion,
+    startingCash6: pairStartingCash6,
+    dailyBucketUtc: new Date().toISOString().slice(0, 10),
+    createdAtMs: Date.now(),
+  });
+  const pairPortfolios = new PairPortfolioStore(db);
+  const pairTermsSource = new PublicClobTokenTermsSource({
+    feeCollectionContract: POLYMARKET_CLOB_V2_USDC_TAKER_FEE_CONTRACT,
+    nowMs: Date.now,
+  });
+  const pairTermsHealth = () => pairTermsSource.health({
+    tokenIds: engine.subscriptionTokens(Math.floor(Date.now() / 1000)).filter((tokenId) => tokenId.trim().length > 0),
+    asOfMs: Date.now(),
+    maximumFeeAgeMs: engine.cfg.pair.maximum_fee_snapshot_age_ms,
+    maximumConstraintAgeMs: engine.cfg.pair.maximum_constraint_snapshot_age_ms,
+  });
   const pairSubsystem = await createPairSubsystem({
     db,
     config: engine.cfg,
@@ -89,14 +117,24 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
     sourceVersion: ENGINE_VERSION,
     startupRunKey: `engine:${Date.now()}:${process.pid}`,
     engine,
-    // Gamma currently parses these values through Number, which is not an
-    // acceptable exact-terms authority. Stay observer-safe and fail terms
-    // closed until an exact-string CLOB/Gamma metadata adapter is wired.
-    termsSource: { fetchTokenTerms: async () => null },
-    // The counterfactual account portfolio adapter is a later lifecycle port.
-    // Throwing records honest unavailability; it never fabricates bankroll.
-    portfolio: async () => { throw new Error("pair portfolio adapter is not wired"); },
-    requestedCashCap6: () => 0n,
+    termsSource: pairTermsSource,
+    portfolio: async ({ asOfMs }) => {
+      const directional = engine.accounting.state();
+      return pairPortfolios.snapshot({
+        accountId: pairAccountId,
+        referenceBankroll6: pairStartingCash6,
+        directionalFreeCash6: directional.bankroll > 0n ? directional.bankroll : 0n,
+        globalAppMode: engine.cfg.app.mode,
+        directionalLiveArmed: engine.live.isArmed(asOfMs),
+        asOfMs,
+      });
+    },
+    requestedCashCap6: ({ portfolio, policy }) => {
+      const configured = (portfolio.referenceBankroll6 * policy.maximumCashFractionPpm) / 1_000_000n;
+      const absolute = (portfolio.referenceBankroll6 * policy.hardRiskConstant.valuePpm) / 1_000_000n;
+      return [configured, absolute, portfolio.pairCashAvailable6, portfolio.sharedCapAvailable6]
+        .reduce((lowest, value) => value < lowest ? value : lowest);
+    },
     maximumObserverMarkets: 64,
     nowMs: Date.now,
     captureSequence: ({ trigger }) => {
@@ -114,9 +152,10 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       captureQueueOverflowed: () => (captureQueueRef?.metrics().unhealthyMarketCount ?? 0) > 0,
       captureGapUnbounded: () => (captureQueueRef?.metrics().unhealthyMarketCount ?? 0) > 0,
       invalidMarketCount: () => captureQueueRef?.metrics().unhealthyMarketCount ?? 0,
-      // Exact token-term discovery is deliberately not pretended ready.
-      feeTermsHealthy: () => false,
-      constraintTermsHealthy: () => false,
+      feeTermsHealthy: () => pairTermsHealth().feeTermsHealthy,
+      constraintTermsHealthy: () => pairTermsHealth().constraintTermsHealthy,
+      lastFeeSnapshotAtMs: () => pairTermsHealth().lastFeeSnapshotAtMs,
+      lastConstraintSnapshotAtMs: () => pairTermsHealth().lastConstraintSnapshotAtMs,
     },
   });
   logger.info("pair subsystem initialized", {

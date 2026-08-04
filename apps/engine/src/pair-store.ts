@@ -1,6 +1,7 @@
-import { schema, type DbHandle } from "@b5p/db";
+import { schema, type Db, type DbHandle } from "@b5p/db";
 import { canonicalJsonValue, canonicalObjectHash } from "@b5p/pair-execution";
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { MarketExposureGuardStore, type MarketExposureGuardConflictCode } from "./market-exposure-guard-store";
 
 export const ACTIVE_PAIR_GROUP_STATES = [
   "SCHEDULED", "ACTIVATING", "ACTIVATION_REJECTED", "SUBMITTING", "OUTCOME_UNKNOWN",
@@ -64,7 +65,13 @@ export type AppendPairEventResult =
 export type CreatePairGroupResult =
   | { readonly kind: "CREATED"; readonly group: PairOrderGroupRow }
   | { readonly kind: "DUPLICATE"; readonly group: PairOrderGroupRow }
-  | { readonly kind: "ACTIVE_MARKET_CONFLICT"; readonly active: PairOrderGroupRow };
+  | { readonly kind: "ACTIVE_MARKET_CONFLICT"; readonly active: PairOrderGroupRow }
+  | {
+      readonly kind: "MARKET_EXPOSURE_CONFLICT";
+      readonly code: MarketExposureGuardConflictCode;
+      readonly ownerKind: string | null;
+      readonly ownerId: string | null;
+    };
 
 export interface PairInboxEvidenceInput {
   readonly id: string;
@@ -128,22 +135,67 @@ export class PairStore {
     assertIdentity(candidate.id, "group id");
     assertIdentity(candidate.idempotencyKey, "group idempotency key");
     assertIdentity(candidate.requestHash, "group request hash");
-    const inserted = await this.handle.db.insert(schema.pairOrderGroups).values(candidate)
-      .onConflictDoNothing().returning();
-    if (inserted[0] !== undefined) return { kind: "CREATED", group: inserted[0] };
-
-    const sameKey = await this.handle.db.select().from(schema.pairOrderGroups)
-      .where(eq(schema.pairOrderGroups.idempotencyKey, candidate.idempotencyKey)).limit(1);
-    if (sameKey[0] !== undefined) {
-      if (sameKey[0].requestHash !== candidate.requestHash || sameKey[0].id !== candidate.id) {
-        throw new PairStoreIdempotencyCollisionError("group idempotency key is bound to a different immutable request");
+    return this.handle.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as Db;
+      const sameKey = await tx.select().from(schema.pairOrderGroups)
+        .where(eq(schema.pairOrderGroups.idempotencyKey, candidate.idempotencyKey)).limit(1);
+      if (sameKey[0] !== undefined) {
+        if (sameKey[0].requestHash !== candidate.requestHash || sameKey[0].id !== candidate.id) {
+          throw new PairStoreIdempotencyCollisionError("group idempotency key is bound to a different immutable request");
+        }
+        return { kind: "DUPLICATE" as const, group: sameKey[0] };
       }
-      return { kind: "DUPLICATE", group: sameKey[0] };
-    }
 
-    const active = await this.findActiveGroupForMarket(candidate.marketId);
-    if (active !== null) return { kind: "ACTIVE_MARKET_CONFLICT", active };
-    throw new PairStoreError("group insert conflicted with an unknown unique identity");
+      const activeRows = await tx.select().from(schema.pairOrderGroups).where(and(
+        eq(schema.pairOrderGroups.marketId, candidate.marketId),
+        inArray(schema.pairOrderGroups.state, ACTIVE_PAIR_GROUP_STATE_VALUES),
+      )).orderBy(asc(schema.pairOrderGroups.createdAtMs), asc(schema.pairOrderGroups.id)).limit(1);
+      if (activeRows[0] !== undefined) return { kind: "ACTIVE_MARKET_CONFLICT" as const, active: activeRows[0] };
+
+      const guard = new MarketExposureGuardStore(this.handle, tx);
+      const currentGuard = await guard.get(candidate.marketId);
+      if (currentGuard?.releasedAtMs === null && currentGuard.ownerKind === "PAIR_GROUP") {
+        const ownerRows = await tx.select({ state: schema.pairOrderGroups.state }).from(schema.pairOrderGroups)
+          .where(eq(schema.pairOrderGroups.id, currentGuard.ownerId)).limit(1);
+        const terminalState = ownerRows[0]?.state;
+        if (terminalState === "RECONCILED_FLAT" || terminalState === "RECONCILED_SETTLED") {
+          const released = await guard.release({
+            marketId: candidate.marketId,
+            ownerKind: "PAIR_GROUP",
+            ownerId: currentGuard.ownerId,
+            expectedStateVersion: currentGuard.stateVersion,
+            terminalState,
+            releasedAtMs: candidate.createdAtMs,
+          });
+          if (released.kind === "CONFLICT") throw new PairStoreError(`failed to release terminal pair market guard: ${released.code}`);
+        }
+      }
+      const acquired = await guard.acquire({
+        marketId: candidate.marketId,
+        ownerKind: "PAIR_GROUP",
+        ownerId: candidate.id,
+        ownerState: candidate.state,
+        acquiredAtMs: candidate.createdAtMs,
+      });
+      if (acquired.kind === "CONFLICT") {
+        return {
+          kind: "MARKET_EXPOSURE_CONFLICT" as const,
+          code: acquired.code,
+          ownerKind: acquired.guard?.ownerKind ?? null,
+          ownerId: acquired.guard?.ownerId ?? null,
+        };
+      }
+
+      const inserted = await tx.insert(schema.pairOrderGroups).values(candidate)
+        .onConflictDoNothing().returning();
+      if (inserted[0] !== undefined) return { kind: "CREATED" as const, group: inserted[0] };
+      const racedKey = await tx.select().from(schema.pairOrderGroups)
+        .where(eq(schema.pairOrderGroups.idempotencyKey, candidate.idempotencyKey)).limit(1);
+      if (racedKey[0] !== undefined && racedKey[0].requestHash === candidate.requestHash && racedKey[0].id === candidate.id) {
+        return { kind: "DUPLICATE" as const, group: racedKey[0] };
+      }
+      throw new PairStoreError("group insert conflicted with an unknown unique identity");
+    });
   }
 
   async getGroup(groupId: string): Promise<PairOrderGroupRow | null> {
@@ -231,6 +283,21 @@ export class PairStore {
           state: "PENDING", notBeforeMs: effect.notBeforeMs, deadlineMs: effect.deadlineMs,
           attemptCount: 0, createdAtMs: effect.createdAtMs, updatedAtMs: effect.createdAtMs,
         })));
+      }
+      if (input.projection.state === "RECONCILED_FLAT" || input.projection.state === "RECONCILED_SETTLED") {
+        const guard = new MarketExposureGuardStore(this.handle, tx as unknown as Db);
+        const current = await guard.findActiveByOwner("PAIR_GROUP", input.groupId);
+        if (current !== null) {
+          const released = await guard.release({
+            marketId: current.marketId,
+            ownerKind: "PAIR_GROUP",
+            ownerId: input.groupId,
+            expectedStateVersion: current.stateVersion,
+            terminalState: input.projection.state,
+            releasedAtMs: input.event.recordedAtMs,
+          });
+          if (released.kind === "CONFLICT") throw new PairStoreError(`failed to release terminal pair market guard: ${released.code}`);
+        }
       }
       return { kind: "APPLIED" as const, stateVersion: nextVersion, eventSequence: nextSequence };
     });

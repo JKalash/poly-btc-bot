@@ -9,6 +9,7 @@ export {
 } from "./inventory-cycle";
 export { InventoryPersistence, MemoryInventorySink } from "./inventory-persistence";
 export * from "./market-exposure-guard-store";
+export * from "./pair-portfolio-store";
 export { createEngineRuntime, type EngineRuntime } from "./main";
 export {
   requotePairActivation,

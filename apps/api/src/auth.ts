@@ -19,6 +19,7 @@ export interface SessionInfo {
 }
 
 const SESSION_TTL_MS = 12 * 3600 * 1000;
+export const REMEMBERED_SESSION_TTL_SECONDS = 30 * 24 * 3600;
 
 export class AuthService {
   private sessions = new Map<string, SessionInfo>();
@@ -82,7 +83,7 @@ export class AuthService {
     return entry.count > 5;
   }
 
-  async login(username: string, password: string): Promise<{ token: string; csrfToken: string } | null> {
+  async login(username: string, password: string, remember = false): Promise<{ token: string; csrfToken: string } | null> {
     if (username !== this.username) return null;
     if (!(await AuthService.verifyPassword(password, this.passwordHash))) return null;
     const raw = randomBytes(32).toString("hex");
@@ -91,7 +92,7 @@ export class AuthService {
     this.sessions.set(raw, {
       username,
       createdAtMs: Date.now(),
-      expiresAtMs: Date.now() + SESSION_TTL_MS,
+      expiresAtMs: Date.now() + (remember ? REMEMBERED_SESSION_TTL_SECONDS * 1000 : SESSION_TTL_MS),
       csrfToken,
     });
     return { token, csrfToken };

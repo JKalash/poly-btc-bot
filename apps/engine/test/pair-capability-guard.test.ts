@@ -6,9 +6,9 @@
  * never touch the directional live signing/transaction path, and that the
  * pair package's dependency surface stays free of venue/wallet SDKs.
  *
- * NOTE: no `pair-*.ts` file exists in apps/engine/src yet — later waves
- * (pair composition work) populate it. Until then the file scan passes
- * vacuously; the fixture test below proves the scanner itself can fail.
+ * The scan is load-bearing: engine pair observer, persistence, paper venue,
+ * lifecycle, reconciliation, and composition modules all match `pair-*.ts`.
+ * The fixture test below proves the scanner itself can fail.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -82,8 +82,7 @@ function scanPairFile(file: string, content: string): Finding[] {
 describe("engine pair capability guard", () => {
   it("no apps/engine/src/pair-*.ts file touches the directional live path", () => {
     const pairFiles = listPairFiles(ENGINE_SRC);
-    // Vacuously true today (no pair-*.ts exists yet); becomes load-bearing
-    // the moment a later wave adds pair composition files.
+    expect(pairFiles.length).toBeGreaterThan(0);
     const findings = pairFiles.flatMap((file) => scanPairFile(file, readFileSync(file, "utf8")));
     expect(findings).toEqual([]);
   });

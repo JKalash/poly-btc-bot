@@ -61,6 +61,14 @@
    sizing modes exist as paper-only ruin simulations; its "degen" all-in mode is structurally
    unreachable from any armed path (the spec's absolute 10% cap and no-all-in rules are
    non-negotiable).
+10. **Paired execution is a separate, no-live subsystem.** The UP+DOWN observer uses complete,
+    durably persisted CLOB envelopes, exact per-level fixed-point quotes, immutable policy/terms
+    snapshots, and an isolated counterfactual account. Its package exports no wallet, signer,
+    authenticated venue, or live-order capability. The engine may observe public data, but pair
+    paper scheduling remains fail-closed unless startup reconciliation, exact token terms,
+    portfolio accounting, lifecycle/effect adapters, and the shared market-exposure guard are all
+    healthy. The `/api/pairs/*` and `/pairs` surfaces are read-only research views; they cannot arm
+    or mutate execution.
 
 ## Engine state machines
 
