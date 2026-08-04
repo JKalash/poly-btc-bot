@@ -22,7 +22,7 @@ import { backfillResolvedMarkets, runTimingStats } from "@b5p/research";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import { AuthService, REMEMBERED_SESSION_TTL_SECONDS } from "./auth";
+import { AuthService, REMEMBERED_SESSION_TTL_SECONDS, timingSafeStringEqual } from "./auth";
 import { PairReadModelRepository, type PairReadCapability } from "./pair-read-repository";
 import { registerPairReadRoutes, type PairReadRouteRepository } from "./pair-routes";
 
@@ -65,7 +65,7 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     }
     if (req.method !== "GET" && req.method !== "HEAD") {
       const header = req.headers["x-csrf-token"];
-      if (!header || header !== s.csrfToken) {
+      if (typeof header !== "string" || !timingSafeStringEqual(header, s.csrfToken)) {
         await reply.code(403).send({ error: "csrf token missing or invalid" });
         return false;
       }
@@ -1531,9 +1531,9 @@ export async function makeApiBus(): Promise<Bus> {
   return process.env.REDIS_URL ? makeBus() : getLocalBus();
 }
 
-function clampLimit(v: string | undefined, dflt: number): number {
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? Math.min(500, Math.floor(n)) : dflt;
+export function clampLimit(v: string | undefined, dflt: number): number {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n > 0 ? Math.min(500, n) : dflt;
 }
 
 function jsonSafe<T>(v: T): T {

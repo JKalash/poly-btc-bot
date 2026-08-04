@@ -296,7 +296,8 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
     onLastTrade: (msg, ts, meta) => {
       const marketId = marketIdForToken(msg.asset_id, msg.market);
       const sourceTs = msg.timestamp === undefined ? null : tsToMs(msg.timestamp, ts);
-      void engine.onTrade(msg.asset_id, msg.price, msg.size ?? "0", sourceTs ?? 0);
+      engine.onTrade(msg.asset_id, msg.price, msg.size ?? "0", sourceTs ?? 0)
+        .catch((e) => logger.warn("trade ingestion failed; message dropped", { error: String(e), tokenId: msg.asset_id }));
       if (msg.size !== undefined && sourceTs !== null) {
         const envelopeId = `trade:${meta.connectionEpoch}:${ts}:${++clobEnvelopeOrdinal}`;
         enqueueEnvelope([
@@ -394,6 +395,9 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       clob.setAssets(engine.subscriptionTokens(nowSec));
     } catch (e) {
       logger.warn("discovery error", { error: String(e) });
+      // surface in the health log too: a wedged discovery loop idles the
+      // whole engine with nothing visible in the cockpit otherwise
+      void engine.health("warning", "discovery", `market discovery cycle failed: ${String(e)}`);
     } finally {
       discovering = false;
     }
@@ -434,6 +438,13 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
   }, engine.cfg.pair.reconcile_interval_ms);
 
   logger.info("engine runtime started", { mode: engine.mode, db: db.kind, bus: bus.kind });
+  // #27: a standalone engine process with a process-LOCAL bus cannot receive
+  // API control messages (kill/arm/disarm/resume). The DB-polled kill
+  // fallback still works, but everything else is dead — say so loudly.
+  if (!process.env.EMBED_ENGINE && process.env.DATABASE_URL && bus.kind === "local") {
+    void engine.health("critical", "control",
+      "split-process engine without REDIS_URL: bus control messages (arm/disarm/resume/config-reload) CANNOT reach this process; only the kill switch works, via DB polling. Set REDIS_URL.");
+  }
 
   return {
     engine,
@@ -467,4 +478,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+  // Last-resort isolation: an escaped exception/rejection becomes a
+  // controlled HALT (orders canceled, live disarmed, health event) instead of
+  // silent process death that abandons resting orders on the exchange.
+  const fatal = (kind: string) => (err: unknown) => {
+    logger.error(`${kind}; halting engine (fail closed)`, { error: String(err), stack: (err as Error)?.stack });
+    void runtime.engine.halt(`${kind}: ${String(err)}`, Date.now()).catch(() => undefined);
+  };
+  process.on("uncaughtException", fatal("uncaught exception"));
+  process.on("unhandledRejection", fatal("unhandled rejection"));
 }

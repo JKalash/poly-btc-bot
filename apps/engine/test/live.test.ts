@@ -73,6 +73,22 @@ describe("LiveController — disarmed and unconfigured by default", () => {
     expect(lc.consecutiveLosses).toBe(1); // unchanged: not a win, not a loss
   });
 
+  it("reconcile() restores the live loss streak from persisted live pnl_records (#61 live path)", async () => {
+    const { pnlRecords } = await import("@b5p/db");
+    const base = Date.now();
+    await db.db.insert(pnlRecords).values([
+      // oldest -> newest: win, then two losses (current streak = 2)
+      { id: "p1", mode: "live", marketId: "m1", gross6: 10n, fees6: 0n, rebates6: 0n, net6: 10n, createdAtMs: base - 3000 },
+      { id: "p2", mode: "live", marketId: "m2", gross6: -5n, fees6: 0n, rebates6: 0n, net6: -5n, createdAtMs: base - 2000 },
+      { id: "p3", mode: "live", marketId: "m3", gross6: -5n, fees6: 0n, rebates6: 0n, net6: -5n, createdAtMs: base - 1000 },
+      // paper records must not contaminate the live streak
+      { id: "p4", mode: "paper", marketId: "m4", gross6: -5n, fees6: 0n, rebates6: 0n, net6: -5n, createdAtMs: base - 500 },
+    ]);
+    const lc = new LiveController(db);
+    await lc.reconcile();
+    expect(lc.consecutiveLosses).toBe(2); // restart cannot silently re-arm the stop
+  });
+
   it("settle() with no recorded fill returns null and leaves the loss counter alone", async () => {
     const lc = new LiveController(db);
     lc.markOpen("m-nofill");

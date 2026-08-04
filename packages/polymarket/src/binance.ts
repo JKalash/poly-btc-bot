@@ -21,9 +21,10 @@ export async function fetchKlines1s(opts: {
   limit?: number;
   fetchImpl?: typeof fetch;
   base?: string;
+  timeoutMs?: number;
 }): Promise<Candle[]> {
-  const { symbol = "BTCUSDT", limit = 600, fetchImpl = fetch, base = BINANCE_BASE } = opts;
-  const res = await fetchImpl(`${base}/api/v3/klines?symbol=${symbol}&interval=1s&limit=${limit}`);
+  const { symbol = "BTCUSDT", limit = 600, fetchImpl = fetch, base = BINANCE_BASE, timeoutMs = 4000 } = opts;
+  const res = await fetchImpl(`${base}/api/v3/klines?symbol=${symbol}&interval=1s&limit=${limit}`, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`binance klines HTTP ${res.status}`);
   const rows = z.array(KlineRow).parse(await res.json());
   return rows.map((r) => ({
@@ -56,18 +57,26 @@ export class BinanceKlinesPoller {
   private consecutiveErrors = 0;
   private lastErrorLogMs = 0;
 
+  private inFlight = false;
+
   start(): void {
     const interval = this.opts.pollIntervalMs ?? 5000;
     const tick = async () => {
+      // No overlap: a slow poll must never race a fast later poll and clobber
+      // fresh candles with stale ones stamped as new. The fetch timeout stays
+      // under the poll interval, so the guard cannot wedge the poller.
+      if (this.inFlight) return;
       // geo-blocked or persistently failing endpoints (e.g. HTTP 451 from US
       // hosts) back off to one attempt per 10 minutes and one warning per hour;
       // the engine falls back to Chainlink-synthesized candles meanwhile.
       if (this.consecutiveErrors >= 3 && Date.now() - this.lastFailMs < 600_000) return;
+      this.inFlight = true;
       try {
         const kl = await fetchKlines1s({
           ...(this.opts.symbol !== undefined ? { symbol: this.opts.symbol } : {}),
           ...(this.opts.limit !== undefined ? { limit: this.opts.limit } : {}),
           ...(this.opts.fetchImpl !== undefined ? { fetchImpl: this.opts.fetchImpl } : {}),
+          timeoutMs: Math.max(1000, interval - 1000),
         });
         this.candles = kl;
         this.lastFetchTsMs = Date.now();
@@ -82,6 +91,8 @@ export class BinanceKlinesPoller {
           this.lastErrorLogMs = Date.now();
           this.opts.onError?.(this.lastError);
         }
+      } finally {
+        this.inFlight = false;
       }
     };
     void tick();

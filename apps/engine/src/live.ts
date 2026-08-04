@@ -4,7 +4,7 @@ import {
   mulDiv, usdc, type BankrollState, type OutcomeSide, type Prob6, type Shares6, type Usdc6,
 } from "@b5p/domain";
 import { LiveClobAdapter, type LivePreflight, type OrderRequest } from "@b5p/polymarket";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { logger } from "./log";
 import { DirectionalExposureCoordinator } from "./directional-exposure-guard";
 
@@ -97,6 +97,27 @@ export class LiveController {
 
   get configured(): boolean { return this.adapter !== null; }
 
+  /**
+   * Restore the live consecutive-loss streak from persisted live pnl_records
+   * (newest first: count net6 < 0 rows until a win; scratch trades neither
+   * break nor extend the streak — matching settle()'s semantics). Without
+   * this, every restart-then-re-arm silently wiped a tripped loss stop on the
+   * real-money path while the paper path kept its restored counter.
+   */
+  async reconcile(): Promise<void> {
+    const rows = await this.db.db.select({ net6: pnlRecords.net6, createdAtMs: pnlRecords.createdAtMs })
+      .from(pnlRecords).where(eq(pnlRecords.mode, "live"))
+      .orderBy(desc(pnlRecords.createdAtMs)).limit(50);
+    let streak = 0;
+    for (const r of rows) {
+      if (r.net6 < 0n) streak += 1;
+      else if (r.net6 > 0n) break;
+      // net6 === 0n: scratch — skip, keep counting
+    }
+    this.consecutiveLosses = streak;
+    if (streak > 0) logger.warn("live consecutive-loss streak restored from persisted records", { streak });
+  }
+
   isArmed(nowMs: number): boolean {
     if (this.state === "ARMED" && nowMs >= this.expiresAtMs) {
       this.disarm("arming token expired");
@@ -120,7 +141,9 @@ export class LiveController {
     this.liveBankroll6 = pf.usdcBalance;
     this.sessionPeak6 = pf.usdcBalance;
     this.dailyPeak6 = pf.usdcBalance;
-    this.consecutiveLosses = 0;
+    // NOTE: consecutiveLosses is deliberately NOT reset here — arming must not
+    // re-arm a tripped loss stop. The counter is restored from persisted live
+    // pnl_records at boot (reconcile()) and cleared only by operator resume.
     this.state = "ARMED";
     this.disarmReason = null;
     const ttl = Math.min(Math.max(req.ttlMinutes, 1), 120);
@@ -144,10 +167,31 @@ export class LiveController {
     this.expiresAtMs = 0;
   }
 
+  /** #60: engine drains this each step; a set value triggers a full halt. */
+  private pendingHaltReason: string | null = null;
+  takePendingHalt(): string | null {
+    const r = this.pendingHaltReason;
+    this.pendingHaltReason = null;
+    return r;
+  }
+
   async refreshBankroll(): Promise<void> {
     if (!this.adapter || this.state !== "ARMED") return;
     try {
-      this.liveBankroll6 = await this.adapter.usdcBalance();
+      const expected = this.liveBankroll6;
+      const actual = await this.adapter.usdcBalance();
+      // #60: wallet balance mismatch beyond tolerance is a spec'd halt
+      // condition — money moved that this engine did not account for
+      // (external transfer, another client trading, or accounting drift).
+      // Tolerance: 2% of expected, floor 5 USDC, to absorb fee rounding.
+      const tolerance6 = expected / 50n > 5_000_000n ? expected / 50n : 5_000_000n;
+      const diff = actual > expected ? actual - expected : expected - actual;
+      if (expected > 0n && diff > tolerance6) {
+        this.pendingHaltReason = `wallet balance mismatch: expected ~${expected} got ${actual} (diff ${diff} > tolerance ${tolerance6})`;
+        this.disarm("wallet balance mismatch");
+        return;
+      }
+      this.liveBankroll6 = actual;
       if (this.liveBankroll6 > this.sessionPeak6) this.sessionPeak6 = this.liveBankroll6;
       if (this.liveBankroll6 > this.dailyPeak6) this.dailyPeak6 = this.liveBankroll6;
     } catch (e) {

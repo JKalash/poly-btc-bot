@@ -11,7 +11,12 @@ import { ReconnectingWs, type WsStatus } from "./ws-base";
  * Some payloads carry event_type, some are recognized by shape; parse both ways.
  */
 
-const Level = z.object({ price: z.string(), size: z.string() });
+// Plain non-negative decimal strings only: rejects scientific notation,
+// leading-dot, empty and negative values AT THE BOUNDARY (safeParse drops the
+// message) instead of letting them throw deep inside book/engine mutation.
+const decimalString = z.string().regex(/^\d+(\.\d+)?$/);
+
+const Level = z.object({ price: decimalString, size: decimalString });
 
 const BookMsg = z.object({
   event_type: z.literal("book").optional(),
@@ -29,8 +34,8 @@ const PriceChangeMsg = z.object({
   timestamp: z.union([z.string(), z.number()]).optional(),
   price_changes: z.array(z.object({
     asset_id: z.string(),
-    price: z.string(),
-    size: z.string(),
+    price: decimalString,
+    size: decimalString,
     side: z.enum(["BUY", "SELL"]),
     hash: z.string().optional(),
     best_bid: z.string().optional(),
@@ -42,9 +47,9 @@ const LastTradeMsg = z.object({
   event_type: z.literal("last_trade_price"),
   market: z.string(),
   asset_id: z.string(),
-  price: z.string(),
+  price: decimalString,
   side: z.enum(["BUY", "SELL"]).optional(),
-  size: z.string().optional(),
+  size: decimalString.optional(),
   timestamp: z.union([z.string(), z.number()]).optional(),
 });
 
@@ -115,12 +120,20 @@ export class ClobMarketWs {
   /** Epoch of the current connection; null until the first successful open. */
   get connectionEpoch(): string | null { return this.ws.connectionEpoch; }
 
-  /** Replace the subscription set (reconnect-based; the WS also supports incremental ops). */
+  /**
+   * Replace the subscription set. Genuinely reconnect-based: the documented
+   * market-channel contract consumes the subscription at connection start, and
+   * whether a repeated full-list payload takes effect mid-connection is
+   * server-version-dependent — this bot gets a NEW token pair every 5 minutes,
+   * so betting the entire book feed on unverified repeat-subscribe semantics
+   * would risk zero book data for every post-connect window. Reconnecting also
+   * sheds expired assets instead of accumulating them for hours.
+   */
   setAssets(assetIds: string[]): void {
     const same = assetIds.length === this.assetIds.length && assetIds.every((a, i) => this.assetIds[i] === a);
     this.assetIds = [...assetIds];
     if (!same) {
-      this.ws.send(JSON.stringify({ assets_ids: this.assetIds, type: "market" }));
+      this.ws.restart("subscription set changed");
     }
   }
 

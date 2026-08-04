@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card, Empty, Meter, Th, Td } from "../../components/ui";
 import { api } from "../../lib/api";
 import { fmtTs, useApi } from "../../lib/hooks";
@@ -21,6 +21,7 @@ const pFmt = (p: number | null): string => (p === null ? "—" : p < 0.0001 ? p.
 export default function TimingLabPage() {
   const { data, reload } = useApi<Payload>("/api/timing-lab", 0);
   const status = useApi<RefreshStatus>("/api/timing-lab/refresh/status", 3000);
+  const refreshInFlight = useRef(false);
   const [windowDays, setWindowDays] = useState(30);
   const [hours, setHours] = useState(24);
   const [starting, setStarting] = useState(false);
@@ -33,10 +34,24 @@ export default function TimingLabPage() {
   const meta = rows.find((r) => r.meta?.globalChi2)?.meta ?? null;
   const windows = [...new Set((data?.rows ?? []).map((r) => r.windowDays))].sort((a, b) => a - b);
 
+  useEffect(() => {
+    if (status.data?.running) {
+      refreshInFlight.current = true;
+      return;
+    }
+    if (status.data?.running === false && refreshInFlight.current) {
+      refreshInFlight.current = false;
+      reload();
+    }
+  }, [status.data, reload]);
+
   const refresh = async () => {
     setStarting(true);
     try {
       await api("/api/timing-lab/refresh", { method: "POST", body: JSON.stringify({ hours }) });
+      // Treat an accepted refresh as in flight even if it finishes before the
+      // first status poll observes `running: true`.
+      refreshInFlight.current = true;
       status.reload();
     } finally {
       setStarting(false);

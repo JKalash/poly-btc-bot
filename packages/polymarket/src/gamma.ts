@@ -93,10 +93,17 @@ export class GammaClient {
   constructor(
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly base: string = GAMMA_BASE,
+    /** Per-request deadline. These are small JSON responses; a black-holed
+     * request must fail fast — the discovery loop is serialized behind a
+     * guard, so one unbounded fetch stalls ALL market discovery. */
+    private readonly timeoutMs: number = 5000,
   ) {}
 
   private async getJson(path: string): Promise<unknown> {
-    const res = await this.fetchImpl(`${this.base}${path}`, { headers: { accept: "application/json" } });
+    const res = await this.fetchImpl(`${this.base}${path}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
     if (!res.ok) throw new Error(`gamma ${path} -> HTTP ${res.status}`);
     return res.json();
   }

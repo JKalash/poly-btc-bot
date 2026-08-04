@@ -35,7 +35,7 @@ import {
   type Candle, type CandleSource, type EnvelopeApplyOutcome, type ExtendedMoveFadePriorRun,
   type FeatureSet, type PresetContext, type StrategyDecision,
 } from "@b5p/strategy";
-import { eq, gte } from "drizzle-orm";
+import { desc, eq, gt, gte } from "drizzle-orm";
 import { Accounting } from "./accounting";
 import { CHANNELS, type Bus } from "./bus";
 import { LiveController, minArmUsdc, type ArmRequest } from "./live";
@@ -113,6 +113,15 @@ export class Engine {
   private lastFeaturePersistMs = 0;
   private lastLiveRefreshMs = 0;
   private lastLivePollMs = 0;
+  /** Operator cooling-off deadline; set when the consecutive-loss stop trips, cleared only by operator resume. */
+  private coolingOffUntilMs: number | null = null;
+  /** #27: DB-backed kill-switch fallback state (covers dead/absent control bus). */
+  private lastKillEventMs = 0;
+  private lastKillPollMs = 0;
+  /** #60: consecutive live submission rejections; N in a row is a halt condition. */
+  private liveRejectStreak = 0;
+  /** #77: per-market serialized market.status write chains (ordered, error-tolerant). */
+  private statusWriteChains = new Map<string, Promise<void>>();
   private stopped = false;
   private unsubscribeControl: (() => void) | null = null;
   /** Latest CLOB epoch, so books first seen after a reset inherit its barrier. */
@@ -195,6 +204,12 @@ export class Engine {
       onActivated: (o, nowMs) => this.onPaperActivated(o, nowMs),
       onQueueChanged: (o, consumed6, tsMs) => this.onPaperQueueChanged(o, consumed6, tsMs),
       onFinished: (o, status, reason, nowMs) => this.onPaperFinished(o, status, reason, nowMs),
+      // #60: a risk-limit breach detected at fill time halts the engine —
+      // the sizing/approval invariant failed upstream of the simulator.
+      onInvariantBreach: (o, detail, nowMs) => {
+        void this.halt(`risk invariant breached at fill time (order ${o.id}): ${detail}`, nowMs)
+          .catch((e) => logger.error("halt on invariant breach failed", { error: String(e) }));
+      },
     };
 
     // R10 paired-cycle simulation: buffered persistence + separate accrual
@@ -278,7 +293,13 @@ export class Engine {
     const orphans = await this.paper.reconcileOrphans(nowMs);
     if (orphans > 0) await this.health("warning", "reconcile", `${orphans} orphaned resting order(s) canceled on restart`);
     await this.accounting.reconcile(this.cfg, nowMs);
+    // Live loss-stop durability: rebuild the live streak from persisted live
+    // pnl_records, then re-evaluate cooling-off so a stop tripped before the
+    // restart is visible (COOLING_OFF_ACTIVE + audit) immediately, not only
+    // after the next resolution happens to run.
+    await this.live.reconcile();
     await this.live.reconcileExposureGuards(nowMs);
+    await this.maybeTripCoolingOff(nowMs);
     // Reload recent idempotency keys so the duplicate-order gate survives the
     // restart scenarios it exists for (keys are content-derived and also
     // unique-constrained on order_intents as a fail-closed backstop).
@@ -289,8 +310,25 @@ export class Engine {
     this.transitionEngine(target, "startup complete");
     await this.audit("engine", "start", { mode: this.mode, engineVersion: ENGINE_VERSION });
     this.unsubscribeControl = this.bus.subscribe(CHANNELS.control, (payload) => {
-      if (!this.stopped) void this.onControl(payload, Date.now());
+      if (this.stopped) return;
+      this.onControl(payload, Date.now()).catch(async (e) => {
+        // A control-handler failure must never be a silent no-op or a process
+        // death. For a kill specifically, force the safety latch even when the
+        // handler failed partway: disarm + HALTED are pure in-memory actions.
+        logger.error("control message handling failed", { error: String(e), type: (payload as { type?: string })?.type });
+        if ((payload as { type?: string })?.type === "kill") {
+          this.live.disarm("kill switch (handler failure fallback)");
+          this.haltReason = "kill switch (handler failure fallback)";
+          this.transitionEngine("HALTED", "kill switch (handler failure fallback)");
+        }
+        await this.health("critical", "control", `control handler error: ${String(e)}`).catch(() => undefined);
+      });
     });
+    // #27: DB-backed kill fallback baseline — only kill events AFTER this
+    // moment trigger the fallback (historical rows were already handled).
+    const lastKill = (await this.db.db.select().from(killSwitchEvents)
+      .orderBy(desc(killSwitchEvents.createdAtMs)).limit(1))[0];
+    this.lastKillEventMs = lastKill?.createdAtMs ?? 0;
   }
 
   async loadConfig(): Promise<void> {
@@ -348,11 +386,19 @@ export class Engine {
     const msg = payload as { type?: string; reason?: string; actor?: string; acknowledgement?: string; ttlMinutes?: number; replyChannel?: string };
     switch (msg.type) {
       case "kill": {
-        await this.db.db.insert(killSwitchEvents).values({
-          id: newId(), scope: "engine", reason: msg.reason ?? "operator", actor: msg.actor ?? "operator", createdAtMs: nowMs,
-        });
+        // SAFETY BEFORE BOOKKEEPING: disarm and halt first — the audit row is
+        // best-effort. A DB outage is exactly when operators reach for the
+        // emergency stop; it must never abort the kill.
         this.live.disarm(`kill switch: ${msg.reason ?? "operator"}`);
         await this.halt(`kill switch: ${msg.reason ?? "operator"}`, nowMs);
+        this.lastKillEventMs = Math.max(this.lastKillEventMs, nowMs); // don't re-trigger on our own audit row
+        try {
+          await this.db.db.insert(killSwitchEvents).values({
+            id: newId(), scope: "engine", reason: msg.reason ?? "operator", actor: msg.actor ?? "operator", createdAtMs: nowMs,
+          });
+        } catch (e) {
+          logger.error("kill-switch audit row failed (kill itself already executed)", { error: String(e) });
+        }
         break;
       }
       case "arm": {
@@ -376,9 +422,25 @@ export class Engine {
         break;
       }
       case "resume": {
+        // Operator resume IS the manual re-arm the spec demands: it clears the
+        // cooling-off timer and the consecutive-loss stop. Nothing else does —
+        // the stops are restored across restarts and never self-reset.
+        const hadCoolingOff = this.coolingOffUntilMs !== null;
+        const hadLossStop = this.accounting.consecutiveLosses > 0 || this.live.consecutiveLosses > 0;
+        this.coolingOffUntilMs = null;
+        await this.accounting.resetLossStop();
+        this.live.consecutiveLosses = 0;
+        if (hadCoolingOff || hadLossStop) {
+          await this.audit("risk", "loss_stop_rearmed", { actor: msg.actor ?? "operator", hadCoolingOff, hadLossStop });
+        }
         if (this.engineState === "HALTED") {
           this.haltReason = null;
           this.transitionEngine("RECONCILING", "operator resume");
+          // RECONCILING must actually reconcile (spec's on-halt recovery):
+          // rebuild the live loss streak from persisted records and re-read
+          // the wallet balance before any trading state is re-entered.
+          await this.live.reconcile().catch((e) => logger.warn("resume reconcile: live streak restore failed", { error: String(e) }));
+          if (this.live.configured) await this.live.refreshBankroll().catch(() => undefined);
           const target: EngineState = this.mode === "observe" ? "READ_ONLY" : this.mode === "paper" ? "PAPER" : "SHADOW";
           this.transitionEngine(target, "operator resume");
           await this.audit("engine", "resume", { actor: msg.actor ?? "operator" });
@@ -393,12 +455,44 @@ export class Engine {
     }
   }
 
+  /**
+   * #27: DB-backed kill-switch fallback. The API writes a kill_switch_events
+   * row on every emergency stop; polling it makes the kill work even when the
+   * control bus cannot cross process boundaries (split-process without
+   * REDIS_URL) or Redis is down. Bus delivery remains the fast path.
+   */
+  private async pollKillSwitch(nowMs: number): Promise<void> {
+    if (nowMs - this.lastKillPollMs < 2000) return;
+    this.lastKillPollMs = nowMs;
+    try {
+      const rows = await this.db.db.select().from(killSwitchEvents)
+        .where(gt(killSwitchEvents.createdAtMs, this.lastKillEventMs));
+      if (rows.length === 0) return;
+      this.lastKillEventMs = Math.max(...rows.map((r) => r.createdAtMs));
+      if (this.engineState !== "HALTED") {
+        const latest = rows.sort((a, b) => b.createdAtMs - a.createdAtMs)[0]!;
+        this.live.disarm(`kill switch (db fallback): ${latest.reason}`);
+        await this.halt(`kill switch (db fallback): ${latest.reason} [actor: ${latest.actor}]`, nowMs);
+      }
+    } catch {
+      // DB unavailable: the bus path is still subscribed; nothing to do here
+    }
+  }
+
   async halt(reason: string, nowMs: number): Promise<void> {
     if (this.engineState === "HALTED") return;
     this.haltReason = reason;
     this.live.disarm(`halt: ${reason}`); // any halt condition disarms live immediately
     this.transitionEngine("HALTED", reason);
-    if (this.live.configured) await this.live.cancelAll().catch(() => 0);
+    if (this.live.configured) {
+      // Spec: "do not assume cancellation succeeded". A failed or unconfirmed
+      // live cancel-all is surfaced as its own critical event so the operator
+      // verifies on the exchange instead of trusting the halt banner.
+      const ok = await this.live.cancelAll().then((n) => n > 0).catch(() => false);
+      if (!ok) {
+        await this.health("critical", "halt", "live cancel-all FAILED or unconfirmed during halt — resting exchange orders may remain; verify on Polymarket directly").catch(() => undefined);
+      }
+    }
     const canceled = await this.paper.cancelAll(`halt: ${reason}`, nowMs);
     await this.health("critical", "halt", reason, { canceledOrders: canceled });
     await this.audit("engine", "halt", { reason });
@@ -535,6 +629,19 @@ export class Engine {
     for (const p of parsed) {
       const existing = this.markets.get(p.marketId);
       if (existing) {
+        // #60: fee schedule changed while live-armed is a spec'd halt
+        // condition — approvals were priced under the old schedule.
+        if (p.feeSchedule && existing.fee && p.feeSchedule.feeType === existing.fee.feeType) {
+          const newRate = ppm(p.feeSchedule.rate.toFixed(6));
+          if (newRate !== existing.fee.ratePpm) {
+            if (this.live.state === "ARMED") {
+              await this.halt(`fee schedule changed for ${p.slug} while armed (${existing.fee.ratePpm} -> ${newRate} ppm)`, nowMs);
+            } else {
+              existing.fee = { ...existing.fee, ratePpm: newRate, rebateRatePpm: ppm(p.feeSchedule.rebateRate.toFixed(6)) };
+              await this.health("warning", "fees", `fee schedule changed for ${p.slug}; updated (${newRate} ppm)`);
+            }
+          }
+        }
         // refresh official outcome for cross-checking
         if (p.closed && p.outcomePrices) {
           const [upP, downP] = p.outcomePrices;
@@ -544,6 +651,16 @@ export class Engine {
         continue;
       }
       if (!p.upTokenId || !p.downTokenId) continue; // not yet activated
+      // #60: duplicate market identity (one token claimed by two market ids)
+      // poisons book routing and accounting attribution — spec'd halt.
+      for (const other of this.markets.values()) {
+        const clash = other.ref.upTokenId === p.upTokenId || other.ref.downTokenId === p.downTokenId
+          || other.ref.upTokenId === p.downTokenId || other.ref.downTokenId === p.upTokenId;
+        if (clash) {
+          await this.halt(`duplicate market identity: token collision between ${other.ref.slug} (${other.ref.marketId}) and ${p.slug} (${p.marketId})`, nowMs);
+          return;
+        }
+      }
       const rulesHash = sha256Hex(`${p.description}|${p.resolutionSource}`);
       const rulesVerified = this.cfg.market.rules_must_name_chainlink ? p.rulesNameChainlink : true;
       const rt: MarketRuntime = {
@@ -630,6 +747,9 @@ export class Engine {
 
   async step(nowMs: number): Promise<void> {
     if (this.stopped) return;
+    await this.pollKillSwitch(nowMs);
+    const pendingHalt = this.live.takePendingHalt();
+    if (pendingHalt) await this.halt(pendingHalt, nowMs);
     this.accounting.rollDay(nowMs);
     await this.persistTicksBatch(nowMs);
     await this.captureBoundaries(nowMs);
@@ -736,6 +856,7 @@ export class Engine {
         this.books.delete(rt.ref.downTokenId);
         this.paper.pruneMarket(id);
         this.markets.delete(id);
+        this.statusWriteChains.delete(id);
       }
     }
     for (const [key, createdAtMs] of this.usedIdempotencyKeys) {
@@ -826,6 +947,15 @@ export class Engine {
     } else if (this.engineState === "DEGRADED" && clAge !== null && clAge < this.cfg.feeds.chainlink.max_age_ms) {
       const target: EngineState = this.mode === "observe" ? "READ_ONLY" : this.mode === "paper" ? "PAPER" : "SHADOW";
       this.transitionEngine(target, "feeds recovered");
+    }
+    // #60: sustained clock drift is a spec'd HALT condition, not just a
+    // per-decision rejection — a drifted clock corrupts boundary capture and
+    // GTD expirations, so trading through it is fail-open. 4× the decision
+    // tolerance leaves room for transient latency contamination in the
+    // estimate; the per-decision gate keeps rejecting well before this.
+    const skew = this.clockSkewMs();
+    if (this.mode !== "observe" && skew !== null && Math.abs(skew) > (this.cfg.feeds.clock.max_drift_ms + 150) * 4) {
+      await this.halt(`clock drift ${skew}ms exceeds 4x tolerance`, nowMs);
     }
   }
 
@@ -1009,7 +1139,7 @@ export class Engine {
       // override cannot bypass this (it is not a governance gate).
       calibrationRequired: this.cfg.strategy.calibration_required,
       modelCalibrated: model.calibrated,
-      coolingOffUntilMs: null,
+      coolingOffUntilMs: this.coolingOffUntilMs,
       nowMs,
       idempotencyKeyIsDuplicate: this.usedIdempotencyKeys.has(idemKey),
       requestedStakeFractionPpm: null,
@@ -1244,6 +1374,7 @@ export class Engine {
           this.execTimeline.transition(intentId, "RESTING", { utcMs: Date.now() });
         }
         this.transitionMarket(rt, res.status === "MATCHED" ? "FILLED" : "RESTING");
+        this.liveRejectStreak = 0;
         await this.audit("order", "live_submitted", { decisionId, orderId: res.orderId, side, price: price6, shares: shares6, stake: stake6, status: res.status });
         this.emitEvent({ type: "live_order", orderId: res.orderId, marketId: rt.ref.marketId, decisionId, status: res.status });
       } else {
@@ -1252,6 +1383,13 @@ export class Engine {
         this.transitionMarket(rt, "OBSERVING");
         await this.audit("order", "live_rejected", { decisionId, reason: res.reason });
         this.emitEvent({ type: "live_rejected", decisionId, marketId: rt.ref.marketId, reason: res.reason });
+        // #60: repeated submission failure is a spec'd halt condition — the
+        // decide loop would otherwise retry a permanently failing submit
+        // every cooldown forever, logged but never stopped.
+        this.liveRejectStreak += 1;
+        if (this.liveRejectStreak >= 5) {
+          await this.halt(`repeated live submission failures (${this.liveRejectStreak} consecutive; last: ${res.reason ?? "unknown"})`, nowMs);
+        }
       }
       guard.endMutation(attemptId);
       return;
@@ -1430,11 +1568,17 @@ export class Engine {
       if (nowMs < dueMs) continue;
 
       const finalTick = this.chainlink.atOrBefore(rt.ref.endEpoch * 1000);
+      // Same freshness rule as boundary capture: a "final" tick older than the
+      // gap tolerance must not resolve the market — a feed that died minutes
+      // before close would otherwise book a wrong outcome and later halt the
+      // engine on its own self-inflicted official-outcome mismatch.
+      const finalTickFresh = finalTick !== null
+        && rt.ref.endEpoch * 1000 - finalTick.sourceTsMs <= this.cfg.feeds.chainlink.max_gap_ms;
       let outcome: OutcomeSide | null = null;
       let source = "rtds_chainlink_boundary";
       let finalText: string | null = null;
 
-      if (finalTick && rt.priceToBeat) {
+      if (finalTick && finalTickFresh && rt.priceToBeat) {
         finalText = finalTick.fullAccuracyValue ?? String(finalTick.value);
         outcome = compareDecimal(finalText, rt.priceToBeat.text) >= 0 ? "UP" : "DOWN";
       } else if (rt.officialOutcome) {
@@ -1445,7 +1589,8 @@ export class Engine {
       if (outcome === null) {
         if (nowMs - dueMs > 60_000 && !rt.resolveWarned) {
           rt.resolveWarned = true; // warn once per market, not every step
-          await this.health("warning", "resolution", `cannot resolve ${rt.ref.slug} locally (missing boundary data); awaiting official outcome`);
+          const why = finalTick && !finalTickFresh ? "final Chainlink tick stale" : "missing boundary data";
+          await this.health("warning", "resolution", `cannot resolve ${rt.ref.slug} locally (${why}); awaiting official outcome`);
         }
         continue;
       }
@@ -1464,7 +1609,10 @@ export class Engine {
         source,
         resolvedAtMs: nowMs,
       }).onConflictDoNothing();
-      await this.db.db.update(marketsTable).set({ status: "RESOLVED", outcome, updatedAtMs: nowMs }).where(eq(marketsTable.id, rt.ref.marketId));
+      // joins the per-market chain so it cannot be overtaken by a stale
+      // in-flight status write regressing the resolved row
+      this.enqueueMarketWrite(rt.ref.marketId, () =>
+        this.db.db.update(marketsTable).set({ status: "RESOLVED", outcome, updatedAtMs: nowMs }).where(eq(marketsTable.id, rt.ref.marketId)).then(() => undefined));
       const pnl = await this.accounting.onResolution(rt.ref.marketId, outcome, nowMs);
       // Live settlement from RECORDED fills only: settle() computes win/loss
       // from the position ledger and returns null when no fill was recorded —
@@ -1512,7 +1660,28 @@ export class Engine {
       // fill_selection_cost = signal-conditioned value − fill-conditioned value,
       // computed per resolution batch (drained at end of step).
       this.paperVariants.flushSelectionCost(nowMs);
+      await this.maybeTripCoolingOff(nowMs);
     }
+  }
+
+  /**
+   * Start the operator cooling-off window when the consecutive-loss stop
+   * trips (paper or live counter). Cleared ONLY by an explicit operator
+   * resume — the spec's behavioral-risk mitigation against win-it-back
+   * re-entry after a loss streak. Disabled with risk.cooling_off_minutes: 0.
+   */
+  private async maybeTripCoolingOff(nowMs: number): Promise<void> {
+    if (this.coolingOffUntilMs !== null || this.cfg.risk.cooling_off_minutes <= 0) return;
+    const profileName = this.cfg.risk.profile;
+    const limits = profileName === "custom"
+      ? clampCustomProfile(customLimitsFromConfig(this.cfg)).limits
+      : RISK_PROFILES[profileName];
+    const losses = Math.max(this.accounting.consecutiveLosses, this.live.consecutiveLosses);
+    if (losses < limits.consecutiveLossLimit) return;
+    this.coolingOffUntilMs = nowMs + this.cfg.risk.cooling_off_minutes * 60_000;
+    await this.health("warning", "risk",
+      `consecutive-loss stop tripped (${losses} losses); cooling-off active until ${new Date(this.coolingOffUntilMs).toISOString()} — operator resume required to re-arm`);
+    await this.audit("risk", "cooling_off_started", { losses, untilMs: this.coolingOffUntilMs });
   }
 
   private async crossCheckResolution(rt: MarketRuntime, nowMs: number): Promise<void> {
@@ -1678,7 +1847,23 @@ export class Engine {
       return;
     }
     rt.state = to;
-    void this.db.db.update(marketsTable).set({ status: to, updatedAtMs: Date.now() }).where(eq(marketsTable.id, rt.ref.marketId));
+    this.enqueueMarketWrite(rt.ref.marketId, () =>
+      this.db.db.update(marketsTable).set({ status: to, updatedAtMs: Date.now() }).where(eq(marketsTable.id, rt.ref.marketId)).then(() => undefined));
+  }
+
+  /**
+   * #77: market-row writes are serialized per market on a promise chain.
+   * Fire-and-forget writes on a pooled pg connection have no commit-ordering
+   * guarantee, so back-to-back transitions could persist out of order (even
+   * regressing a RESOLVED row); and a rejected write with no .catch() was a
+   * fatal unhandled rejection. In-memory state stays synchronous.
+   */
+  private enqueueMarketWrite(marketId: string, write: () => Promise<void>): void {
+    const prev = this.statusWriteChains.get(marketId) ?? Promise.resolve();
+    const next = prev.then(write).catch((e) => {
+      logger.warn("market row persist failed", { marketId, error: String(e) });
+    });
+    this.statusWriteChains.set(marketId, next);
   }
 
   async health(severity: "info" | "warning" | "critical", kind: string, message: string, data?: Record<string, unknown>): Promise<void> {
