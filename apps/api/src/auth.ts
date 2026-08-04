@@ -3,6 +3,13 @@ import { createHmac, randomBytes, scrypt as scryptCb, timingSafeEqual } from "no
 const scrypt = (password: string, salt: Buffer, keylen: number, opts: { N: number; r: number; p: number }): Promise<Buffer> =>
   new Promise((resolve, reject) => scryptCb(password, salt, keylen, opts, (err, buf) => (err ? reject(err) : resolve(buf))));
 
+/** Compare secret strings without leaking their first differing byte. */
+export function timingSafeStringEqual(actual: string, expected: string): boolean {
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
+}
+
 /**
  * Single-operator auth. scrypt password hashing, HMAC-signed opaque session
  * tokens (in-memory store — sessions end on API restart, acceptable for a
@@ -100,7 +107,7 @@ export class AuthService {
   validate(token: string | undefined): SessionInfo | null {
     if (!token) return null;
     const [raw, sig] = token.split(".");
-    if (!raw || !sig || this.sign(raw) !== sig) return null;
+    if (!raw || !sig || !timingSafeStringEqual(sig, this.sign(raw))) return null;
     const s = this.sessions.get(raw);
     if (!s) return null;
     if (Date.now() > s.expiresAtMs) {
