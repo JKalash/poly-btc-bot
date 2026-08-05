@@ -217,6 +217,17 @@ describe("BPAIR-061 pair account persistence", () => {
       startingCash6: 10_000n, dailyBucketUtc: "2027-01-15", createdAtMs: now,
     })).rejects.toBeInstanceOf(PairAccountIdempotencyCollisionError);
 
+    // Regression: the engine derives dailyBucketUtc from the current clock on
+    // every boot, so the first restart after 00:00 UTC presents a later day for
+    // the same session key. That must reuse the account, not crash startup.
+    const nextDay = await store.createAccount({
+      id: ACCOUNT, sessionKey: "runtime-pair-session", sourceConfigVersion: 7,
+      startingCash6: 10_000n, dailyBucketUtc: "2027-01-16", createdAtMs: now,
+    });
+    expect(nextDay.kind).toBe("DUPLICATE");
+    expect(nextDay.account.dailyBucketUtc).toBe("2027-01-15");
+    expect(await handle.db.select().from(schema.pairLedgerEntries)).toHaveLength(2);
+
     await seedEvent(GROUP_A, "reserve-event", 1);
     expect((await store.appendReservation({
       accountId: ACCOUNT, groupId: GROUP_A, eventId: "reserve-event", journalId: "reserve-journal",

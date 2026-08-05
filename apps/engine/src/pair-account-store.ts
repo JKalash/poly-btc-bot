@@ -245,10 +245,23 @@ function validateJournalForAccount(accountId: string, journal: PairLedgerJournal
   }
 }
 
+/**
+ * A session key binds an account's funding identity. Everything compared here
+ * is genuinely fixed for the life of the account.
+ *
+ * daily_bucket_utc is deliberately NOT compared. It records the UTC day the
+ * account was funded, but the caller derives its value from the current clock
+ * on every boot, so the first restart on a later UTC day presented a different
+ * bucket for the same session key and this threw during engine startup — a
+ * crash loop that a rollback could not clear, because the stored row keeps the
+ * original funding day. The column is written once at creation and read
+ * nowhere else, so treating it as a creation record rather than an identity
+ * component is both correct and inert.
+ */
 function validateAccountIdentity(existing: PairPaperAccountRow, input: CreatePairAccountInput): void {
   if (existing.id !== input.id || existing.accountModel !== (input.accountModel ?? "ISOLATED_PAIR_PAPER") ||
       existing.sourceConfigVersion !== input.sourceConfigVersion || existing.startingCash6 !== input.startingCash6 ||
-      existing.sourceBankrollSnapshotId !== (input.sourceBankrollSnapshotId ?? null) || existing.dailyBucketUtc !== input.dailyBucketUtc) {
+      existing.sourceBankrollSnapshotId !== (input.sourceBankrollSnapshotId ?? null)) {
     throw new PairAccountIdempotencyCollisionError("session key is bound to different immutable account parameters");
   }
 }
