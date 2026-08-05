@@ -141,6 +141,7 @@ export { LiveController, ARM_ACK_PHRASE, minArmUsdc } from "./live";
 export { makeBus, getLocalBus, CHANNELS, type Bus } from "./bus";
 export { ENGINE_VERSION, buildDecisionSnapshot, lossErasesWinsLine } from "./snapshot";
 export { logger } from "./log";
+export { MetricsRegistry, metricsRegistry, METRICS_CONTENT_TYPE } from "./metrics";
 export { ExecutionTimeline } from "./execution-timeline";
 export { ExecutionPersistence } from "./execution-persistence";
 export { IntentExecutionGuard, ExecutionGuardRegistry } from "./execution-invariants";

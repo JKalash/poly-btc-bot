@@ -3,7 +3,7 @@ import {
   MarketDataStore, configVersions, makeDb,
   type MarketDataEventInput, type PersistedMarketDataEvent,
 } from "@b5p/db";
-import { prob, shares, usdc } from "@b5p/domain";
+import { ENGINE_STATES, prob, shares, usdc } from "@b5p/domain";
 import { canonicalObjectHash } from "@b5p/pair-execution";
 import {
   BinanceKlinesPoller, ClobMarketWs, GammaClient,
@@ -15,6 +15,7 @@ import { makeBus } from "./bus";
 import { Engine } from "./engine";
 import { logger } from "./log";
 import { LogRateLimiter } from "./log-rate-limiter";
+import { metricsRegistry } from "./metrics";
 import { resolveCapturePersistence } from "./pair-capture-persistence";
 import { PairCaptureQueue, type PairMarketDataRecord } from "./pair-capture-queue";
 import { PairAccountStore } from "./pair-account-store";
@@ -480,6 +481,33 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       .finally(() => { pairMaintaining = false; });
   }, engine.cfg.pair.reconcile_interval_ms);
 
+  // --- Prometheus export (scraped by the org-private Prometheus; see
+  // monitoring/fly/prometheus in the mono-repo). Every value here is either a
+  // point-in-time gauge or a lifetime total re-exported as an absolute counter.
+  const publishMetrics = (): void => {
+    const q = captureQueue.metrics();
+    metricsRegistry.gauge("b5p_capture_queue_depth", "Capture queue current depth", q.depth);
+    metricsRegistry.gauge("b5p_capture_queue_capacity", "Capture queue configured capacity", engine.cfg.pair.capture_queue_capacity);
+    metricsRegistry.gauge("b5p_capture_queue_max_depth", "High-water mark of capture queue depth", q.maxDepth);
+    metricsRegistry.gauge("b5p_capture_unhealthy_markets", "Markets with lost capture continuity", q.unhealthyMarketCount);
+    metricsRegistry.counterTotal("b5p_capture_enqueued_total", "Capture records enqueued", q.enqueued);
+    metricsRegistry.counterTotal("b5p_capture_flushed_total", "Capture records flushed to storage", q.flushed);
+    metricsRegistry.counterTotal("b5p_capture_flushes_total", "Capture flush batches", q.flushes);
+    metricsRegistry.counterTotal("b5p_capture_overflows_total", "Capture records dropped on overflow", q.overflows);
+    metricsRegistry.counterTotal("b5p_capture_rejected_unhealthy_total", "Capture records rejected while market unhealthy", q.rejectedWhileUnhealthy);
+    if (q.lastFlushLatencyMs !== null) metricsRegistry.gauge("b5p_capture_last_flush_latency_ms", "Latency of last capture flush batch", q.lastFlushLatencyMs);
+    for (const [feed, age] of [["rtds", rtds.ageMs()], ["clob", clob.ageMs()], ["binance", klines.ageMs()]] as const) {
+      if (age === null) metricsRegistry.clear("b5p_feed_age_seconds", { feed });
+      else metricsRegistry.gauge("b5p_feed_age_seconds", "Seconds since last inbound message per feed", age / 1000, { feed });
+    }
+    metricsRegistry.gauge("b5p_engine_halted", "1 when the engine is in HALTED state", engine.engineState === "HALTED" ? 1 : 0);
+    // full one-hot: every known state gets a sample, so state flips zero the old label
+    for (const s of ENGINE_STATES) metricsRegistry.gauge("b5p_engine_state", "Engine state one-hot", engine.engineState === s ? 1 : 0, { state: s });
+    metricsRegistry.gauge("process_resident_memory_bytes", "Resident set size", process.memoryUsage().rss);
+  };
+  publishMetrics();
+  const metricsTimer = setInterval(publishMetrics, 5_000);
+
   logger.info("engine runtime started", { mode: engine.mode, db: db.kind, bus: bus.kind });
   // #27: a standalone engine process with a process-LOCAL bus cannot receive
   // API control messages (kill/arm/disarm/resume). The DB-polled kill
@@ -497,6 +525,7 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       clearInterval(stepTimer);
       clearInterval(captureFlushTimer);
       clearInterval(pairMaintenanceTimer);
+      clearInterval(metricsTimer);
       engine.setPairEnvelopeDirtyMarker(null);
       for (const marketId of registeredPairMarkets.keys()) pairSubsystem.observer.unregisterMarket(marketId);
       pendingObserverEnvelopes.clear();

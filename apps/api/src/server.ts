@@ -17,7 +17,7 @@ import {
   isRiskFree, PAIRED_CYCLE_STATES, PAIRED_LEG_STATES, type PairedCycleState, type PairedLegState,
 } from "@b5p/domain";
 import { newId } from "@b5p/domain/ids";
-import { CHANNELS, getLocalBus, makeBus, type Bus } from "@b5p/engine";
+import { CHANNELS, getLocalBus, makeBus, METRICS_CONTENT_TYPE, metricsRegistry, type Bus } from "@b5p/engine";
 import { backfillResolvedMarkets, runTimingStats } from "@b5p/research";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
@@ -1524,6 +1524,17 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   });
 
   app.get("/api/healthz", async () => ({ ok: true, ts: Date.now() }));
+
+  // Prometheus scrape endpoint. Unauthenticated like /api/healthz: the app has
+  // no public [[services]] for this port on Fly, so callers are already inside
+  // the org's private network. Carries no market data or secrets — only
+  // operational gauges (queue depth, feed staleness, engine state, RSS).
+  // In embedded mode (EMBED_ENGINE=1, the production layout) the engine
+  // publishes into this process-global registry; split-process deployments see
+  // API-side metrics only.
+  app.get("/metrics", async (_req, reply) => {
+    return reply.header("Content-Type", METRICS_CONTENT_TYPE).send(metricsRegistry.render());
+  });
 
   return app;
 }
