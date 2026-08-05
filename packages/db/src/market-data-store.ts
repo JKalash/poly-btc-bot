@@ -268,6 +268,33 @@ function eventMatches(row: PersistedMarketDataEvent, input: MarketDataEventInput
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
+ * Rows per statement. Each event row binds 14 parameters, so 256 rows is
+ * ~3.6k parameters — comfortably inside the 65535 bind-parameter ceiling with
+ * room for the wider trade-tick and lookup shapes.
+ */
+const INSERT_CHUNK_ROWS = 256;
+const SELECT_CHUNK_ROWS = 128;
+
+// `items` is a fresh slice per chunk, so handing out a mutable array is safe
+// and lets it be passed straight to drizzle's values(), which requires one.
+interface Chunk<T> { readonly start: number; readonly items: T[] }
+
+function* chunked<T>(items: readonly T[], size: number): Generator<Chunk<T>> {
+  for (let start = 0; start < items.length; start += size) {
+    yield { start, items: items.slice(start, start + size) };
+  }
+}
+
+/** Identity of an envelope position — the store's uniqueness constraint. */
+function positionKey(row: {
+  readonly connectionEpoch: string;
+  readonly envelopeId: string;
+  readonly sequenceInEnvelope: number;
+}): string {
+  return `${row.connectionEpoch}\u0000${row.envelopeId}\u0000${row.sequenceInEnvelope}`;
+}
+
+/**
  * Append-only §18.12 event store. It never updates or deletes an event row.
  * Retrying an identical envelope is idempotent; reusing an envelope position
  * for different content is rejected instead of silently accepting evidence.
@@ -295,6 +322,19 @@ export class MarketDataStore {
     return this.appendBatch(inputs);
   }
 
+  /**
+   * Appends a batch in a bounded number of statements rather than one
+   * round-trip per row.
+   *
+   * The previous per-row loop cost one INSERT (plus a SELECT and a second
+   * INSERT for trades) per event inside a single transaction. On the embedded
+   * single-connection PGlite database a 500-row flush every 50ms could not
+   * complete before the next one was due, so the capture queue grew until it
+   * overflowed and every consumer sharing that connection was starved.
+   *
+   * Semantics are unchanged: append-only, idempotent on retry, and a reused
+   * envelope position holding different evidence is still rejected.
+   */
   async appendBatch(inputs: readonly MarketDataEventInput[]): Promise<readonly PersistedMarketDataEvent[]> {
     if (inputs.length === 0) return Object.freeze([]);
     const validated = inputs.map(validateEvent);
@@ -304,44 +344,49 @@ export class MarketDataStore {
       }
     }
     return this.db.transaction(async (tx) => {
-      const result: PersistedMarketDataEvent[] = [];
-      for (let i = 0; i < inputs.length; i++) {
-        result.push(await this.insertOne(tx, inputs[i]!, validated[i]!));
+      const byPosition = new Map<string, PersistedMarketDataEvent>();
+      const insertedPositions = new Set<string>();
+
+      for (const chunk of chunked(inputs, INSERT_CHUNK_ROWS)) {
+        const values = chunk.items.map((input, offset) => {
+          const v = validated[chunk.start + offset]!;
+          return {
+            marketId: input.marketId,
+            tokenId: input.tokenId,
+            eventKind: input.eventKind,
+            connectionEpoch: input.connectionEpoch,
+            envelopeId: input.envelopeId,
+            sequenceInEnvelope: input.sequenceInEnvelope,
+            sourceEventId: input.sourceEventId ?? null,
+            sourceTsMs: input.sourceTsMs,
+            sourceTimestampKind: input.sourceTimestampKind,
+            receivedTsMs: input.receivedTsMs,
+            exchangeHash: input.exchangeHash ?? null,
+            payloadHash: v.payloadHash,
+            payload: v.payload,
+            createdAtMs: input.createdAtMs,
+          };
+        });
+        const inserted = await tx.insert(orderbookEvents).values(values).onConflictDoNothing({
+          target: [orderbookEvents.connectionEpoch, orderbookEvents.envelopeId, orderbookEvents.sequenceInEnvelope],
+        }).returning();
+        for (const raw of inserted) {
+          const row = normalizeRow(raw);
+          const key = positionKey(row);
+          byPosition.set(key, row);
+          insertedPositions.add(key);
+        }
       }
-      return Object.freeze(result);
-    });
-  }
 
-  private async insertOne(
-    tx: Transaction,
-    input: MarketDataEventInput,
-    validated: { payload: Record<string, unknown>; payloadHash: string },
-  ): Promise<PersistedMarketDataEvent> {
-    const inserted = await tx.insert(orderbookEvents).values({
-      marketId: input.marketId,
-      tokenId: input.tokenId,
-      eventKind: input.eventKind,
-      connectionEpoch: input.connectionEpoch,
-      envelopeId: input.envelopeId,
-      sequenceInEnvelope: input.sequenceInEnvelope,
-      sourceEventId: input.sourceEventId ?? null,
-      sourceTsMs: input.sourceTsMs,
-      sourceTimestampKind: input.sourceTimestampKind,
-      receivedTsMs: input.receivedTsMs,
-      exchangeHash: input.exchangeHash ?? null,
-      payloadHash: validated.payloadHash,
-      payload: validated.payload,
-      createdAtMs: input.createdAtMs,
-    }).onConflictDoNothing({
-      target: [orderbookEvents.connectionEpoch, orderbookEvents.envelopeId, orderbookEvents.sequenceInEnvelope],
-    }).returning();
-
-    let row: PersistedMarketDataEvent;
-    if (inserted[0] !== undefined) {
-      row = normalizeRow(inserted[0]);
-      if (input.eventKind === "TRADE") {
-        const trade = tradePayload(validated.payload);
-        await tx.insert(marketTradeTicks).values({
+      // Trade ticks only for rows this call actually inserted; a conflicting
+      // TRADE already contributed its tick when it was first written.
+      const ticks: (typeof marketTradeTicks.$inferInsert)[] = [];
+      for (let i = 0; i < inputs.length; i++) {
+        const input = inputs[i]!;
+        if (input.eventKind !== "TRADE") continue;
+        if (!insertedPositions.has(positionKey(input))) continue;
+        const trade = tradePayload(validated[i]!.payload);
+        ticks.push({
           marketId: input.marketId,
           tokenId: input.tokenId!,
           price6: trade.price6,
@@ -351,19 +396,40 @@ export class MarketDataStore {
           receivedTsMs: input.receivedTsMs,
         });
       }
-    } else {
-      const existing = await tx.select().from(orderbookEvents).where(and(
-        eq(orderbookEvents.connectionEpoch, input.connectionEpoch),
-        eq(orderbookEvents.envelopeId, input.envelopeId),
-        eq(orderbookEvents.sequenceInEnvelope, input.sequenceInEnvelope),
-      )).limit(1);
-      if (existing[0] === undefined) throw new Error("market-data idempotency conflict could not be resolved");
-      row = normalizeRow(existing[0]);
-      if (!eventMatches(row, input, validated.payloadHash)) {
-        throw new Error("market-data envelope position already contains different evidence");
+      for (const chunk of chunked(ticks, INSERT_CHUNK_ROWS)) {
+        await tx.insert(marketTradeTicks).values(chunk.items);
       }
-    }
-    return row;
+
+      // Resolve only the positions that conflicted. This is the rare retry
+      // path, so it stays a lookup rather than shaping the common case.
+      const unresolved = inputs.filter((input) => !byPosition.has(positionKey(input)));
+      for (const chunk of chunked(unresolved, SELECT_CHUNK_ROWS)) {
+        const existing = await tx.select().from(orderbookEvents).where(or(
+          ...chunk.items.map((input) => and(
+            eq(orderbookEvents.connectionEpoch, input.connectionEpoch),
+            eq(orderbookEvents.envelopeId, input.envelopeId),
+            eq(orderbookEvents.sequenceInEnvelope, input.sequenceInEnvelope),
+          )),
+        ));
+        for (const raw of existing) {
+          const row = normalizeRow(raw);
+          byPosition.set(positionKey(row), row);
+        }
+      }
+
+      const result: PersistedMarketDataEvent[] = [];
+      for (let i = 0; i < inputs.length; i++) {
+        const input = inputs[i]!;
+        const key = positionKey(input);
+        const row = byPosition.get(key);
+        if (row === undefined) throw new Error("market-data idempotency conflict could not be resolved");
+        if (!insertedPositions.has(key) && !eventMatches(row, input, validated[i]!.payloadHash)) {
+          throw new Error("market-data envelope position already contains different evidence");
+        }
+        result.push(row);
+      }
+      return Object.freeze(result);
+    });
   }
 
   async reconstructBook(input: {

@@ -14,6 +14,8 @@ import { eq } from "drizzle-orm";
 import { makeBus } from "./bus";
 import { Engine } from "./engine";
 import { logger } from "./log";
+import { LogRateLimiter } from "./log-rate-limiter";
+import { resolveCapturePersistence } from "./pair-capture-persistence";
 import { PairCaptureQueue, type PairMarketDataRecord } from "./pair-capture-queue";
 import { PairAccountStore } from "./pair-account-store";
 import { PairPortfolioStore } from "./pair-portfolio-store";
@@ -85,6 +87,9 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
 
   let activeClobEpoch: string | null = null;
   let captureQueueRef: PairCaptureQueue | null = null;
+  // One line per market+outcome per 10s, with the suppressed count carried
+  // forward, instead of one line per rejected envelope.
+  const continuityLogLimiter = new LogRateLimiter(10_000);
   const pendingObserverEnvelopes = new Map<string, { readonly marketId: string; readonly envelopeId: string }>();
   const durableEnvelopeSequences = new Map<string, bigint>();
   const pairAccountSessionKey = `pair-runtime:${ENGINE_VERSION}:config:${engine.configVersion}`;
@@ -166,6 +171,20 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
   });
 
   const marketDataStore = new MarketDataStore(db.db);
+  const capturePersistence = resolveCapturePersistence({
+    observerEnabled: engine.cfg.pair.observer_enabled,
+    configured: engine.cfg.pair.capture_persistence_enabled,
+    embedded: process.env.EMBED_ENGINE === "1",
+    override: process.env.PAIR_CAPTURE_PERSISTENCE,
+  });
+  const captureEnabled = capturePersistence.enabled;
+  if (!captureEnabled) {
+    logger.warn("pair market-data capture persistence is OFF; the pair observer will not evaluate", {
+      reason: capturePersistence.reason,
+      observerEnabled: engine.cfg.pair.observer_enabled,
+      embedded: process.env.EMBED_ENGINE === "1",
+    });
+  }
   const captureQueue = new PairCaptureQueue({
     capacity: engine.cfg.pair.capture_queue_capacity,
     batchSize: engine.cfg.pair.market_event_batch_size,
@@ -197,23 +216,44 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
     onContinuityLost: (marketId, code) => {
       const epoch = activeClobEpoch ?? "capture-overflow";
       engine.invalidatePairBooksForMarket(marketId, epoch);
-      logger.error("pair market-data capture continuity lost", { marketId, code, epoch });
+      const emission = continuityLogLimiter.take(`lost:${marketId}:${code}`);
+      if (emission !== null) {
+        logger.error("pair market-data capture continuity lost", {
+          marketId, code, epoch, suppressed: emission.suppressed, total: emission.total,
+        });
+      }
     },
   });
   captureQueueRef = captureQueue;
 
   // Exactly one complete-envelope hook. It records pending observer work; the
-  // persistence callback above is solely responsible for releasing it.
-  engine.setPairEnvelopeDirtyMarker((marketId, envelopeId) => {
+  // persistence callback above is solely responsible for releasing it. With
+  // capture off nothing will ever release these, so we must not record them —
+  // an unreleased pending map is an unbounded leak.
+  engine.setPairEnvelopeDirtyMarker(captureEnabled
+    ? (marketId, envelopeId) => { pendingObserverEnvelopes.set(envelopeId, Object.freeze({ marketId, envelopeId })); }
+    : null);
+
+  const notePendingEnvelope = (marketId: string, envelopeId: string) => {
+    if (!captureEnabled) return;
     pendingObserverEnvelopes.set(envelopeId, Object.freeze({ marketId, envelopeId }));
-  });
+  };
 
   const enqueueEnvelope = (records: readonly PairMarketDataRecord[]) => {
+    if (!captureEnabled) return "DISABLED" as const;
     const result = captureQueue.enqueueEnvelope(records);
     if (result !== "ENQUEUED") {
       const envelopeId = records[0]?.envelopeId;
       if (envelopeId !== undefined) pendingObserverEnvelopes.delete(envelopeId);
-      logger.warn("pair market-data envelope not enqueued", { marketId: records[0]?.marketId, envelopeId, result });
+      // Rejection is cheap and happens per envelope, so an unthrottled line
+      // here floods hardest exactly when the process is already saturated.
+      const marketId = records[0]?.marketId;
+      const emission = continuityLogLimiter.take(`reject:${marketId}:${result}`);
+      if (emission !== null) {
+        logger.warn("pair market-data envelope not enqueued", {
+          marketId, envelopeId, result, suppressed: emission.suppressed, total: emission.total,
+        });
+      }
     }
     return result;
   };
@@ -240,8 +280,9 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
         exchangeHash: msg.hash ?? null,
         marketId,
       });
+      if (!captureEnabled) return;
       const envelopeId = `book:${meta.connectionEpoch}:${ts}:${++clobEnvelopeOrdinal}`;
-      pendingObserverEnvelopes.set(envelopeId, Object.freeze({ marketId, envelopeId }));
+      notePendingEnvelope(marketId, envelopeId);
       enqueueEnvelope([
         {
           kind: "SNAPSHOT", marketId, tokenId: msg.asset_id, connectionEpoch: meta.connectionEpoch,
@@ -274,6 +315,7 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
         })),
         meta: { connectionEpoch: meta.connectionEpoch },
       });
+      if (!captureEnabled) return;
       const grouped = new Map<string, typeof msg.price_changes>();
       for (const change of msg.price_changes) grouped.set(change.asset_id, [...(grouped.get(change.asset_id) ?? []), change]);
       const records: PairMarketDataRecord[] = [];
@@ -298,7 +340,7 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
       const sourceTs = msg.timestamp === undefined ? null : tsToMs(msg.timestamp, ts);
       engine.onTrade(msg.asset_id, msg.price, msg.size ?? "0", sourceTs ?? 0)
         .catch((e) => logger.warn("trade ingestion failed; message dropped", { error: String(e), tokenId: msg.asset_id }));
-      if (msg.size !== undefined && sourceTs !== null) {
+      if (captureEnabled && msg.size !== undefined && sourceTs !== null) {
         const envelopeId = `trade:${meta.connectionEpoch}:${ts}:${++clobEnvelopeOrdinal}`;
         enqueueEnvelope([
           { kind: "TRADE", marketId, tokenId: msg.asset_id, connectionEpoch: meta.connectionEpoch, envelopeId, sequenceInEnvelope: 0, sourceTsMs: sourceTs, receivedTsMs: ts, createdAtMs: ts, payload: { price6: prob(msg.price).toString(), size6: shares(msg.size).toString(), side: msg.side ?? null } },
@@ -311,6 +353,7 @@ export async function createEngineRuntime(): Promise<EngineRuntime> {
     onEpochChange: (epoch, prevEpoch) => {
       activeClobEpoch = epoch;
       engine.onConnectionEpochChange(epoch, prevEpoch);
+      if (!captureEnabled) return;
       for (const marketId of marketTokens.keys()) {
         const ts = Date.now();
         const envelopeId = `reset:${epoch}:${ts}:${++clobEnvelopeOrdinal}`;

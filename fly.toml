@@ -37,6 +37,23 @@ primary_region = "iad"
   min_machines_running = 1
   processes = ["app"]
 
+# "Machine started" only means the VM booted; it says nothing about whether the
+# API is still answering. On 2026-08-05 the capture writer saturated the shared
+# PGlite connection and /api/state began resetting sockets while Fly still
+# reported the release as healthy. This probe reaches the Fastify API through
+# the web proxy, so a wedged event loop in either process now shows up.
+#
+# Deliberately slack: /api/healthz is unauthenticated and cheap, the grace
+# period covers migrate + engine boot, and the timeout is long enough that a
+# write burst does not restart the machine. It fails on no answer, not a slow
+# one — a restart loop would be worse than the condition it is detecting.
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "10s"
+  grace_period = "120s"
+  method = "GET"
+  path = "/api/healthz"
+
 [mounts]
   source = "b5p_data"
   destination = "/data"

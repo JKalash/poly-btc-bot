@@ -55,6 +55,73 @@ describe("market-data canonical serialization", () => {
 });
 
 describe("MarketDataStore append-only persistence and replay", () => {
+  it("resolves a partially conflicting multi-envelope batch without duplicating trades", async () => {
+    const store = new MarketDataStore(handle.db);
+    const envelopeA = [
+      event({
+        marketId: "m-batch", tokenId: "up", eventKind: "TRADE", connectionEpoch: "epoch-b",
+        envelopeId: "batch-a", sequenceInEnvelope: 0, receivedTsMs: 1_800_000_100_000,
+        sourceTsMs: 1_800_000_099_900,
+        payload: { price6: "510000", side: "BUY", size6: "2000000" },
+      }),
+      boundary({ marketId: "m-batch", connectionEpoch: "epoch-b", envelopeId: "batch-a", sequenceInEnvelope: 1, receivedTsMs: 1_800_000_100_001 }),
+    ] as const;
+    await store.appendEnvelope(envelopeA);
+
+    const ticksAfterFirst = await handle.db.select().from(schema.marketTradeTicks)
+      .where(eq(schema.marketTradeTicks.marketId, "m-batch"));
+    expect(ticksAfterFirst).toHaveLength(1);
+
+    // A flush batch packs several envelope groups. Replaying one that already
+    // committed alongside a genuinely new one must insert only the new rows,
+    // return every row in input order, and project the trade exactly once.
+    const envelopeB = [
+      event({
+        marketId: "m-batch", tokenId: "up", eventKind: "DELTA", connectionEpoch: "epoch-b",
+        envelopeId: "batch-b", sequenceInEnvelope: 0, receivedTsMs: 1_800_000_100_010,
+        sourceTsMs: 1_800_000_099_950,
+        payload: { bookVersion: "9", changes: [{ price6: "520000", side: "SELL", size6: "3000000" }] },
+      }),
+      boundary({ marketId: "m-batch", connectionEpoch: "epoch-b", envelopeId: "batch-b", sequenceInEnvelope: 1, receivedTsMs: 1_800_000_100_011 }),
+    ] as const;
+
+    const mixed = await store.appendBatch([...envelopeA, ...envelopeB]);
+    expect(mixed).toHaveLength(4);
+    expect(mixed.map((r) => [r.envelopeId, r.sequenceInEnvelope]))
+      .toEqual([["batch-a", 0], ["batch-a", 1], ["batch-b", 0], ["batch-b", 1]]);
+    // The replayed rows keep their original ids rather than being re-inserted.
+    expect(mixed[0]!.id).toBe((await store.appendEnvelope(envelopeA))[0]!.id);
+
+    const ticksAfterMixed = await handle.db.select().from(schema.marketTradeTicks)
+      .where(eq(schema.marketTradeTicks.marketId, "m-batch"));
+    expect(ticksAfterMixed).toHaveLength(1);
+  });
+
+  it("appends a batch larger than one insert chunk in input order", async () => {
+    const store = new MarketDataStore(handle.db);
+    const rows: MarketDataEventInput[] = [];
+    // 600 rows crosses the 256-row chunk boundary the bulk writer uses.
+    for (let i = 0; i < 300; i++) {
+      rows.push(event({
+        marketId: "m-chunk", tokenId: "up", eventKind: "DELTA", connectionEpoch: "epoch-c",
+        envelopeId: `chunk-${i}`, sequenceInEnvelope: 0, receivedTsMs: 1_800_000_200_000 + i * 2,
+        sourceTsMs: 1_800_000_199_000,
+        payload: { bookVersion: String(i), changes: [{ price6: "500000", side: "BUY", size6: "1000000" }] },
+      }));
+      rows.push(boundary({
+        marketId: "m-chunk", connectionEpoch: "epoch-c", envelopeId: `chunk-${i}`,
+        sequenceInEnvelope: 1, receivedTsMs: 1_800_000_200_000 + i * 2 + 1,
+      }));
+    }
+    const persisted = await store.appendBatch(rows);
+    expect(persisted).toHaveLength(600);
+    expect(persisted.map((r) => r.envelopeId)).toEqual(rows.map((r) => r.envelopeId));
+    // Ids are monotonic, so input order survived the chunked inserts.
+    for (let i = 1; i < persisted.length; i++) {
+      expect(persisted[i]!.id > persisted[i - 1]!.id).toBe(true);
+    }
+  });
+
   it("atomically appends complete envelopes, projects trades once, and rejects conflicting retries", async () => {
     const store = new MarketDataStore(handle.db);
     const first = [

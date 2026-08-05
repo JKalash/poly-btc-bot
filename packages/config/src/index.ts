@@ -204,6 +204,13 @@ export const AppConfigSchema = z.object({
     episode_cooloff_ms: z.number().int().nonnegative().default(1_000),
     negative_control_sample_ppm: z.number().int().min(0).max(1_000_000).default(1_000),
     observer_flush_interval_ms: z.number().int().min(10).default(50),
+    /**
+     * Persist full pair envelopes to the market-data event store. Required for
+     * strict observer evaluation; disabling it also disables the pair observer.
+     * On embedded PGlite this defaults off regardless (one shared connection),
+     * and PAIR_CAPTURE_PERSISTENCE=on overrides that.
+     */
+    capture_persistence_enabled: z.boolean().default(true),
     capture_queue_capacity: z.number().int().positive().default(10_000),
     market_event_batch_size: z.number().int().positive().default(500),
     checkpoint_interval_ms: z.number().int().positive().default(1_000),
@@ -408,6 +415,12 @@ export function validateConfig(raw: unknown): { ok: true; config: AppConfig } | 
   }
   if (pair.paper_execution_enabled && !pair.observer_enabled) {
     issues.push({ path: "pair.paper_execution_enabled", message: "paper scheduling requires the observer" });
+  }
+  // Strict observer evaluation is released only by a committed envelope
+  // boundary row, so without capture persistence the observer never fires and
+  // paper scheduling would be silently dead rather than merely idle.
+  if (pair.paper_execution_enabled && pair.capture_persistence_enabled === false) {
+    issues.push({ path: "pair.capture_persistence_enabled", message: "paper scheduling requires capture persistence" });
   }
   const automaticRecovery = pair.recovery_policy !== "NO_AUTO_RECOVERY";
   if (automaticRecovery && !pair.paper_execution_enabled) {
